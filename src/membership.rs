@@ -170,7 +170,10 @@ mod tests {
         // Past dead → reported exactly once.
         assert_eq!(m.sweep(6_000), vec!["a".to_string()]);
         assert_eq!(m.snapshot()[0].health, NodeHealth::Dead);
-        assert!(m.sweep(7_000).is_empty(), "dead is reported only on the transition");
+        assert!(
+            m.sweep(7_000).is_empty(),
+            "dead is reported only on the transition"
+        );
 
         // A fresh heartbeat resurrects it.
         m.heartbeat(&"a".to_string(), 7_000, report("gcp", &[0, 1]));

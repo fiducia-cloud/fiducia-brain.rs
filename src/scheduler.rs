@@ -103,8 +103,10 @@ impl Scheduler {
 
         for shard in 0..self.placement.shard_count() {
             let current = self.placement.get(shard);
-            let current_replicas: Vec<NodeId> =
-                current.as_ref().map(|a| a.replicas.clone()).unwrap_or_default();
+            let current_replicas: Vec<NodeId> = current
+                .as_ref()
+                .map(|a| a.replicas.clone())
+                .unwrap_or_default();
 
             let slots: Vec<NodeSlot> = healthy_ids
                 .iter()
@@ -155,7 +157,10 @@ impl Scheduler {
             let now = now_ms();
             let newly_dead = self.membership.sweep(now);
             if !newly_dead.is_empty() {
-                tracing::warn!(?newly_dead, "nodes declared dead; re-replicating their shards");
+                tracing::warn!(
+                    ?newly_dead,
+                    "nodes declared dead; re-replicating their shards"
+                );
             }
             self.reconcile();
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -222,6 +227,28 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_keeps_healthy_observed_leader_as_preferred_leader() {
+        let s = scheduler(1, 3);
+        s.membership.heartbeat(
+            &"a".to_string(),
+            0,
+            HeartbeatReport {
+                leading_shards: vec![0],
+                hosted_shards: vec![0],
+                ..hb("gcp")
+            },
+        );
+        s.membership.heartbeat(&"b".to_string(), 0, hb("aws"));
+        s.membership.heartbeat(&"c".to_string(), 0, hb("hetzner"));
+
+        s.reconcile();
+
+        let assignment = s.placement.get(0).expect("shard placed");
+        assert_eq!(assignment.preferred_leader.as_deref(), Some("a"));
+        assert!(assignment.replicas.contains(&"a".to_string()));
+    }
+
+    #[test]
     fn a_dead_node_is_evacuated_to_a_surviving_node_on_the_next_tick() {
         let s = scheduler(4, 3);
         for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner"), ("d", "gcp")] {
@@ -239,7 +266,10 @@ mod tests {
         // No shard should still list the dead node, and all stay at RF.
         for shard in 0..4 {
             let a = s.placement.get(shard).unwrap();
-            assert!(!a.replicas.contains(&"a".to_string()), "shard {shard} evacuated a");
+            assert!(
+                !a.replicas.contains(&"a".to_string()),
+                "shard {shard} evacuated a"
+            );
             assert_eq!(a.replicas.len(), 3, "shard {shard} restored to RF");
         }
     }
