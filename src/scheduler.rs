@@ -37,10 +37,11 @@
 //! Skeleton: the loop and the four phases are sketched as methods; the placement
 //! math inside each is left as `TODO`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::membership::Membership;
-use crate::model::{NodeHealth, ScalePlan};
+use crate::model::{NodeHealth, NodeId, ScalePlan};
 use crate::placement::Placement;
 
 /// The reconciler: reads observed state (membership), writes desired state
@@ -111,13 +112,30 @@ impl Scheduler {
         // TODO
     }
 
-    /// **Leadership balancing.** Replica placement can be even while leadership
-    /// is lopsided (one node leads most shards). Transfer shard leadership so
-    /// each node leads roughly `shard_count / nodes` shards.
+    /// **Leadership balancing + affinity.** Drive each shard's leader toward its
+    /// affinity target ([`crate::leadership::desired_leader`]): the preferred
+    /// node when healthy (so leadership returns to it after it recovers),
+    /// otherwise the current leader, otherwise a healthy replica.
     ///
-    /// TODO: count leaders per node; issue leadership transfers toward the mean.
+    /// TODO: feed the observed Raft leader (reported via heartbeats) as `current`
+    /// and issue a leadership transfer when it differs from the desired leader.
     fn balance_leadership(&self) {
-        // TODO
+        let healthy: HashSet<NodeId> = self
+            .membership
+            .snapshot()
+            .into_iter()
+            .filter(|n| n.health == NodeHealth::Healthy)
+            .map(|n| n.node_id)
+            .collect();
+        for a in self.placement.snapshot() {
+            let _desired = crate::leadership::desired_leader(
+                a.preferred_leader.as_ref(),
+                &a.replicas,
+                &healthy,
+                None, // TODO: observed leader from heartbeats
+            );
+            // TODO: if _desired differs from the observed leader, transfer.
+        }
     }
 
     /// Background loop driving `reconcile` on an interval.
