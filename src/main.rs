@@ -54,27 +54,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // factor. Everything else reads this.
     let cluster = config::ClusterConfig::from_env();
 
-    // Desired cluster shape. In a real deployment this is persisted in the
-    // brain's own Raft group and adjusted via POST /v1/scale.
-    let plan = ScalePlan {
+    // Desired cluster shape. Shared (so `POST /v1/scale` can adjust it live); in a
+    // real deployment this is persisted in the brain's own Raft group.
+    let plan = Arc::new(Mutex::new(ScalePlan {
         target_nodes: std::env::var("FIDUCIA_TARGET_NODES")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3),
         replication_factor: cluster.replication_factor,
-    };
+    }));
 
-    let membership = Arc::new(Membership::new());
+    let membership = Arc::new(Membership::new(membership::MembershipConfig::default()));
     let placement = Arc::new(Placement::new(cluster.shard_count));
-    let scheduler = Arc::new(Scheduler::new(membership.clone(), placement.clone()));
+    let scheduler = Arc::new(Scheduler::new(
+        membership.clone(),
+        placement.clone(),
+        plan.clone(),
+    ));
 
-    // Kick off the reconciliation loop.
-    tokio::spawn(scheduler.clone().run(plan.clone()));
+    // Kick off the reconciliation loop (sweeps failures, then reconciles).
+    tokio::spawn(scheduler.clone().run());
 
     let state = BrainState {
         config: cluster.clone(),
         membership,
         placement,
+        plan: plan.clone(),
     };
 
     let app = Router::new()
