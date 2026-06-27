@@ -140,12 +140,10 @@ async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) ->
     }
 }
 
-/// `POST /v1/scale` — set the desired scale plan.
-async fn set_scale(State(_s): State<BrainState>) -> Json<Value> {
-    // TODO: parse ScalePlan from the body; store it for the scheduler loop.
-    not_implemented("brain.set_scale")
-}
-
-fn not_implemented(op: &str) -> Json<Value> {
-    Json(json!({ "error": "not_implemented", "op": op }))
+/// `POST /v1/scale` — set the desired scale plan; the reconciler picks it up on
+/// its next tick. `replication_factor` is clamped to ≥ 1.
+async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Json<Value> {
+    plan.replication_factor = plan.replication_factor.max(1);
+    *s.plan.lock().unwrap() = plan.clone();
+    Json(json!({ "ok": true, "plan": plan }))
 }
