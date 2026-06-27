@@ -22,9 +22,14 @@ mod scheduler;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 use api::BrainState;
 use membership::Membership;
