@@ -118,7 +118,14 @@ mod tests {
         assert_eq!(plan.len(), 3);
         let domains: std::collections::HashSet<_> = plan
             .iter()
-            .map(|id| healthy.iter().find(|s| &s.node_id == id).unwrap().domain.clone())
+            .map(|id| {
+                healthy
+                    .iter()
+                    .find(|s| &s.node_id == id)
+                    .unwrap()
+                    .domain
+                    .clone()
+            })
             .collect();
         assert_eq!(domains.len(), 3, "one replica per failure domain");
     }
@@ -134,8 +141,14 @@ mod tests {
         let plan = plan_replicas(&ids(&["a", "b", "c"]), &healthy, 3);
         assert!(plan.contains(&"a".to_string()));
         assert!(plan.contains(&"c".to_string()));
-        assert!(plan.contains(&"d".to_string()), "the lost replica is replaced");
-        assert!(!plan.contains(&"b".to_string()), "the dead replica is dropped");
+        assert!(
+            plan.contains(&"d".to_string()),
+            "the lost replica is replaced"
+        );
+        assert!(
+            !plan.contains(&"b".to_string()),
+            "the dead replica is dropped"
+        );
     }
 
     #[test]
