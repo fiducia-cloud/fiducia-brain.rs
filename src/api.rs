@@ -102,16 +102,29 @@ async fn list_nodes(State(s): State<BrainState>) -> Json<Value> {
     Json(json!({ "nodes": s.membership.snapshot() }))
 }
 
-/// `POST /v1/nodes/{id}/heartbeat` — a data-plane node checks in.
-async fn heartbeat(State(_s): State<BrainState>, Path(_id): Path<String>) -> Json<Value> {
-    // TODO: parse reported shard status from the body; membership.heartbeat(id).
-    not_implemented("brain.heartbeat")
+/// `POST /v1/nodes/{id}/heartbeat` — a data-plane node checks in with its
+/// address, failure domain, and the shards it hosts/leads. Refreshes liveness.
+async fn heartbeat(
+    State(s): State<BrainState>,
+    Path(id): Path<String>,
+    report: Option<Json<HeartbeatReport>>,
+) -> Json<Value> {
+    let report = report.map(|Json(r)| r).unwrap_or_default();
+    s.membership.heartbeat(&id, now_ms(), report);
+    let health = s
+        .membership
+        .snapshot()
+        .into_iter()
+        .find(|n| n.node_id == id)
+        .map(|n| n.health);
+    Json(json!({ "ok": true, "node_id": id, "health": health }))
 }
 
-/// `DELETE /v1/nodes/{id}` — drain and remove a node.
-async fn remove_node(State(_s): State<BrainState>, Path(_id): Path<String>) -> Json<Value> {
-    // TODO: membership.drain(id); scheduler moves replicas off before removal.
-    not_implemented("brain.remove_node")
+/// `DELETE /v1/nodes/{id}` — begin draining a node. The reconciler evacuates its
+/// replicas/leadership onto healthy nodes; the operator removes it once empty.
+async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Json<Value> {
+    let known = s.membership.drain(&id);
+    Json(json!({ "draining": known, "node_id": id }))
 }
 
 /// `GET /v1/placement` — full shard map for nodes to reconcile against.
