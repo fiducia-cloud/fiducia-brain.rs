@@ -7,9 +7,9 @@
 //! [`fiducia-node`] processes heartbeat to the brain and fetch the placement map
 //! they should host.
 //!
-//! This is a **skeleton**: the API surface, the membership/placement stores, and
-//! the reconciliation loop are wired up; the failure-detection, placement math,
-//! and scaling actions are marked with `TODO`s.
+//! Failure detection (Healthy→Suspect→Dead), the placement math
+//! ([`plan`]), and the reconciliation loop are implemented; what remains is
+//! replicating the brain's *own* state in its own Raft group (HA), tracked below.
 
 mod api;
 mod config;
@@ -17,9 +17,11 @@ mod leadership;
 mod membership;
 mod model;
 mod placement;
+mod plan;
 mod scheduler;
 
 use std::net::SocketAddr;
+use std::sync::Mutex;
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -52,27 +54,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // factor. Everything else reads this.
     let cluster = config::ClusterConfig::from_env();
 
-    // Desired cluster shape. In a real deployment this is persisted in the
-    // brain's own Raft group and adjusted via POST /v1/scale.
-    let plan = ScalePlan {
+    // Desired cluster shape. Shared (so `POST /v1/scale` can adjust it live); in a
+    // real deployment this is persisted in the brain's own Raft group.
+    let plan = Arc::new(Mutex::new(ScalePlan {
         target_nodes: std::env::var("FIDUCIA_TARGET_NODES")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3),
         replication_factor: cluster.replication_factor,
-    };
+    }));
 
-    let membership = Arc::new(Membership::new());
+    let membership = Arc::new(Membership::new(membership::MembershipConfig::default()));
     let placement = Arc::new(Placement::new(cluster.shard_count));
-    let scheduler = Arc::new(Scheduler::new(membership.clone(), placement.clone()));
+    let scheduler = Arc::new(Scheduler::new(
+        membership.clone(),
+        placement.clone(),
+        plan.clone(),
+    ));
 
-    // Kick off the reconciliation loop.
-    tokio::spawn(scheduler.clone().run(plan.clone()));
+    // Kick off the reconciliation loop (sweeps failures, then reconciles).
+    tokio::spawn(scheduler.clone().run());
 
     let state = BrainState {
         config: cluster.clone(),
         membership,
         placement,
+        plan: plan.clone(),
     };
 
     let app = Router::new()
@@ -92,12 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(8095);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
+    let shape = plan.lock().unwrap().clone();
     tracing::info!(
         "{SERVICE} listening on http://{addr} (cluster={}, shards={}, target_nodes={}, rf={})",
         cluster.cluster_id,
         cluster.shard_count,
-        plan.target_nodes,
-        plan.replication_factor
+        shape.target_nodes,
+        shape.replication_factor
     );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

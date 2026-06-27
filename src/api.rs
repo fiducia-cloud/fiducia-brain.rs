@@ -14,7 +14,8 @@
 //!   * `POST   /v1/scale`                     — set the desired `ScalePlan`
 //!   * `GET    /v1/status`                    — control-plane status
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, Query, State},
@@ -26,6 +27,7 @@ use serde_json::{json, Value};
 
 use crate::config::ClusterConfig;
 use crate::membership::Membership;
+use crate::model::{HeartbeatReport, ScalePlan};
 use crate::placement::Placement;
 
 /// Shared control-plane state handed to handlers.
@@ -34,6 +36,15 @@ pub struct BrainState {
     pub config: ClusterConfig,
     pub membership: Arc<Membership>,
     pub placement: Arc<Placement>,
+    /// The live scale intent the reconciler drives toward (`POST /v1/scale`).
+    pub plan: Arc<Mutex<ScalePlan>>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub fn router(state: BrainState) -> Router {
@@ -91,16 +102,29 @@ async fn list_nodes(State(s): State<BrainState>) -> Json<Value> {
     Json(json!({ "nodes": s.membership.snapshot() }))
 }
 
-/// `POST /v1/nodes/{id}/heartbeat` — a data-plane node checks in.
-async fn heartbeat(State(_s): State<BrainState>, Path(_id): Path<String>) -> Json<Value> {
-    // TODO: parse reported shard status from the body; membership.heartbeat(id).
-    not_implemented("brain.heartbeat")
+/// `POST /v1/nodes/{id}/heartbeat` — a data-plane node checks in with its
+/// address, failure domain, and the shards it hosts/leads. Refreshes liveness.
+async fn heartbeat(
+    State(s): State<BrainState>,
+    Path(id): Path<String>,
+    report: Option<Json<HeartbeatReport>>,
+) -> Json<Value> {
+    let report = report.map(|Json(r)| r).unwrap_or_default();
+    s.membership.heartbeat(&id, now_ms(), report);
+    let health = s
+        .membership
+        .snapshot()
+        .into_iter()
+        .find(|n| n.node_id == id)
+        .map(|n| n.health);
+    Json(json!({ "ok": true, "node_id": id, "health": health }))
 }
 
-/// `DELETE /v1/nodes/{id}` — drain and remove a node.
-async fn remove_node(State(_s): State<BrainState>, Path(_id): Path<String>) -> Json<Value> {
-    // TODO: membership.drain(id); scheduler moves replicas off before removal.
-    not_implemented("brain.remove_node")
+/// `DELETE /v1/nodes/{id}` — begin draining a node. The reconciler evacuates its
+/// replicas/leadership onto healthy nodes; the operator removes it once empty.
+async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Json<Value> {
+    let known = s.membership.drain(&id);
+    Json(json!({ "draining": known, "node_id": id }))
 }
 
 /// `GET /v1/placement` — full shard map for nodes to reconcile against.
@@ -116,12 +140,10 @@ async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) ->
     }
 }
 
-/// `POST /v1/scale` — set the desired scale plan.
-async fn set_scale(State(_s): State<BrainState>) -> Json<Value> {
-    // TODO: parse ScalePlan from the body; store it for the scheduler loop.
-    not_implemented("brain.set_scale")
-}
-
-fn not_implemented(op: &str) -> Json<Value> {
-    Json(json!({ "error": "not_implemented", "op": op }))
+/// `POST /v1/scale` — set the desired scale plan; the reconciler picks it up on
+/// its next tick. `replication_factor` is clamped to ≥ 1.
+async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Json<Value> {
+    plan.replication_factor = plan.replication_factor.max(1);
+    *s.plan.lock().unwrap() = plan.clone();
+    Json(json!({ "ok": true, "plan": plan }))
 }

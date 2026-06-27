@@ -2,9 +2,14 @@
 
 The **control plane** for [fiducia.cloud](https://fiducia.cloud) — a small,
 highly-available cluster that runs *inside* the larger deployment and runs the
-cluster itself. This repository is currently a **skeleton**: the architecture
-and HTTP surface are in place; the failure-detection, placement, and scaling
-internals are stubbed with `TODO`s.
+cluster itself. The control logic is **implemented**: time-based failure
+detection (Healthy→Suspect→Dead), the placement math ([`src/plan.rs`](src/plan.rs):
+keep healthy replicas, drop dead/draining ones, fill to RF on the least-loaded
+node in a fresh failure domain), leadership affinity/failover, and the
+reconciliation loop + HTTP API are all live and unit-tested. What remains is
+replicating the brain's *own* state (membership + placement) in its **own Raft
+group** so the control plane itself survives losing a brain node (the HA note
+at the bottom).
 
 ## What the brain does
 
@@ -99,9 +104,11 @@ replicas per node · even **leaders** per node (the real write hotspot).
 | `src/main.rs`      | axum wiring, scheduler spawn, config                      |
 | `src/config.rs`    | central `ClusterConfig` + `key → shard` mapping           |
 | `src/api.rs`       | control-plane HTTP handlers                               |
-| `src/membership.rs`| node registry + failure detection                        |
+| `src/membership.rs`| node registry + time-based failure detection             |
 | `src/placement.rs` | authoritative shard → replicas/leader map                |
-| `src/scheduler.rs` | reconciliation loop (failure / scale / rebalance)        |
+| `src/plan.rs`      | **pure placement math** (`plan_replicas`) + tests        |
+| `src/leadership.rs`| leader affinity / failover decision (`desired_leader`)   |
+| `src/scheduler.rs` | reconciliation loop (sweep failures → recompute placement)|
 | `src/model.rs`     | shared types                                              |
 
 > HA note: the brain's own state (membership + placement) is meant to be
