@@ -39,6 +39,11 @@ use scheduler::Scheduler;
 
 const SERVICE: &str = "fiducia-brain";
 
+/// Bound request handling time (slow-loris / hung-upstream protection).
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Cap request bodies; control-plane payloads are small JSON.
+const MAX_BODY_BYTES: usize = 256 * 1024;
+
 #[tokio::main]
 async fn main() {
     fiducia_telemetry::init(SERVICE);
