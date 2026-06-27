@@ -35,7 +35,7 @@ use scheduler::Scheduler;
 const SERVICE: &str = "fiducia-brain";
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     // Authoritative cluster configuration: shard_count (fixed) + replication
@@ -84,8 +84,9 @@ async fn main() {
         plan.target_nodes,
         plan.replication_factor
     );
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 async fn health() -> Json<Value> {

@@ -79,7 +79,13 @@ mod tests {
 
         // a recovers -> affinity pulls leadership back to a (even though b leads now).
         assert_eq!(
-            desired_leader(Some(&pref), &replicas, &set(&["a", "b", "c"]), Some(&id("b"))).as_deref(),
+            desired_leader(
+                Some(&pref),
+                &replicas,
+                &set(&["a", "b", "c"]),
+                Some(&id("b"))
+            )
+            .as_deref(),
             Some("a"),
         );
     }
