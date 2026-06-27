@@ -108,3 +108,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
 }
+
+#[cfg(test)]
+mod interface_contract_tests {
+    use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
+
+    #[test]
+    fn generated_interfaces_are_importable() {
+        let request = LockAcquireManyRequest {
+            keys: vec!["orders/42".to_string(), "inventory/sku-7".to_string()],
+            holder: Some("worker-a".to_string()),
+            ttl_ms: Some(30_000),
+            wait: Some(false),
+        };
+
+        assert_eq!(request.keys.len(), 2);
+        assert!(matches!(
+            ProposeErrorReason::NotLeader,
+            ProposeErrorReason::NotLeader
+        ));
+    }
+}
