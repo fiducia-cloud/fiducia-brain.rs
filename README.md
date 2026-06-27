@@ -104,9 +104,11 @@ replicas per node · even **leaders** per node (the real write hotspot).
 | `src/main.rs`      | axum wiring, scheduler spawn, config                      |
 | `src/config.rs`    | central `ClusterConfig` + `key → shard` mapping           |
 | `src/api.rs`       | control-plane HTTP handlers                               |
-| `src/membership.rs`| node registry + failure detection                        |
+| `src/membership.rs`| node registry + time-based failure detection             |
 | `src/placement.rs` | authoritative shard → replicas/leader map                |
-| `src/scheduler.rs` | reconciliation loop (failure / scale / rebalance)        |
+| `src/plan.rs`      | **pure placement math** (`plan_replicas`) + tests        |
+| `src/leadership.rs`| leader affinity / failover decision (`desired_leader`)   |
+| `src/scheduler.rs` | reconciliation loop (sweep failures → recompute placement)|
 | `src/model.rs`     | shared types                                              |
 
 > HA note: the brain's own state (membership + placement) is meant to be
