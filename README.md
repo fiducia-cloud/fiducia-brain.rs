@@ -1,16 +1,20 @@
 # fiducia-brain
 
 The **control plane** for [fiducia.cloud](https://fiducia.cloud) — a small,
-highly-available cluster that runs *inside* the larger deployment and runs the
-cluster itself. This repository is currently a **skeleton**: the architecture
-and HTTP surface are in place; the failure-detection, placement, and scaling
-internals are stubbed with `TODO`s.
+highly-available cluster manager that runs *inside* the larger deployment.
+`fiducia-brain` does not serve customer coordination operations directly;
+`fiducia-node` does. The brain manages the cluster itself: membership, shard
+placement, leader affinity, failover, scale, and rebalance. This repository is
+currently a **skeleton**: the architecture and HTTP surface are in place; the
+failure-detection, placement, and scaling internals are stubbed with `TODO`s`.
 
 ## What the brain does
 
 The data plane ([`fiducia-node`](https://github.com/fiducia-cloud/fiducia-node.rs))
-stores and replicates coordination state in sharded Raft groups. It deliberately
-does **not** decide *which* nodes host *which* shards — that is the brain's job:
+stores and replicates coordination state in sharded Raft groups. Every VM or
+bare-metal machine runs a node process; each node can lead some shards and
+follow others. Nodes deliberately do **not** decide *which* machines host
+*which* shards — that is the brain's job:
 
 - **Membership & failure detection** — every node heartbeats to the brain;
   silent nodes go Healthy → Suspect → Dead.
@@ -22,7 +26,8 @@ does **not** decide *which* nodes host *which* shards — that is the brain's jo
   (target node count × replication factor): bleeds shards onto new nodes,
   drains and removes nodes on scale-down.
 - **Rebalancing** — keeps replica counts and leadership spread evenly so no
-  node becomes a write hotspot.
+  node becomes a write hotspot; after failover, the brain can restore leader
+  affinity when the original, preferred leader is healthy again.
 
 This mirrors the "placement driver" pattern: TiKV's **PD** and CockroachDB's
 control plane do the same thing for their range/region maps.
@@ -51,7 +56,7 @@ control plane do the same thing for their range/region maps.
 | `GET  /v1/placement`               | data plane  | full shard map to reconcile toward       |
 | `GET  /v1/placement/{shard}`       | data plane  | one shard's assignment                   |
 | `POST /v1/scale`                   | operators   | set the desired `ScalePlan`              |
-| `GET  /v1/status`                  | all         | control-plane status                     |
+| `GET  /v1/status`                  | all         | control-plane status + placement health |
 
 Plus `/healthz`, `/readyz`.
 
@@ -118,6 +123,6 @@ curl localhost:8095/v1/status
 
 ## Related
 
-- [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane (sharded coordination engine).
+- [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane (runs on each node; hosts shard leaders/followers).
 - [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the website webserver.
 - [`fiducia-ui.web`](https://github.com/fiducia-cloud/fiducia-ui.web) — the website frontend.

@@ -1,11 +1,12 @@
 //! fiducia-brain — the control plane.
 //!
-//! A small, highly-available cluster that sits *inside* the larger Fiducia
-//! deployment and runs the cluster: it tracks node membership, detects failures,
-//! owns the authoritative shard-placement map, and reconciles the data plane
-//! toward a desired scale (nodes × replication factor). Data-plane
-//! [`fiducia-node`] processes heartbeat to the brain and fetch the placement map
-//! they should host.
+//! A small, highly-available cluster manager that sits *inside* the larger
+//! Fiducia deployment. It does not serve customer coordination operations
+//! directly; [`fiducia-node`] does. The brain tracks node membership, detects
+//! failures, owns the authoritative shard-placement map, manages preferred
+//! leaders, and reconciles the data plane toward a desired scale (nodes ×
+//! replication factor). Data-plane [`fiducia-node`] processes heartbeat to the
+//! brain and fetch the placement map they should host.
 //!
 //! This is a **skeleton**: the API surface, the membership/placement stores, and
 //! the reconciliation loop are wired up; the failure-detection, placement math,
