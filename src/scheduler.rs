@@ -37,10 +37,11 @@
 //! Skeleton: the loop and the four phases are sketched as methods; the placement
 //! math inside each is left as `TODO`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::membership::Membership;
-use crate::model::{NodeHealth, ScalePlan};
+use crate::model::{NodeHealth, NodeId, ScalePlan};
 use crate::placement::Placement;
 
 /// The reconciler: reads observed state (membership), writes desired state
