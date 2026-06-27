@@ -13,6 +13,7 @@
 
 mod api;
 mod config;
+mod leadership;
 mod membership;
 mod model;
 mod placement;
