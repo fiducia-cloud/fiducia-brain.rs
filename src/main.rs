@@ -45,7 +45,7 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     // Authoritative cluster configuration: shard_count (fixed) + replication
@@ -99,8 +99,9 @@ async fn main() {
         plan.target_nodes,
         plan.replication_factor
     );
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 async fn health() -> Json<Value> {

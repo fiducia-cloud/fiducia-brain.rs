@@ -29,10 +29,32 @@ pub struct NodeInfo {
     pub node_id: NodeId,
     pub address: String,
     pub health: NodeHealth,
+    /// Failure domain (region/AZ/rack) the sidecar reports. The scheduler spreads
+    /// a shard's replicas across **distinct** domains so one domain loss can't
+    /// take a quorum. Empty string = "unknown" (treated as its own domain).
+    #[serde(default)]
+    pub failure_domain: String,
     /// Last heartbeat receipt (ms since epoch).
     pub last_seen_ms: u64,
     /// Shards this node reports hosting, and whether it leads them.
     pub hosted_shards: Vec<ShardId>,
+    pub leading_shards: Vec<ShardId>,
+}
+
+/// The body a data-plane node (its sidecar) posts to `/v1/nodes/{id}/heartbeat`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HeartbeatReport {
+    /// Where to reach this node (host:port), echoed into the placement redirects.
+    #[serde(default)]
+    pub address: String,
+    /// Failure domain (region/AZ/rack).
+    #[serde(default)]
+    pub failure_domain: String,
+    /// Shards the node currently hosts a replica of.
+    #[serde(default)]
+    pub hosted_shards: Vec<ShardId>,
+    /// Subset of `hosted_shards` this node currently leads.
+    #[serde(default)]
     pub leading_shards: Vec<ShardId>,
 }
 

@@ -63,7 +63,10 @@ impl Scheduler {
     /// shed/absorb capacity, then fine-tune balance.
     pub fn reconcile(&self, plan: &ScalePlan) {
         let nodes = self.membership.snapshot();
-        let healthy = nodes.iter().filter(|n| n.health == NodeHealth::Healthy).count() as u32;
+        let healthy = nodes
+            .iter()
+            .filter(|n| n.health == NodeHealth::Healthy)
+            .count() as u32;
 
         // 1. Heal failures first — restore RF for under-replicated shards.
         self.rereplicate_failed(plan);
@@ -109,7 +112,7 @@ impl Scheduler {
     /// TODO: pick drain victims; sequence the evacuations.
     fn scale_down(&self, plan: &ScalePlan) {
         let _floor = plan.replication_factor; // hard lower bound on node count
-        // TODO
+                                              // TODO
     }
 
     /// **Leadership balancing + affinity.** Drive each shard's leader toward its
