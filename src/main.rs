@@ -7,9 +7,9 @@
 //! [`fiducia-node`] processes heartbeat to the brain and fetch the placement map
 //! they should host.
 //!
-//! This is a **skeleton**: the API surface, the membership/placement stores, and
-//! the reconciliation loop are wired up; the failure-detection, placement math,
-//! and scaling actions are marked with `TODO`s.
+//! Failure detection (Healthy→Suspect→Dead), the placement math
+//! ([`plan`]), and the reconciliation loop are implemented; what remains is
+//! replicating the brain's *own* state in its own Raft group (HA), tracked below.
 
 mod api;
 mod config;
@@ -17,9 +17,11 @@ mod leadership;
 mod membership;
 mod model;
 mod placement;
+mod plan;
 mod scheduler;
 
 use std::net::SocketAddr;
+use std::sync::Mutex;
 use std::sync::Arc;
 
 use std::time::Duration;
