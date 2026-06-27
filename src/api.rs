@@ -14,7 +14,8 @@
 //!   * `POST   /v1/scale`                     — set the desired `ScalePlan`
 //!   * `GET    /v1/status`                    — control-plane status
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, Query, State},
@@ -26,6 +27,7 @@ use serde_json::{json, Value};
 
 use crate::config::ClusterConfig;
 use crate::membership::Membership;
+use crate::model::{HeartbeatReport, ScalePlan};
 use crate::placement::Placement;
 
 /// Shared control-plane state handed to handlers.
@@ -34,6 +36,15 @@ pub struct BrainState {
     pub config: ClusterConfig,
     pub membership: Arc<Membership>,
     pub placement: Arc<Placement>,
+    /// The live scale intent the reconciler drives toward (`POST /v1/scale`).
+    pub plan: Arc<Mutex<ScalePlan>>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub fn router(state: BrainState) -> Router {
