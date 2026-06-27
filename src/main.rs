@@ -22,9 +22,14 @@ mod scheduler;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 use api::BrainState;
 use membership::Membership;
@@ -33,6 +38,11 @@ use placement::Placement;
 use scheduler::Scheduler;
 
 const SERVICE: &str = "fiducia-brain";
+
+/// Bound request handling time (slow-loris / hung-upstream protection).
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Cap request bodies; control-plane payloads are small JSON.
+const MAX_BODY_BYTES: usize = 256 * 1024;
 
 #[tokio::main]
 async fn main() {
@@ -69,7 +79,12 @@ async fn main() {
         .route("/healthz", get(health))
         .route("/readyz", get(health))
         .nest("/v1", api::router(state))
-        .layer(TraceLayer::new_for_http());
+        // Hardening stack (outermost last): catch handler panics → 500, bound
+        // request time, and cap body size.
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT")
         .ok()
