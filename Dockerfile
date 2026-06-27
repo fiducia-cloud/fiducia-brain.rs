@@ -15,10 +15,8 @@ COPY . fiducia-brain.rs
 WORKDIR /build/fiducia-brain.rs
 RUN cargo build --release && strip target/release/fiducia-brain
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
-    && useradd --uid 10001 --user-group --home-dir /nonexistent --shell /usr/sbin/nologin fiducia
-COPY --from=build --chown=10001:10001 /build/fiducia-brain.rs/target/release/fiducia-brain /usr/local/bin/fiducia-brain
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=build --chown=65532:65532 /build/fiducia-brain.rs/target/release/fiducia-brain /usr/local/bin/fiducia-brain
 EXPOSE 8095 9095
-USER 10001:10001
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/fiducia-brain"]
