@@ -99,12 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(8095);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
+    let shape = plan.lock().unwrap().clone();
     tracing::info!(
         "{SERVICE} listening on http://{addr} (cluster={}, shards={}, target_nodes={}, rf={})",
         cluster.cluster_id,
         cluster.shard_count,
-        plan.target_nodes,
-        plan.replication_factor
+        shape.target_nodes,
+        shape.replication_factor
     );
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
