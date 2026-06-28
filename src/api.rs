@@ -131,13 +131,7 @@ async fn heartbeat(
     report: Option<Json<HeartbeatReport>>,
 ) -> Json<Value> {
     let report = report.map(|Json(r)| r).unwrap_or_default();
-    s.membership.heartbeat(&id, now_ms(), report);
-    let health = s
-        .membership
-        .snapshot()
-        .into_iter()
-        .find(|n| n.node_id == id)
-        .map(|n| n.health);
+    let health = s.membership.heartbeat(&id, now_ms(), report);
     Json(json!({ "ok": true, "node_id": id, "health": health }))
 }
 
