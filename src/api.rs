@@ -94,6 +94,9 @@ async fn status(State(s): State<BrainState>) -> Json<Value> {
         "placed_shards": placed.len(),
         "under_replicated_shards": under_replicated,
         "placement_generation": s.placement.generation(),
+        // Brain's own control plane: which member is driving reconciliation.
+        "is_leader": s.control_plane.is_leader(),
+        "leader": s.control_plane.leader_addr(),
     }))
 }
 
