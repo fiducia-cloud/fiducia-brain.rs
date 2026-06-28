@@ -69,6 +69,23 @@ impl Membership {
     /// operator's intent to remove it isn't undone by liveness.
     pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) -> NodeHealth {
         let mut nodes = self.nodes.lock().unwrap();
+        // Reject a reordered or duplicated heartbeat: if the sender stamps a
+        // monotonic `seq` and this one is not strictly newer than the highest we
+        // have accepted, it carries stale state and applying it would revert newer
+        // reported shards/address. `seq == 0` means the sender doesn't sequence
+        // (legacy), so it is never rejected on that basis. Liveness is unaffected —
+        // a strictly newer heartbeat already refreshed it more recently.
+        if let Some(existing) = nodes.get(node_id) {
+            if report.seq != 0 && report.seq <= existing.last_seq {
+                tracing::debug!(
+                    node = %node_id,
+                    seq = report.seq,
+                    last_seq = existing.last_seq,
+                    "membership: ignoring stale/duplicate heartbeat (seq not newer)"
+                );
+                return existing.health;
+            }
+        }
         let known = nodes.contains_key(node_id);
         let entry = nodes.entry(node_id.clone()).or_insert_with(|| NodeInfo {
             node_id: node_id.clone(),
@@ -78,6 +95,7 @@ impl Membership {
             last_seen_ms: now_ms,
             hosted_shards: Vec::new(),
             leading_shards: Vec::new(),
+            last_seq: 0,
         });
         entry.last_seen_ms = now_ms;
         if !report.address.is_empty() {
