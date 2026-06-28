@@ -901,6 +901,8 @@ mod tests {
         nodes: HashMap<NodeId, Raft>,
         durable: HashMap<NodeId, Persisted>,
         applied: HashMap<NodeId, Vec<Command>>,
+        /// Last snapshot bytes each member restored via InstallSnapshot.
+        snapshots: HashMap<NodeId, Vec<u8>>,
         down: HashSet<NodeId>,
     }
 
