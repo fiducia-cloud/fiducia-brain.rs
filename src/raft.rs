@@ -534,7 +534,11 @@ impl Raft {
         if resp.success {
             self.match_index.insert(from.clone(), resp.match_index);
             self.next_index.insert(from, resp.match_index + 1);
-            self.maybe_advance_commit();
+            if self.maybe_advance_commit() {
+                // Tell followers the commit point moved so they apply promptly,
+                // instead of waiting for the next heartbeat.
+                self.broadcast_append();
+            }
         } else {
             // Fast-rewind next_index toward the follower's hint and retry.
             let backed = resp.match_index + 1;
