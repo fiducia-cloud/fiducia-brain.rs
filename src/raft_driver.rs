@@ -178,6 +178,7 @@ impl RaftControlPlane {
             engine: Mutex::new(engine),
             store,
             transport,
+            raft_secret: raft_secret_from_env(),
             outbox,
             outbox_rx: Mutex::new(Some(rx)),
             io_lock: Mutex::new(()),
