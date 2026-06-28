@@ -57,7 +57,7 @@ impl Membership {
     /// store its reported address, failure domain, and shard set (registering it
     /// if new). A `Draining` node that keeps heartbeating stays `Draining` — the
     /// operator's intent to remove it isn't undone by liveness.
-    pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) {
+    pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) -> NodeHealth {
         let mut nodes = self.nodes.lock().unwrap();
         let known = nodes.contains_key(node_id);
         let entry = nodes.entry(node_id.clone()).or_insert_with(|| NodeInfo {
