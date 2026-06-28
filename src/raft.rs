@@ -50,6 +50,13 @@ pub struct Persisted {
     pub voted_for: Option<NodeId>,
     pub commit_index: u64,
     pub log: Vec<LogEntry>,
+    /// Snapshot base: everything at or before `base_index` (term `base_term`) is
+    /// compacted out of `log` and folded into `snapshot` (the serialized state
+    /// machine at that point). `0` / `None` ⇒ nothing compacted yet (the log
+    /// still starts at index 1, exactly as before compaction existed).
+    pub base_index: u64,
+    pub base_term: u64,
+    pub snapshot: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
