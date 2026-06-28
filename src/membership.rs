@@ -217,6 +217,40 @@ mod tests {
         assert_eq!(m.snapshot()[0].health, NodeHealth::Healthy);
     }
 
+    /// An oracle with a fixed verdict, for exercising the hybrid detector.
+    struct FixedOracle(PodLiveness);
+    impl LivenessOracle for FixedOracle {
+        fn liveness(&self, _node_id: &str) -> PodLiveness {
+            self.0
+        }
+    }
+
+    #[test]
+    fn oracle_confirmed_gone_declares_dead_before_the_timeout() {
+        // Pod is gone per k8s: declare Dead immediately, without waiting out
+        // dead_after (here the node has been silent for only 1ms).
+        let m = Membership::with_oracle(
+            MembershipConfig { suspect_after_ms: 1_000, dead_after_ms: 60_000 },
+            Arc::new(FixedOracle(PodLiveness::Gone)),
+        );
+        m.heartbeat(&"a".to_string(), 0, report("gcp", &[0]));
+        assert_eq!(m.sweep(1), vec!["a".to_string()], "gone pod is dead now");
+        assert_eq!(m.snapshot()[0].health, NodeHealth::Dead);
+    }
+
+    #[test]
+    fn oracle_running_holds_a_silent_node_at_suspect_not_dead() {
+        // Pod is Running per k8s but heartbeats stopped (network blip): we must
+        // NOT declare it Dead and trigger re-replication — hold it at Suspect.
+        let m = Membership::with_oracle(
+            MembershipConfig { suspect_after_ms: 1_000, dead_after_ms: 5_000 },
+            Arc::new(FixedOracle(PodLiveness::Running)),
+        );
+        m.heartbeat(&"a".to_string(), 0, report("gcp", &[0]));
+        assert!(m.sweep(1_000_000).is_empty(), "running pod is never declared dead on silence");
+        assert_eq!(m.snapshot()[0].health, NodeHealth::Suspect);
+    }
+
     #[test]
     fn draining_is_sticky_across_heartbeats_and_sweeps() {
         let m = Membership::new(MembershipConfig::default());
