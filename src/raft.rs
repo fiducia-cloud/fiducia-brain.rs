@@ -476,6 +476,8 @@ impl Raft {
             RaftMessage::RequestVoteResp(resp) => self.handle_vote_resp(from, resp),
             RaftMessage::AppendEntries(req) => self.handle_append(from, req),
             RaftMessage::AppendEntriesResp(resp) => self.handle_append_resp(from, resp),
+            RaftMessage::InstallSnapshot(req) => self.handle_install_snapshot(from, req),
+            RaftMessage::InstallSnapshotResp(resp) => self.handle_install_snapshot_resp(from, resp),
         }
     }
 
