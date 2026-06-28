@@ -131,6 +131,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             let id = std::env::var("FIDUCIA_BRAIN_ID")
                 .unwrap_or_else(|_| format!("http://localhost:{port}"));
+            // Peers must EXCLUDE self. Operators commonly list every member
+            // (including this one) in FIDUCIA_BRAIN_PEERS, so filter our own id out
+            // — otherwise quorum is inflated (a 3-member group would wrongly need
+            // all 3, losing fault tolerance) and the member would RPC itself.
+            let peers: Vec<String> = peers.into_iter().filter(|p| p != &id).collect();
             let data_dir = std::env::var("FIDUCIA_DATA_DIR")
                 .unwrap_or_else(|_| "/tmp/fiducia-brain".to_string());
             // Fail closed: if we can't open our durable Raft home, we must not run.
