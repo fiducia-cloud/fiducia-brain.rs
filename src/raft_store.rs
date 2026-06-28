@@ -26,6 +26,11 @@ struct Meta {
     current_term: u64,
     voted_for: Option<String>,
     commit_index: u64,
+    /// Snapshot base (0 until the log has been compacted at least once).
+    #[serde(default)]
+    base_index: u64,
+    #[serde(default)]
+    base_term: u64,
 }
 
 /// A brain member's durable Raft home under `<dir>/`: a `meta` file and a `log`.
