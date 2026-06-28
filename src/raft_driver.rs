@@ -138,6 +138,7 @@ impl RaftControlPlane {
             transport,
             outbox,
             outbox_rx: Mutex::new(Some(rx)),
+            io_lock: Mutex::new(()),
             membership,
             placement,
             plan,
