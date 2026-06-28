@@ -282,4 +282,67 @@ mod tests {
         assert!(m.sweep(1_000_000).is_empty());
         assert_eq!(m.snapshot()[0].health, NodeHealth::Draining);
     }
+
+    #[test]
+    fn a_stale_or_duplicate_heartbeat_does_not_overwrite_newer_state() {
+        let m = Membership::new(MembershipConfig::default());
+        // seq 5: node leads shards [0, 1].
+        m.heartbeat(
+            &"a".to_string(),
+            1_000,
+            HeartbeatReport { seq: 5, ..report("gcp", &[0, 1]) },
+        );
+        assert_eq!(m.snapshot()[0].leading_shards, vec![0, 1]);
+
+        // A delayed/duplicated heartbeat with an OLDER seq and no shards arrives.
+        // It must be ignored, not revert the node to leading nothing.
+        m.heartbeat(
+            &"a".to_string(),
+            2_000,
+            HeartbeatReport { seq: 3, ..report("gcp", &[]) },
+        );
+        assert_eq!(
+            m.snapshot()[0].leading_shards,
+            vec![0, 1],
+            "older heartbeat ignored — newer reported state preserved"
+        );
+
+        // A duplicate of the latest seq is likewise ignored.
+        m.heartbeat(
+            &"a".to_string(),
+            2_500,
+            HeartbeatReport { seq: 5, ..report("gcp", &[]) },
+        );
+        assert_eq!(
+            m.snapshot()[0].leading_shards,
+            vec![0, 1],
+            "duplicate seq ignored"
+        );
+
+        // A strictly newer seq is applied.
+        m.heartbeat(
+            &"a".to_string(),
+            3_000,
+            HeartbeatReport { seq: 6, ..report("gcp", &[7]) },
+        );
+        assert_eq!(
+            m.snapshot()[0].leading_shards,
+            vec![7],
+            "newer heartbeat applied"
+        );
+    }
+
+    #[test]
+    fn unsequenced_heartbeats_seq_zero_are_always_applied() {
+        // A legacy sidecar that doesn't stamp seq (always 0) must keep working:
+        // every heartbeat is accepted (no false "stale" rejection).
+        let m = Membership::new(MembershipConfig::default());
+        m.heartbeat(&"a".to_string(), 0, report("gcp", &[0]));
+        m.heartbeat(&"a".to_string(), 1, report("gcp", &[1]));
+        assert_eq!(
+            m.snapshot()[0].leading_shards,
+            vec![1],
+            "latest unsequenced heartbeat wins"
+        );
+    }
 }
