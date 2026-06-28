@@ -68,15 +68,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_factor: cluster.replication_factor,
     }));
 
+    // Liveness uses pure timeouts until the k8s `KubeOracle` is wired (Milestone
+    // 3); `Membership::new` installs the `NullOracle`.
     let membership = Arc::new(Membership::new(membership::MembershipConfig::default()));
     let placement = Arc::new(Placement::new(cluster.shard_count));
-    let scheduler = Arc::new(Scheduler::new(
+
+    // The brain's own control plane. Single-member today (always leader, in-proc
+    // apply); the replicated Raft engine drops in behind this same trait.
+    let control_plane: Arc<dyn ControlPlane> = Arc::new(LocalControlPlane::new(
         membership.clone(),
         placement.clone(),
         plan.clone(),
     ));
 
-    // Kick off the reconciliation loop (sweeps failures, then reconciles).
+    let scheduler = Arc::new(Scheduler::new(
+        membership.clone(),
+        placement.clone(),
+        plan.clone(),
+        control_plane.clone(),
+    ));
+
+    // Kick off the reconciliation loop (sweeps failures, then reconciles) — it
+    // only acts while this member is the leader.
     tokio::spawn(scheduler.clone().run());
 
     let state = BrainState {
@@ -84,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         membership,
         placement,
         plan: plan.clone(),
+        control_plane,
     };
 
     let app = Router::new()
