@@ -626,4 +626,86 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    async fn await_leader(cps: &[Arc<RaftControlPlane>], timeout: Duration) -> Option<usize> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(i) = cps.iter().position(|cp| cp.is_leader()) {
+                return Some(i);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The real thing: three drivers on localhost HTTP ports elect a leader and
+    /// replicate a command over `Transport::Http` + `raft_router` (vote/append) —
+    /// exercising the serialize → POST → handler → reply → `deliver` path that the
+    /// in-process engine harness in `raft.rs` does not.
+    #[tokio::test]
+    async fn three_brains_elect_and_replicate_over_http() {
+        // Bind three ephemeral ports first so every member knows all peers' URLs.
+        let mut listeners = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            ids.push(format!("http://{}", l.local_addr().unwrap()));
+            listeners.push(l);
+        }
+
+        let mut cps = Vec::new();
+        let mut plans = Vec::new();
+        for (i, listener) in listeners.into_iter().enumerate() {
+            let peers: Vec<String> = ids
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, id)| id.clone())
+                .collect();
+            let (membership, placement, plan) = handles();
+            let cp = RaftControlPlane::new(
+                ids[i].clone(),
+                peers,
+                cfg(),
+                None, // in-memory: this test exercises the HTTP path, not durability
+                Persisted::default(),
+                Transport::http(),
+                membership,
+                placement,
+                plan.clone(),
+            );
+            cp.spawn();
+            let app = raft_router(cp.clone());
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            cps.push(cp);
+            plans.push(plan);
+        }
+
+        // A leader must emerge from real elections over HTTP.
+        let leader = await_leader(&cps, Duration::from_secs(5))
+            .await
+            .expect("a leader is elected over HTTP");
+
+        // Propose through the leader; it must replicate + apply on all three.
+        assert!(cps[leader].propose(Command::SetScalePlan(ScalePlan {
+            target_nodes: 7,
+            replication_factor: 3,
+        })));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if plans.iter().all(|p| p.lock().unwrap().target_nodes == 7) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scale plan did not replicate to all members over HTTP"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
