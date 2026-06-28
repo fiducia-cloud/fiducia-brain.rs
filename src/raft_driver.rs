@@ -250,6 +250,15 @@ impl RaftControlPlane {
                 // then lose a recorded vote or entry — a safety violation). The IO
                 // lock orders the writes, and re-reading current state under it
                 // means a later save never regresses what an earlier one persisted.
+                //
+                // The fsync is synchronous and must finish before this RPC is acked
+                // (a follower must never acknowledge an entry it has not durably
+                // stored), so the latency is fundamental, not a bug. It runs on a
+                // Tokio worker; at the brain's low write rate (3-member group,
+                // ~150ms heartbeats) that is fine, and compaction keeps each write
+                // small by bounding the log. If write rate ever grows, move the
+                // fsync to a dedicated persister thread the async handler awaits via
+                // a oneshot — keeping persist-before-ack without parking a worker.
                 let _io = self.io_lock.lock().unwrap();
                 let snapshot = self.engine.lock().unwrap().persisted_snapshot();
                 if let Err(err) = store.save(&snapshot) {
