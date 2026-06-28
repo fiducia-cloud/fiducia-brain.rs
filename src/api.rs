@@ -63,15 +63,34 @@ pub fn router(state: BrainState) -> Router {
         .with_state(state)
 }
 
-/// `GET /v1/status` — control-plane summary.
+/// `GET /v1/status` — control-plane summary + placement health. Surfaces the gap
+/// between *desired* (`ScalePlan`) and *observed* (membership) so operators can
+/// see at a glance whether the cluster is converged or under-replicated.
 async fn status(State(s): State<BrainState>) -> Json<Value> {
+    let nodes = s.membership.snapshot();
+    let healthy = nodes
+        .iter()
+        .filter(|n| n.health == NodeHealth::Healthy)
+        .count();
+    let plan = s.plan.lock().unwrap().clone();
+    let rf = plan.replication_factor.max(1);
+    let placed = s.placement.snapshot();
+    let under_replicated = placed
+        .iter()
+        .filter(|a| (a.replicas.len() as u32) < rf)
+        .count();
     Json(json!({
         "service": "fiducia-brain",
         "version": env!("CARGO_PKG_VERSION"),
         "cluster_id": s.config.cluster_id,
-        "nodes": s.membership.snapshot().len(),
         "shard_count": s.config.shard_count,
-        "replication_factor": s.config.replication_factor,
+        "replication_factor": rf,
+        "nodes": nodes.len(),
+        "healthy_nodes": healthy,
+        "desired_nodes": plan.target_nodes,
+        "placed_shards": placed.len(),
+        "under_replicated_shards": under_replicated,
+        "placement_generation": s.placement.generation(),
     }))
 }
 
