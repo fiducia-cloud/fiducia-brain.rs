@@ -116,9 +116,8 @@ impl Membership {
     }
 
     /// Drop a node from the registry entirely (after it has been drained and holds
-    /// nothing). Returns whether it was present. Exposed for the operator
-    /// "finalize removal" step once a drained node's replicas have all moved.
-    #[allow(dead_code)]
+    /// nothing). Returns whether it was present. Driven by the reconciler's
+    /// scale-down finalize via [`crate::cluster::Command::ForgetNode`].
     pub fn forget(&self, node_id: &NodeId) -> bool {
         self.nodes.lock().unwrap().remove(node_id).is_some()
     }
