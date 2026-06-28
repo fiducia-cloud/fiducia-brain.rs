@@ -640,12 +640,17 @@ impl Raft {
 
     fn send_append(&mut self, peer: &NodeId) {
         let next = self.next_index.get(peer).copied().unwrap_or(self.last_index() + 1);
+        // The follower needs an entry we have already compacted away → ship the
+        // snapshot instead of log entries it can no longer receive.
+        if next <= self.base_index {
+            self.send_snapshot(peer);
+            return;
+        }
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index);
-        let entries = if next <= self.last_index() {
-            self.log[(next - 1) as usize..].to_vec()
-        } else {
-            Vec::new()
+        let entries = match self.log_slot(next) {
+            Some(slot) => self.log[slot..].to_vec(),
+            None => Vec::new(),
         };
         let req = AppendEntriesReq {
             term: self.current_term,
