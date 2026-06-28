@@ -104,11 +104,18 @@ impl RaftStore {
     /// Durably save hard state + log. The log is written **first**, then meta, so
     /// `commit_index` can never reference entries that aren't yet on disk.
     pub fn save(&self, p: &Persisted) -> io::Result<()> {
+        // Snapshot first, then log, then meta — so the `base_index`/`commit_index`
+        // recorded in meta can never reference a snapshot or entries not yet on disk.
+        if let Some(snapshot) = &p.snapshot {
+            atomic_write(&self.snapshot_path, snapshot, &self.dir)?;
+        }
         self.write_log(&p.log)?;
         self.write_meta(&Meta {
             current_term: p.current_term,
             voted_for: p.voted_for.clone(),
             commit_index: p.commit_index,
+            base_index: p.base_index,
+            base_term: p.base_term,
         })
     }
 
