@@ -106,6 +106,7 @@ impl Membership {
         }
         entry.hosted_shards = report.hosted_shards;
         entry.leading_shards = report.leading_shards;
+        entry.last_seq = entry.last_seq.max(report.seq);
         if entry.health != NodeHealth::Draining {
             entry.health = NodeHealth::Healthy;
         }
