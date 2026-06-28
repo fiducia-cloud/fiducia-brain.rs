@@ -289,6 +289,51 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_is_sorted_by_node_id() {
+        let m = Membership::new(MembershipConfig::default());
+        m.heartbeat(&"node-c".to_string(), 0, report("c", &[2]));
+        m.heartbeat(&"node-a".to_string(), 0, report("a", &[0]));
+        m.heartbeat(&"node-b".to_string(), 0, report("b", &[1]));
+
+        let ids: Vec<String> = m.snapshot().into_iter().map(|node| node.node_id).collect();
+
+        assert_eq!(ids, vec!["node-a", "node-b", "node-c"]);
+    }
+
+    #[test]
+    fn forget_removes_known_node_and_reports_absent_nodes() {
+        let m = Membership::new(MembershipConfig::default());
+        m.heartbeat(&"node-a".to_string(), 0, report("gcp", &[0]));
+
+        assert_eq!(m.snapshot().len(), 1);
+        assert!(m.forget(&"node-a".to_string()));
+        assert!(m.snapshot().is_empty());
+        assert!(!m.forget(&"node-a".to_string()));
+    }
+
+    #[test]
+    fn empty_heartbeat_fields_do_not_erase_existing_address_or_domain() {
+        let m = Membership::new(MembershipConfig::default());
+        m.heartbeat(&"node-a".to_string(), 0, report("GCP/US", &[0]));
+        m.heartbeat(
+            &"node-a".to_string(),
+            1_000,
+            HeartbeatReport {
+                address: String::new(),
+                failure_domain: String::new(),
+                hosted_shards: vec![1],
+                leading_shards: vec![],
+                ..HeartbeatReport::default()
+            },
+        );
+
+        let node = m.snapshot().remove(0);
+        assert_eq!(node.address, "10.0.0.1:8090");
+        assert_eq!(node.failure_domain, "gcp/us");
+        assert_eq!(node.hosted_shards, vec![1]);
+    }
+
+    #[test]
     fn detector_config_keeps_dead_after_suspect() {
         assert_eq!(dead_after_ms_after(6_000, 1_000), 6_001);
         assert_eq!(dead_after_ms_after(6_000, 30_000), 30_000);
