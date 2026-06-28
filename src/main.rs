@@ -48,6 +48,9 @@ use cluster::{ControlPlane, LocalControlPlane};
 use membership::Membership;
 use model::ScalePlan;
 use placement::Placement;
+use raft::RaftConfig;
+use raft_driver::RaftControlPlane;
+use raft_store::RaftStore;
 use scheduler::Scheduler;
 
 const SERVICE: &str = "fiducia-brain";
