@@ -871,6 +871,7 @@ impl Raft {
         Ready {
             persist,
             restore,
+            applied_upto: self.last_applied,
             messages,
             committed,
         }
