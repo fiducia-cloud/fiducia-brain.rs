@@ -198,9 +198,18 @@ impl RaftControlPlane {
     /// `reply_to` is set (an inbound RPC), the single response addressed back to
     /// that peer is returned for the HTTP reply rather than dispatched.
     fn drain(&self, ready: Ready, reply_to: Option<&NodeId>) -> Option<RaftMessage> {
-        if let Some(persisted) = &ready.persist {
+        if ready.persist.is_some() {
             if let Some(store) = &self.store {
-                if let Err(err) = store.save(persisted) {
+                // Serialize persistence and write the engine's LATEST durable
+                // state. Concurrent delivers can each yield a dirty `ready`;
+                // without this, two saves would race on the shared temp file AND
+                // could write an older snapshot after a newer one (a restart could
+                // then lose a recorded vote or entry — a safety violation). The IO
+                // lock orders the writes, and re-reading current state under it
+                // means a later save never regresses what an earlier one persisted.
+                let _io = self.io_lock.lock().unwrap();
+                let snapshot = self.engine.lock().unwrap().persisted_snapshot();
+                if let Err(err) = store.save(&snapshot) {
                     // Durability is the whole point; surface loudly. (A hardening
                     // step could step the member down on repeated failures.)
                     tracing::error!("raft: failed to persist state: {err}");
