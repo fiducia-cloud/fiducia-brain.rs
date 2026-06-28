@@ -88,6 +88,7 @@ impl Membership {
                 "membership: new node registered via heartbeat"
             );
         }
+        entry.health
     }
 
     /// Begin draining a node ahead of removal (scale-down / maintenance): the
