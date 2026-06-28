@@ -83,13 +83,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let membership = Arc::new(Membership::new(membership::MembershipConfig::default()));
     let placement = Arc::new(Placement::new(cluster.shard_count));
 
-    // The brain's own control plane. Single-member today (always leader, in-proc
-    // apply); the replicated Raft engine drops in behind this same trait.
-    let control_plane: Arc<dyn ControlPlane> = Arc::new(LocalControlPlane::new(
-        membership.clone(),
-        placement.clone(),
-        plan.clone(),
-    ));
+    // Where this brain member listens (and the default for its own address).
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8095);
+
+    // The brain's own control plane. With `FIDUCIA_BRAIN_PEERS` set, run the
+    // replicated Raft (one member per cloud): durable state in `FIDUCIA_DATA_DIR`,
+    // and a single elected leader that alone reconciles. Unset ⇒ a single-member
+    // `LocalControlPlane` (local dev / one box) — always leader, no replication.
+    let peers: Vec<String> = std::env::var("FIDUCIA_BRAIN_PEERS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (control_plane, raft): (Arc<dyn ControlPlane>, Option<Arc<RaftControlPlane>>) =
+        if peers.is_empty() {
+            tracing::info!("control plane: single-member (FIDUCIA_BRAIN_PEERS unset) — no replication");
+            (
+                Arc::new(LocalControlPlane::new(
+                    membership.clone(),
+                    placement.clone(),
+                    plan.clone(),
+                )),
+                None,
+            )
+        } else {
+            let id = std::env::var("FIDUCIA_BRAIN_ID")
+                .unwrap_or_else(|_| format!("http://localhost:{port}"));
+            let data_dir = std::env::var("FIDUCIA_DATA_DIR")
+                .unwrap_or_else(|_| "/tmp/fiducia-brain".to_string());
+            // Fail closed: if we can't open our durable Raft home, we must not run.
+            let (store, restored) = RaftStore::open(&data_dir)?;
+            tracing::info!(
+                %id, ?peers, %data_dir,
+                "control plane: Raft ({} members) — replicating placement + scale plan",
+                peers.len() + 1
+            );
+            let rcp = RaftControlPlane::new(
+                id,
+                peers,
+                RaftConfig::default(),
+                Some(store),
+                restored,
+                raft_driver::Transport::http(),
+                membership.clone(),
+                placement.clone(),
+                plan.clone(),
+            );
+            rcp.spawn();
+            (rcp.clone(), Some(rcp))
+        };
 
     let scheduler = Arc::new(Scheduler::new(
         membership.clone(),
@@ -110,10 +160,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         control_plane,
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(health))
-        .nest("/v1", api::router(state))
+        .nest("/v1", api::router(state));
+    // Peer-facing Raft RPC endpoints — only when replication is enabled.
+    if let Some(rcp) = raft {
+        app = app.merge(raft_driver::raft_router(rcp));
+    }
+    let app = app
         // Hardening stack (outermost last): catch handler panics → 500, bound
         // request time, and cap body size.
         .layer(TraceLayer::new_for_http())
@@ -121,10 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new());
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8095);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     let shape = plan.lock().unwrap().clone();
