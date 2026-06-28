@@ -364,9 +364,19 @@ mod tests {
         panic!("single member did not elect itself");
     }
 
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fiducia-driver-{tag}-{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
     #[test]
     fn single_member_driver_commits_persists_and_applies() {
-        let dir = std::env::temp_dir().join(format!("fiducia-driver-{:?}", std::ptr::addr_of!(cfg)));
+        let dir = unique_dir("commit");
         let (store, restored) = RaftStore::open(&dir).unwrap();
         let (membership, placement, plan) = handles();
         let cp = RaftControlPlane::new(
