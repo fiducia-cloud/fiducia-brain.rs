@@ -12,6 +12,7 @@
 //! group — is the remaining HA work (see `assign`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::model::{ShardAssignment, ShardId};
@@ -19,6 +20,10 @@ use crate::model::{ShardAssignment, ShardId};
 /// The cluster-wide shard → replicas/leader map.
 pub struct Placement {
     shard_count: u32,
+    /// Monotonic version, bumped on every [`Placement::assign`]. Data-plane nodes
+    /// and the load balancer poll this to detect "did the map change?" cheaply
+    /// without diffing the whole snapshot every tick.
+    generation: AtomicU64,
     assignments: Mutex<HashMap<ShardId, ShardAssignment>>,
 }
 
@@ -26,12 +31,18 @@ impl Placement {
     pub fn new(shard_count: u32) -> Self {
         Placement {
             shard_count,
+            generation: AtomicU64::new(0),
             assignments: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn shard_count(&self) -> u32 {
         self.shard_count
+    }
+
+    /// Current placement-map version (bumps on every assignment change).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     /// Current assignment for one shard, if placed.
