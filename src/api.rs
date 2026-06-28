@@ -169,6 +169,8 @@ async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) ->
 /// its next tick. `replication_factor` is clamped to ≥ 1.
 async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Json<Value> {
     plan.replication_factor = plan.replication_factor.max(1);
-    *s.plan.lock().unwrap() = plan.clone();
+    // Operator intent is durable state: route it through the control plane so it
+    // replicates (and, under the replicated engine, only the leader accepts it).
+    s.control_plane.propose(Command::SetScalePlan(plan.clone()));
     Json(json!({ "ok": true, "plan": plan }))
 }
