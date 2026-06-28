@@ -39,6 +39,12 @@ pub struct NodeInfo {
     /// Shards this node reports hosting, and whether it leads them.
     pub hosted_shards: Vec<ShardId>,
     pub leading_shards: Vec<ShardId>,
+    /// Highest heartbeat `seq` accepted from this node. A heartbeat whose `seq`
+    /// is not strictly greater is a reordered or duplicated delivery and is
+    /// ignored, so older in-flight state can never overwrite newer (see
+    /// [`HeartbeatReport::seq`]).
+    #[serde(default)]
+    pub last_seq: u64,
 }
 
 /// The body a data-plane node (its sidecar) posts to `/v1/nodes/{id}/heartbeat`.
