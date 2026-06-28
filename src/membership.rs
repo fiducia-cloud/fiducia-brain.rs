@@ -11,9 +11,10 @@
 //! `dead_after` ms it is `Dead` and its replicas are re-placed.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::model::{HeartbeatReport, NodeHealth, NodeId, NodeInfo};
+use crate::oracle::{LivenessOracle, NullOracle, PodLiveness};
 
 /// Failure-detector timing. Defaults assume a ~1s heartbeat from the sidecar.
 #[derive(Debug, Clone, Copy)]
