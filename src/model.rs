@@ -60,7 +60,7 @@ pub struct HeartbeatReport {
 
 /// The authoritative placement for one shard: which nodes replicate it and which
 /// one the brain wants to lead it. Data-plane nodes reconcile toward this.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardAssignment {
     pub shard_id: ShardId,
     /// Nodes that should hold a replica of this shard.
