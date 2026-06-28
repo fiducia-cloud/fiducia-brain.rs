@@ -47,8 +47,12 @@ const COMPACT_LOG_THRESHOLD: usize = 256;
 /// Peer transport for Raft RPCs. `None` from `send` means "couldn't reach the
 /// peer this time" — Raft tolerates dropped messages and retries on the next tick.
 pub enum Transport {
-    /// Production: JSON-over-HTTP to a peer's `/raft/{vote,append}` endpoints.
-    Http(reqwest::Client),
+    /// Production: JSON-over-HTTP to a peer's `/raft/{vote,append,snapshot}`
+    /// endpoints, bearer-authenticated with the shared secret when one is set.
+    Http {
+        client: reqwest::Client,
+        secret: Option<String>,
+    },
     /// Tests / degenerate single-member: never sends (there are no peers).
     #[cfg(test)]
     Disabled,
@@ -56,21 +60,30 @@ pub enum Transport {
 
 impl Transport {
     pub fn http() -> Self {
-        Transport::Http(
-            reqwest::Client::builder()
+        Transport::Http {
+            client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
                 .unwrap_or_default(),
-        )
+            secret: raft_secret_from_env(),
+        }
     }
 
     async fn send(&self, to: &NodeId, msg: RaftMessage) -> Option<RaftMessage> {
         match self {
-            Transport::Http(client) => http_send(client, to, msg).await,
+            Transport::Http { client, secret } => http_send(client, secret, to, msg).await,
             #[cfg(test)]
             Transport::Disabled => None,
         }
     }
+}
+
+/// The shared secret peer brains authenticate Raft RPCs with, from
+/// `FIDUCIA_BRAIN_RAFT_SECRET`. `None` (unset/empty) ⇒ auth disabled (dev / single box).
+fn raft_secret_from_env() -> Option<String> {
+    std::env::var("FIDUCIA_BRAIN_RAFT_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Send one Raft *request* to a peer and return its *response* message. Responses
