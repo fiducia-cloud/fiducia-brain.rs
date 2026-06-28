@@ -394,6 +394,40 @@ async fn append(
     Json(cp.handle_append_entries(req))
 }
 
+async fn snapshot(
+    State(cp): State<Arc<RaftControlPlane>>,
+    Json(req): Json<InstallSnapshotReq>,
+) -> Json<InstallSnapshotResp> {
+    Json(cp.handle_install_snapshot(req))
+}
+
+/// The brain's replicated state machine, serialized for a Raft snapshot: the
+/// placement map plus the scale plan. (Membership is leader-local soft state,
+/// re-derived from heartbeats, so it is deliberately not part of the snapshot.)
+#[derive(Serialize, Deserialize)]
+struct StateSnapshot {
+    shards: Vec<ShardAssignment>,
+    plan: ScalePlan,
+}
+
+fn snapshot_state_machine(placement: &Placement, plan: &Mutex<ScalePlan>) -> Vec<u8> {
+    let snapshot = StateSnapshot {
+        shards: placement.snapshot(),
+        plan: plan.lock().unwrap().clone(),
+    };
+    serde_json::to_vec(&snapshot).unwrap_or_default()
+}
+
+fn restore_state_machine(data: &[u8], placement: &Placement, plan: &Mutex<ScalePlan>) {
+    match serde_json::from_slice::<StateSnapshot>(data) {
+        Ok(snapshot) => {
+            placement.restore_from(snapshot.shards);
+            *plan.lock().unwrap() = snapshot.plan;
+        }
+        Err(err) => tracing::error!("raft: corrupt state snapshot, not restoring: {err}"),
+    }
+}
+
 /// Deterministic per-member seed (FNV-1a of the id) so members don't all use the
 /// same randomized election timeout.
 fn seed_from(id: &str) -> u64 {
