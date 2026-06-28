@@ -98,10 +98,21 @@ impl Scheduler {
             }
         }
 
-        // Observed leader per shard, from heartbeated `leading_shards`.
+        // Observed hosting per shard, from heartbeated `hosted_shards` /
+        // `leading_shards`. `observed_replicas` lets a freshly (re)started brain —
+        // whose in-memory placement map is empty — ADOPT the data plane's actual
+        // layout as its starting point, instead of recomputing a fresh placement
+        // and ordering a wave of needless data movement on every brain restart.
         let mut observed_leader: HashMap<ShardId, NodeId> = HashMap::new();
+        let mut observed_replicas: HashMap<ShardId, Vec<NodeId>> = HashMap::new();
         for n in &nodes {
             if n.health == NodeHealth::Healthy {
+                for s in &n.hosted_shards {
+                    observed_replicas
+                        .entry(*s)
+                        .or_default()
+                        .push(n.node_id.clone());
+                }
                 for s in &n.leading_shards {
                     observed_leader.insert(*s, n.node_id.clone());
                 }
