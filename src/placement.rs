@@ -67,5 +67,6 @@ impl Placement {
             .lock()
             .unwrap()
             .insert(assignment.shard_id, assignment);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 }
