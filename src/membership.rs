@@ -97,6 +97,7 @@ impl Membership {
         let mut nodes = self.nodes.lock().unwrap();
         if let Some(info) = nodes.get_mut(node_id) {
             info.health = NodeHealth::Draining;
+            tracing::info!(node = %node_id, "membership: node marked Draining (operator scale-down/maintenance)");
             true
         } else {
             false
