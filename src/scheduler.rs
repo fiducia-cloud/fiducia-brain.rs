@@ -35,18 +35,23 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::cluster::{Command, ControlPlane};
 use crate::membership::Membership;
 use crate::model::{NodeHealth, NodeId, ScalePlan, ShardAssignment, ShardId};
 use crate::placement::Placement;
 use crate::plan::{plan_replicas, NodeSlot};
 
 /// The reconciler: reads observed state (membership), writes desired state
-/// (placement), mediated by the current [`ScalePlan`].
+/// (placement) **through the control plane** so the change is replicated, all
+/// mediated by the current [`ScalePlan`].
 pub struct Scheduler {
     membership: Arc<Membership>,
     placement: Arc<Placement>,
     /// The live scale intent; `POST /v1/scale` updates this and the loop reads it.
     plan: Arc<Mutex<ScalePlan>>,
+    /// The brain's own control plane: writes go through `propose`, and the loop
+    /// only acts while `is_leader()`.
+    cp: Arc<dyn ControlPlane>,
 }
 
 impl Scheduler {
@@ -54,11 +59,13 @@ impl Scheduler {
         membership: Arc<Membership>,
         placement: Arc<Placement>,
         plan: Arc<Mutex<ScalePlan>>,
+        cp: Arc<dyn ControlPlane>,
     ) -> Self {
         Scheduler {
             membership,
             placement,
             plan,
+            cp,
         }
     }
 
