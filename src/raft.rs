@@ -241,6 +241,19 @@ impl Raft {
         self.commit_index
     }
 
+    /// The current durable state as a WAL snapshot — the same bytes [`Raft::ready`]
+    /// returns in `persist`, but callable on demand. The driver re-reads the
+    /// *latest* state through this under its IO lock so that two concurrent
+    /// persists can never write an older snapshot over a newer one.
+    pub fn persisted_snapshot(&self) -> Persisted {
+        Persisted {
+            current_term: self.current_term,
+            voted_for: self.voted_for.clone(),
+            commit_index: self.commit_index,
+            log: self.log.clone(),
+        }
+    }
+
     fn quorum(&self) -> usize {
         (self.peers.len() + 1) / 2 + 1
     }
