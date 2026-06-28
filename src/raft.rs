@@ -809,24 +809,30 @@ impl Raft {
         let messages = std::mem::take(&mut self.out);
         let persist = if self.dirty {
             self.dirty = false;
-            Some(Persisted {
-                current_term: self.current_term,
-                voted_for: self.voted_for.clone(),
-                commit_index: self.commit_index,
-                log: self.log.clone(),
-            })
+            Some(self.persisted_snapshot())
+        } else {
+            None
+        };
+        // A freshly installed snapshot must reset the driver's state machine before
+        // any newer committed entries are applied on top of it.
+        let restore = if self.pending_restore {
+            self.pending_restore = false;
+            self.snapshot.clone()
         } else {
             None
         };
         let mut committed = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            if let Some(cmd) = &self.log[(self.last_applied - 1) as usize].command {
-                committed.push(cmd.clone());
+            if let Some(slot) = self.log_slot(self.last_applied) {
+                if let Some(cmd) = &self.log[slot].command {
+                    committed.push(cmd.clone());
+                }
             }
         }
         Ready {
             persist,
+            restore,
             messages,
             committed,
         }
