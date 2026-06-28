@@ -1,4 +1,4 @@
-//! Central cluster configuration + key→shard mapping (skeleton).
+//! Central cluster configuration + key→shard mapping.
 //!
 //! This is the **authoritative, cluster-wide configuration** every component
 //! reads. The single most important rule it encodes:
@@ -24,6 +24,8 @@ use serde::Serialize;
 
 use crate::model::ShardId;
 
+pub const SUPPORTED_REPLICATION_FACTOR: u32 = 3;
+
 /// Cluster-wide configuration. The shard parameters are effectively immutable
 /// for the cluster's life; changing `shard_count` would remap every key and is a
 /// full migration, not a scaling operation.
@@ -35,8 +37,8 @@ pub struct ClusterConfig {
     /// generously (e.g. 256/1024) so there are always enough shards to spread
     /// across the largest node count you expect.
     pub shard_count: u32,
-    /// Replicas per shard (Raft group size), e.g. 3. Independent of node count;
-    /// the cluster can never have fewer than this many nodes.
+    /// Replicas per shard (Raft group size). Fiducia's multi-cloud baseline is
+    /// fixed at RF=3: one voter per Kubernetes cluster / cloud provider.
     pub replication_factor: u32,
 }
 
@@ -49,10 +51,7 @@ impl ClusterConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(16),
-            replication_factor: std::env::var("FIDUCIA_REPLICATION_FACTOR")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3),
+            replication_factor: SUPPORTED_REPLICATION_FACTOR,
         }
     }
 
@@ -60,5 +59,17 @@ impl ClusterConfig {
     /// mapping the node and load balancer compute, by construction.
     pub fn shard_for(&self, key: &str) -> ShardId {
         fiducia_routing::shard_for(key, self.shard_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_keeps_supported_replication_factor_at_three() {
+        let config = ClusterConfig::from_env();
+        assert_eq!(config.replication_factor, SUPPORTED_REPLICATION_FACTOR);
+        assert_eq!(SUPPORTED_REPLICATION_FACTOR, 3);
     }
 }

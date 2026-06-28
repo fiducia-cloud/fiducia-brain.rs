@@ -12,7 +12,58 @@
 
 use std::collections::HashSet;
 
-use crate::model::NodeId;
+use crate::model::{NodeId, PlacementPolicy};
+
+/// A candidate replica that can lead a shard.
+#[derive(Debug, Clone)]
+pub struct LeaderSlot {
+    pub node_id: NodeId,
+    pub cloud_provider: String,
+    pub region: String,
+    pub leader_load: u32,
+}
+
+/// Pick the preferred leader target for a shard.
+///
+/// Region affinity wins first, provider affinity second, then the least-loaded
+/// leader candidate, then node id for deterministic plans. If no policy exists,
+/// this still balances leaders across healthy replicas.
+pub fn preferred_leader_for_policy(
+    policy: Option<&PlacementPolicy>,
+    replicas: &[NodeId],
+    healthy: &HashSet<NodeId>,
+    slots: &[LeaderSlot],
+) -> Option<NodeId> {
+    let home_region = policy.and_then(|p| p.home_region.as_deref());
+    let preferred_cloud = policy.and_then(|p| p.preferred_cloud_provider.as_deref());
+
+    slots
+        .iter()
+        .filter(|slot| {
+            healthy.contains(&slot.node_id) && replicas.iter().any(|r| r == &slot.node_id)
+        })
+        .min_by(|a, b| {
+            let a_region = home_region
+                .map(|region| region.eq_ignore_ascii_case(&a.region))
+                .unwrap_or(false);
+            let b_region = home_region
+                .map(|region| region.eq_ignore_ascii_case(&b.region))
+                .unwrap_or(false);
+            let a_cloud = preferred_cloud
+                .map(|cloud| cloud.eq_ignore_ascii_case(&a.cloud_provider))
+                .unwrap_or(false);
+            let b_cloud = preferred_cloud
+                .map(|cloud| cloud.eq_ignore_ascii_case(&b.cloud_provider))
+                .unwrap_or(false);
+
+            b_region
+                .cmp(&a_region)
+                .then(b_cloud.cmp(&a_cloud))
+                .then(a.leader_load.cmp(&b.leader_load))
+                .then(a.node_id.cmp(&b.node_id))
+        })
+        .map(|slot| slot.node_id.clone())
+}
 
 /// Decide the desired leader for a shard.
 ///
@@ -56,6 +107,14 @@ mod tests {
     }
     fn id(s: &str) -> NodeId {
         s.to_string()
+    }
+    fn leader_slot(id: &str, cloud: &str, region: &str, leader_load: u32) -> LeaderSlot {
+        LeaderSlot {
+            node_id: id.to_string(),
+            cloud_provider: cloud.to_string(),
+            region: region.to_string(),
+            leader_load,
+        }
     }
 
     /// The scenario from the design: preferred leader dies, a follower takes
@@ -115,6 +174,45 @@ mod tests {
         assert_eq!(
             desired_leader(None, &replicas, &set(&["c"]), Some(&id("a"))),
             None,
+        );
+    }
+
+    #[test]
+    fn policy_prefers_home_region_then_balances_leader_load() {
+        let replicas = ids(&["gcp-a", "aws-a", "aws-b", "hetzner-a"]);
+        let healthy = set(&["gcp-a", "aws-a", "aws-b", "hetzner-a"]);
+        let policy = PlacementPolicy {
+            namespace: "tenant-a".to_string(),
+            shard_id: 7,
+            home_region: Some("us-east-1".to_string()),
+            preferred_cloud_provider: None,
+        };
+        let slots = vec![
+            leader_slot("gcp-a", "gcp", "us-central1", 0),
+            leader_slot("aws-a", "aws", "us-east-1", 3),
+            leader_slot("aws-b", "aws", "us-east-1", 1),
+            leader_slot("hetzner-a", "hetzner", "nbg1", 0),
+        ];
+
+        assert_eq!(
+            preferred_leader_for_policy(Some(&policy), &replicas, &healthy, &slots).as_deref(),
+            Some("aws-b")
+        );
+    }
+
+    #[test]
+    fn no_policy_picks_least_loaded_replica() {
+        let replicas = ids(&["a", "b", "c"]);
+        let healthy = set(&["a", "b", "c"]);
+        let slots = vec![
+            leader_slot("a", "gcp", "us", 5),
+            leader_slot("b", "aws", "us", 1),
+            leader_slot("c", "hetzner", "eu", 3),
+        ];
+
+        assert_eq!(
+            preferred_leader_for_policy(None, &replicas, &healthy, &slots).as_deref(),
+            Some("b")
         );
     }
 }

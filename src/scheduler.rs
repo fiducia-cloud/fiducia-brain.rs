@@ -73,6 +73,14 @@ impl Scheduler {
             .iter()
             .map(|n| (n.node_id.clone(), n.failure_domain.clone()))
             .collect();
+        let cloud_of: HashMap<NodeId, String> = nodes
+            .iter()
+            .map(|n| (n.node_id.clone(), n.cloud_provider.clone()))
+            .collect();
+        let region_of: HashMap<NodeId, String> = nodes
+            .iter()
+            .map(|n| (n.node_id.clone(), n.region.clone()))
+            .collect();
         let healthy_ids: Vec<NodeId> = nodes
             .iter()
             .filter(|n| n.health == NodeHealth::Healthy)
@@ -82,10 +90,18 @@ impl Scheduler {
 
         // Current per-node replica load (across the existing placement) so fills
         // pick the least-loaded node and spread evens out as we go.
+        let assignments = self.placement.snapshot();
         let mut load: HashMap<NodeId, u32> = healthy_ids.iter().map(|id| (id.clone(), 0)).collect();
-        for a in self.placement.snapshot() {
+        let mut leader_load: HashMap<NodeId, u32> =
+            healthy_ids.iter().map(|id| (id.clone(), 0)).collect();
+        for a in &assignments {
             for r in &a.replicas {
                 if let Some(l) = load.get_mut(r) {
+                    *l += 1;
+                }
+            }
+            if let Some(leader) = &a.preferred_leader {
+                if let Some(l) = leader_load.get_mut(leader) {
                     *l += 1;
                 }
             }
@@ -130,22 +146,80 @@ impl Scheduler {
                 }
             }
 
+            let policy = self.placement.policy(shard);
+            let leader_slots: Vec<crate::leadership::LeaderSlot> = desired
+                .iter()
+                .map(|id| crate::leadership::LeaderSlot {
+                    node_id: id.clone(),
+                    cloud_provider: cloud_of.get(id).cloned().unwrap_or_default(),
+                    region: region_of.get(id).cloned().unwrap_or_default(),
+                    leader_load: leader_load.get(id).copied().unwrap_or(0),
+                })
+                .collect();
+            let affinity_target = crate::leadership::preferred_leader_for_policy(
+                policy.as_ref(),
+                &desired,
+                &healthy_set,
+                &leader_slots,
+            );
             let preferred_leader = crate::leadership::desired_leader(
-                current.as_ref().and_then(|a| a.preferred_leader.as_ref()),
+                affinity_target.as_ref(),
                 &desired,
                 &healthy_set,
                 observed_leader.get(&shard),
             );
+            if let Some(previous) = current.as_ref().and_then(|a| a.preferred_leader.as_ref()) {
+                if let Some(l) = leader_load.get_mut(previous) {
+                    *l = l.saturating_sub(1);
+                }
+            }
+            if let Some(next) = &preferred_leader {
+                if let Some(l) = leader_load.get_mut(next) {
+                    *l += 1;
+                }
+            }
+            if let (Some(observed), Some(target)) = (observed_leader.get(&shard), &preferred_leader)
+            {
+                if observed != target {
+                    tracing::info!(
+                        metric.name = "fiducia.brain.leader_transfer_intent",
+                        shard,
+                        from = %observed,
+                        to = %target,
+                        preferred_region = policy
+                            .as_ref()
+                            .and_then(|p| p.home_region.as_deref())
+                            .unwrap_or(""),
+                        preferred_cloud_provider = policy
+                            .as_ref()
+                            .and_then(|p| p.preferred_cloud_provider.as_deref())
+                            .unwrap_or(""),
+                        "preferred leader differs from observed leader"
+                    );
+                }
+            }
 
             let changed = match &current {
                 None => !desired.is_empty(),
-                Some(a) => a.replicas != desired || a.preferred_leader != preferred_leader,
+                Some(a) => {
+                    a.replicas != desired
+                        || a.preferred_leader != preferred_leader
+                        || a.preferred_region != policy.as_ref().and_then(|p| p.home_region.clone())
+                        || a.preferred_cloud_provider
+                            != policy
+                                .as_ref()
+                                .and_then(|p| p.preferred_cloud_provider.clone())
+                }
             };
             if changed {
                 self.placement.assign(ShardAssignment {
                     shard_id: shard,
                     replicas: desired,
                     preferred_leader,
+                    preferred_region: policy.as_ref().and_then(|p| p.home_region.clone()),
+                    preferred_cloud_provider: policy
+                        .as_ref()
+                        .and_then(|p| p.preferred_cloud_provider.clone()),
                 });
             }
         }
@@ -179,12 +253,26 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::membership::MembershipConfig;
-    use crate::model::HeartbeatReport;
+    use crate::model::{HeartbeatReport, PlacementPolicy};
 
     fn hb(domain: &str) -> HeartbeatReport {
         HeartbeatReport {
             address: "10.0.0.1:8090".to_string(),
+            cloud_provider: String::new(),
+            region: String::new(),
+            cluster_id: String::new(),
             failure_domain: domain.to_string(),
+            hosted_shards: vec![],
+            leading_shards: vec![],
+        }
+    }
+    fn hb_cloud(cloud_provider: &str, region: &str, cluster_id: &str) -> HeartbeatReport {
+        HeartbeatReport {
+            address: "10.0.0.1:8090".to_string(),
+            cloud_provider: cloud_provider.to_string(),
+            region: region.to_string(),
+            cluster_id: cluster_id.to_string(),
+            failure_domain: String::new(),
             hosted_shards: vec![],
             leading_shards: vec![],
         }
@@ -246,6 +334,68 @@ mod tests {
         let assignment = s.placement.get(0).expect("shard placed");
         assert_eq!(assignment.preferred_leader.as_deref(), Some("a"));
         assert!(assignment.replicas.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn rf3_spreads_across_clouds_and_biases_leader_to_policy_region() {
+        let s = scheduler(1, 3);
+        s.membership.heartbeat(
+            &"aws-us".to_string(),
+            0,
+            hb_cloud("aws", "us-east-1", "aws-prod"),
+        );
+        s.membership.heartbeat(
+            &"gcp-us".to_string(),
+            0,
+            hb_cloud("gcp", "us-east-1", "gcp-prod"),
+        );
+        s.membership.heartbeat(
+            &"hetzner-eu".to_string(),
+            0,
+            hb_cloud("hetzner", "nbg1", "hetzner-prod"),
+        );
+        s.placement.set_policy(PlacementPolicy {
+            namespace: "tenant-a".to_string(),
+            shard_id: 0,
+            home_region: Some("us-east-1".to_string()),
+            preferred_cloud_provider: None,
+        });
+
+        s.reconcile();
+
+        let assignment = s.placement.get(0).expect("shard placed");
+        let nodes = s.membership.snapshot();
+        let clouds: HashSet<String> = assignment
+            .replicas
+            .iter()
+            .filter_map(|replica| {
+                nodes
+                    .iter()
+                    .find(|node| &node.node_id == replica)
+                    .map(|node| node.cloud_provider.clone())
+            })
+            .collect();
+        let clusters: HashSet<String> = assignment
+            .replicas
+            .iter()
+            .filter_map(|replica| {
+                nodes
+                    .iter()
+                    .find(|node| &node.node_id == replica)
+                    .map(|node| node.cluster_id.clone())
+            })
+            .collect();
+        assert_eq!(assignment.replicas.len(), 3);
+        assert_eq!(clouds.len(), 3, "one replica per cloud provider");
+        assert_eq!(clusters.len(), 3, "one replica per Kubernetes cluster");
+
+        let preferred = assignment.preferred_leader.as_deref().unwrap();
+        let preferred_node = nodes
+            .iter()
+            .find(|node| node.node_id == preferred)
+            .expect("preferred leader exists");
+        assert_eq!(preferred_node.region, "us-east-1");
+        assert_eq!(assignment.preferred_region.as_deref(), Some("us-east-1"));
     }
 
     #[test]

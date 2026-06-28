@@ -1,23 +1,23 @@
-//! Shard placement map (skeleton).
+//! Shard placement map.
 //!
 //! The authoritative answer to "which nodes hold shard N, and who should lead
 //! it?". Data-plane nodes fetch this map and reconcile their hosted replicas
 //! toward it; the [`crate::scheduler`] rewrites it as nodes join, fail, or
 //! rebalance.
 //!
-//! In a real deployment this map is itself replicated by the brain's own Raft
-//! group, so the control plane survives losing a brain node. Skeleton: an
-//! in-memory table with the assignment logic left as `TODO`s.
+//! In this process the table is in-memory; production HA persists/replicates the
+//! same assignments through the brain control-plane store.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::model::{ShardAssignment, ShardId};
+use crate::model::{PlacementPolicy, ShardAssignment, ShardId};
 
 /// The cluster-wide shard → replicas/leader map.
 pub struct Placement {
     shard_count: u32,
     assignments: Mutex<HashMap<ShardId, ShardAssignment>>,
+    policies: Mutex<HashMap<ShardId, PlacementPolicy>>,
 }
 
 impl Placement {
@@ -25,6 +25,7 @@ impl Placement {
         Placement {
             shard_count,
             assignments: Mutex::new(HashMap::new()),
+            policies: Mutex::new(HashMap::new()),
         }
     }
 
@@ -44,10 +45,34 @@ impl Placement {
         v
     }
 
+    /// Current placement policy for one shard, if an operator has set one.
+    pub fn policy(&self, shard: ShardId) -> Option<PlacementPolicy> {
+        self.policies.lock().unwrap().get(&shard).cloned()
+    }
+
+    /// All namespace placement policies, sorted for stable API output.
+    pub fn policies_snapshot(&self) -> Vec<PlacementPolicy> {
+        let mut v: Vec<_> = self.policies.lock().unwrap().values().cloned().collect();
+        v.sort_by(|a, b| {
+            a.shard_id
+                .cmp(&b.shard_id)
+                .then(a.namespace.cmp(&b.namespace))
+        });
+        v
+    }
+
+    /// Set or replace a namespace placement policy for the shard it hashes to.
+    pub fn set_policy(&self, policy: PlacementPolicy) {
+        self.policies
+            .lock()
+            .unwrap()
+            .insert(policy.shard_id, policy);
+    }
+
     /// Install a new assignment for a shard (called by the scheduler).
     ///
-    /// TODO(cluster): propose this through the brain's Raft group so the
-    /// placement map is durable and consistent across brain nodes.
+    /// Production HA should commit this through the brain control-plane store so
+    /// placement is durable and consistent across brain nodes.
     pub fn assign(&self, assignment: ShardAssignment) {
         self.assignments
             .lock()

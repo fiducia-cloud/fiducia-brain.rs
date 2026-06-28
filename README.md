@@ -116,9 +116,9 @@ replicas per node · even **leaders** per node (the real write hotspot).
 | `src/scheduler.rs` | reconciliation loop (sweep failures → recompute placement)|
 | `src/model.rs`     | shared types                                              |
 
-> HA note: the brain's own state (membership + placement) is meant to be
-> replicated by the brain's *own* Raft group (a 3–5 node "brain cluster"), so the
-> control plane survives losing a brain node. That replication is a `TODO`.
+> HA note: the brain's own state (membership + placement) should run on a
+> durable control-plane backend or a small replicated brain cluster, so the
+> control plane survives losing a brain node.
 
 ## Run locally
 

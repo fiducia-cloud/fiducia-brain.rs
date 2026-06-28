@@ -1,4 +1,4 @@
-//! Control-plane HTTP API (skeleton handlers).
+//! Control-plane HTTP API.
 //!
 //! Two audiences:
 //!   * **data-plane nodes** heartbeat in and fetch the placement map they should
@@ -25,9 +25,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::config::ClusterConfig;
+use crate::config::{ClusterConfig, SUPPORTED_REPLICATION_FACTOR};
 use crate::membership::Membership;
-use crate::model::{HeartbeatReport, ScalePlan};
+use crate::model::{HeartbeatReport, PlacementPolicy, PlacementPolicyUpdate, ScalePlan};
 use crate::placement::Placement;
 
 /// Shared control-plane state handed to handlers.
@@ -57,6 +57,7 @@ pub fn router(state: BrainState) -> Router {
         .route("/nodes/:id", axum::routing::delete(remove_node))
         .route("/placement", get(placement))
         .route("/placement/:shard", get(placement_shard))
+        .route("/policies", get(list_policies).post(set_policy))
         .route("/scale", post(set_scale))
         .with_state(state)
 }
@@ -129,7 +130,10 @@ async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Jso
 
 /// `GET /v1/placement` — full shard map for nodes to reconcile against.
 async fn placement(State(s): State<BrainState>) -> Json<Value> {
-    Json(json!({ "shards": s.placement.snapshot() }))
+    Json(json!({
+        "shards": s.placement.snapshot(),
+        "policies": s.placement.policies_snapshot(),
+    }))
 }
 
 /// `GET /v1/placement/{shard}` — one shard's assignment.
@@ -140,10 +144,39 @@ async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) ->
     }
 }
 
+/// `GET /v1/policies` — namespace home-region/provider placement policies.
+async fn list_policies(State(s): State<BrainState>) -> Json<Value> {
+    Json(json!({ "policies": s.placement.policies_snapshot() }))
+}
+
+/// `POST /v1/policies` — set the preferred leader region/provider for the shard
+/// that owns a namespace.
+async fn set_policy(
+    State(s): State<BrainState>,
+    Json(update): Json<PlacementPolicyUpdate>,
+) -> Json<Value> {
+    let namespace = update.namespace.trim().to_string();
+    if namespace.is_empty() {
+        return Json(json!({ "ok": false, "error": "namespace_required" }));
+    }
+
+    let policy = PlacementPolicy {
+        shard_id: s.config.shard_for(&namespace),
+        namespace,
+        home_region: update.home_region.filter(|r| !r.trim().is_empty()),
+        preferred_cloud_provider: update
+            .preferred_cloud_provider
+            .filter(|p| !p.trim().is_empty()),
+    };
+    s.placement.set_policy(policy.clone());
+    Json(json!({ "ok": true, "policy": policy }))
+}
+
 /// `POST /v1/scale` — set the desired scale plan; the reconciler picks it up on
-/// its next tick. `replication_factor` is clamped to ≥ 1.
+/// its next tick. `replication_factor` is fixed at RF=3 for the multi-cloud
+/// baseline.
 async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Json<Value> {
-    plan.replication_factor = plan.replication_factor.max(1);
+    plan.replication_factor = SUPPORTED_REPLICATION_FACTOR;
     *s.plan.lock().unwrap() = plan.clone();
     Json(json!({ "ok": true, "plan": plan }))
 }
