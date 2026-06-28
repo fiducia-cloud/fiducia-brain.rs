@@ -139,6 +139,14 @@ impl Membership {
                 NodeHealth::Healthy
             };
             if new_health == NodeHealth::Dead && info.health != NodeHealth::Dead {
+                tracing::warn!(
+                    node = %info.node_id,
+                    domain = %info.failure_domain,
+                    silent_for_ms = silent_for,
+                    hosted_shards = info.hosted_shards.len(),
+                    leading_shards = info.leading_shards.len(),
+                    "membership: node declared DEAD (missed heartbeats) — its shards will be re-placed"
+                );
                 newly_dead.push(info.node_id.clone());
             }
             info.health = new_health;
