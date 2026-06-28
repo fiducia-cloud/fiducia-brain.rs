@@ -122,10 +122,14 @@ impl Scheduler {
         let mut changes = 0u32;
         for shard in 0..self.placement.shard_count() {
             let current = self.placement.get(shard);
-            let current_replicas: Vec<NodeId> = current
-                .as_ref()
-                .map(|a| a.replicas.clone())
-                .unwrap_or_default();
+            // The brain's own desired state is authoritative; but on a cold start
+            // (no desired state yet) fall back to what the nodes actually report
+            // hosting, so we reconcile observed → desired rather than blowing the
+            // existing layout away and re-placing from scratch.
+            let current_replicas: Vec<NodeId> = match &current {
+                Some(a) => a.replicas.clone(),
+                None => observed_replicas.get(&shard).cloned().unwrap_or_default(),
+            };
 
             let slots: Vec<NodeSlot> = healthy_ids
                 .iter()
