@@ -376,6 +376,7 @@ pub fn raft_router(cp: Arc<RaftControlPlane>) -> Router {
     Router::new()
         .route("/raft/vote", post(vote))
         .route("/raft/append", post(append))
+        .route("/raft/snapshot", post(snapshot))
         .with_state(cp)
 }
 
