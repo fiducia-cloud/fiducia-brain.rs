@@ -299,6 +299,9 @@ impl Raft {
             voted_for: self.voted_for.clone(),
             commit_index: self.commit_index,
             log: self.log.clone(),
+            base_index: self.base_index,
+            base_term: self.base_term,
+            snapshot: self.snapshot.clone(),
         }
     }
 
