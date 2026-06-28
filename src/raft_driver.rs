@@ -89,13 +89,20 @@ fn raft_secret_from_env() -> Option<String> {
 /// Send one Raft *request* to a peer and return its *response* message. Responses
 /// (`*Resp`) are never sent proactively — they ride back as the HTTP reply to the
 /// originating request — so they map to `None` here.
-async fn http_send(client: &reqwest::Client, to: &NodeId, msg: RaftMessage) -> Option<RaftMessage> {
+async fn http_send(
+    client: &reqwest::Client,
+    secret: &Option<String>,
+    to: &NodeId,
+    msg: RaftMessage,
+) -> Option<RaftMessage> {
     let base = to.trim_end_matches('/');
+    let auth = |req: reqwest::RequestBuilder| match secret {
+        Some(s) => req.bearer_auth(s),
+        None => req,
+    };
     match msg {
         RaftMessage::RequestVote(req) => {
-            let resp: RequestVoteResp = client
-                .post(format!("{base}/raft/vote"))
-                .json(&req)
+            let resp: RequestVoteResp = auth(client.post(format!("{base}/raft/vote")).json(&req))
                 .send()
                 .await
                 .ok()?
@@ -105,27 +112,25 @@ async fn http_send(client: &reqwest::Client, to: &NodeId, msg: RaftMessage) -> O
             Some(RaftMessage::RequestVoteResp(resp))
         }
         RaftMessage::AppendEntries(req) => {
-            let resp: AppendEntriesResp = client
-                .post(format!("{base}/raft/append"))
-                .json(&req)
-                .send()
-                .await
-                .ok()?
-                .json()
-                .await
-                .ok()?;
+            let resp: AppendEntriesResp =
+                auth(client.post(format!("{base}/raft/append")).json(&req))
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()?;
             Some(RaftMessage::AppendEntriesResp(resp))
         }
         RaftMessage::InstallSnapshot(req) => {
-            let resp: InstallSnapshotResp = client
-                .post(format!("{base}/raft/snapshot"))
-                .json(&req)
-                .send()
-                .await
-                .ok()?
-                .json()
-                .await
-                .ok()?;
+            let resp: InstallSnapshotResp =
+                auth(client.post(format!("{base}/raft/snapshot")).json(&req))
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()?;
             Some(RaftMessage::InstallSnapshotResp(resp))
         }
         RaftMessage::RequestVoteResp(_)
