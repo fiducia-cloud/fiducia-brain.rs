@@ -153,6 +153,10 @@ pub struct RaftControlPlane {
     /// Serializes WAL writes so concurrent delivers can't race on the temp file
     /// or persist an older snapshot after a newer one.
     io_lock: Mutex<()>,
+    /// Serializes state-machine mutation (snapshot restore + committed apply) so
+    /// concurrent delivers can't interleave a restore's clear+rebuild with another
+    /// drain's apply and leave the placement map torn.
+    apply_lock: Mutex<()>,
     // State-machine handles the committed log is applied to.
     membership: Arc<Membership>,
     placement: Arc<Placement>,
