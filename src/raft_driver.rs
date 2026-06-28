@@ -274,14 +274,19 @@ impl RaftControlPlane {
             }
         }
 
-        // Reset the state machine to an installed snapshot before applying anything
-        // newer on top of it (an InstallSnapshot jumps us past compacted entries).
-        if let Some(data) = &ready.restore {
-            restore_state_machine(data, &self.placement, &self.plan);
-        }
-
-        for command in ready.committed {
-            apply_command(&self.membership, &self.placement, &self.plan, command);
+        // Serialize state-machine mutation: a snapshot restore (clear + rebuild)
+        // must not interleave with another concurrent drain's committed apply, or
+        // the placement map is left torn. (Reset to an installed snapshot first,
+        // since an InstallSnapshot jumps us past compacted entries, then apply any
+        // newer committed entries on top.)
+        {
+            let _apply = self.apply_lock.lock().unwrap();
+            if let Some(data) = &ready.restore {
+                restore_state_machine(data, &self.placement, &self.plan);
+            }
+            for command in ready.committed {
+                apply_command(&self.membership, &self.placement, &self.plan, command);
+            }
         }
 
         // Bound the log: once it grows past the threshold, fold its committed prefix
