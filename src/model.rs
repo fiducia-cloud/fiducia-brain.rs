@@ -62,6 +62,13 @@ pub struct HeartbeatReport {
     /// Subset of `hosted_shards` this node currently leads.
     #[serde(default)]
     pub leading_shards: Vec<ShardId>,
+    /// Monotonic per-node sequence the sidecar stamps on each heartbeat (seeded
+    /// from its boot time, incremented per send). The brain ignores any heartbeat
+    /// whose `seq` is not strictly greater than the last it accepted, so a
+    /// reordered or duplicated POST can't revert newer reported state. `0` (the
+    /// default) means the sender doesn't sequence — never rejected on that basis.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// The authoritative placement for one shard: which nodes replicate it and which
