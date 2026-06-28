@@ -88,13 +88,26 @@ impl LocalControlPlane {
     /// Apply a committed command to the state machine. In the replicated engine
     /// this runs on every member after the entry commits; here it runs inline.
     fn apply(&self, command: Command) {
-        match command {
-            Command::AssignShard(assignment) => self.placement.assign(assignment),
-            Command::SetScalePlan(plan) => *self.plan.lock().unwrap() = plan,
-            Command::ForgetNode(node_id) => {
-                if self.membership.forget(&node_id) {
-                    tracing::info!(node = %node_id, "control-plane: forgot drained, evacuated node");
-                }
+        apply_command(&self.membership, &self.placement, &self.plan, command);
+    }
+}
+
+/// Apply one committed [`Command`] to the brain's state machine. This is the
+/// single definition of how the replicated log mutates state — used both by the
+/// in-process [`LocalControlPlane`] and the Raft driver, and replayed at boot to
+/// rebuild the state machine from the persisted log.
+pub fn apply_command(
+    membership: &Membership,
+    placement: &Placement,
+    plan: &Mutex<ScalePlan>,
+    command: Command,
+) {
+    match command {
+        Command::AssignShard(assignment) => placement.assign(assignment),
+        Command::SetScalePlan(new_plan) => *plan.lock().unwrap() = new_plan,
+        Command::ForgetNode(node_id) => {
+            if membership.forget(&node_id) {
+                tracing::info!(node = %node_id, "control-plane: forgot drained, evacuated node");
             }
         }
     }
