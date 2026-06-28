@@ -82,12 +82,105 @@ pub fn plan_replicas(current: &[NodeId], healthy: &[NodeSlot], rf: u32) -> Vec<N
             healthy
                 .iter()
                 .find(|s| &s.node_id == id)
-                .map(|s| std::cmp::Reverse(s.load))
-                .unwrap_or(std::cmp::Reverse(0))
+                .map(|s| s.load)
+                .unwrap_or(0)
         });
         chosen.truncate(rf as usize);
     }
+
+    // Full-RF shards still need to move during scale-up/rebalance. Keep this
+    // intentionally conservative: at most one replica changes per planner call,
+    // and only if it improves failure-domain spread or moves load from a busier
+    // replica to a less-loaded candidate without reducing spread.
+    if (chosen.len() as u32) == rf && !remaining.is_empty() {
+        let current_domain_count = domain_count(&chosen, healthy);
+        let mut best: Option<(usize, NodeId, i32, i64, u32, u32, NodeId)> = None;
+
+        for candidate in &remaining {
+            for (victim_index, victim_id) in chosen.iter().enumerate() {
+                let victim_load = load_for(victim_id, healthy);
+                let mut trial = chosen.clone();
+                trial[victim_index] = candidate.node_id.clone();
+
+                let trial_domain_count = domain_count(&trial, healthy);
+                let domain_gain = trial_domain_count as i32 - current_domain_count as i32;
+                let load_delta = victim_load as i64 - candidate.load as i64;
+
+                if domain_gain < 0 || (domain_gain == 0 && load_delta <= 0) {
+                    continue;
+                }
+
+                let candidate_id = candidate.node_id.clone();
+                let victim_id = victim_id.clone();
+                let is_better = match &best {
+                    None => true,
+                    Some((
+                        _,
+                        best_candidate_id,
+                        best_domain_gain,
+                        best_load_delta,
+                        best_victim_load,
+                        best_candidate_load,
+                        best_victim_id,
+                    )) => {
+                        domain_gain > *best_domain_gain
+                            || (domain_gain == *best_domain_gain && load_delta > *best_load_delta)
+                            || (domain_gain == *best_domain_gain
+                                && load_delta == *best_load_delta
+                                && victim_load > *best_victim_load)
+                            || (domain_gain == *best_domain_gain
+                                && load_delta == *best_load_delta
+                                && victim_load == *best_victim_load
+                                && candidate.load < *best_candidate_load)
+                            || (domain_gain == *best_domain_gain
+                                && load_delta == *best_load_delta
+                                && victim_load == *best_victim_load
+                                && candidate.load == *best_candidate_load
+                                && candidate_id < *best_candidate_id)
+                            || (domain_gain == *best_domain_gain
+                                && load_delta == *best_load_delta
+                                && victim_load == *best_victim_load
+                                && candidate.load == *best_candidate_load
+                                && candidate_id == *best_candidate_id
+                                && victim_id < *best_victim_id)
+                    }
+                };
+
+                if is_better {
+                    best = Some((
+                        victim_index,
+                        candidate_id,
+                        domain_gain,
+                        load_delta,
+                        victim_load,
+                        candidate.load,
+                        victim_id,
+                    ));
+                }
+            }
+        }
+
+        if let Some((victim_index, candidate_id, _, _, _, _, _)) = best {
+            chosen[victim_index] = candidate_id;
+        }
+    }
     chosen
+}
+
+fn domain_count(ids: &[NodeId], healthy: &[NodeSlot]) -> usize {
+    ids.iter()
+        .filter_map(|id| healthy.iter().find(|s| &s.node_id == id))
+        .map(|s| s.domain.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+fn load_for(id: &NodeId, healthy: &[NodeSlot]) -> u32 {
+    healthy
+        .iter()
+        .find(|s| &s.node_id == id)
+        .map(|s| s.load)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -175,5 +268,46 @@ mod tests {
         let healthy = vec![slot("a", "gcp", 0), slot("b", "aws", 0)];
         let plan = plan_replicas(&[], &healthy, 3);
         assert_eq!(plan.len(), 2);
+    }
+
+    #[test]
+    fn scale_up_replaces_an_overloaded_replica_with_a_new_underloaded_node() {
+        let healthy = vec![
+            slot("a", "gcp", 12),
+            slot("b", "aws", 12),
+            slot("c", "hetzner", 12),
+            slot("d", "gcp", 0),
+        ];
+        let plan = plan_replicas(&ids(&["a", "b", "c"]), &healthy, 3);
+
+        assert_eq!(plan.len(), 3);
+        assert!(plan.contains(&"d".to_string()));
+        assert!(!plan.contains(&"a".to_string()));
+        assert!(plan.contains(&"b".to_string()));
+        assert!(plan.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn rebalance_does_not_reduce_failure_domain_spread_for_load_only() {
+        let healthy = vec![
+            slot("a", "gcp", 12),
+            slot("b", "aws", 12),
+            slot("c", "hetzner", 12),
+            slot("d", "gcp", 0),
+        ];
+        let plan = plan_replicas(&ids(&["b", "c", "a"]), &healthy, 3);
+        let domains: std::collections::HashSet<_> = plan
+            .iter()
+            .map(|id| {
+                healthy
+                    .iter()
+                    .find(|s| &s.node_id == id)
+                    .unwrap()
+                    .domain
+                    .clone()
+            })
+            .collect();
+
+        assert_eq!(domains.len(), 3);
     }
 }

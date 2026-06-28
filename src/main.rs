@@ -57,11 +57,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Desired cluster shape. Shared (so `POST /v1/scale` can adjust it live); in a
     // real deployment this is persisted in the brain's own Raft group.
+    let target_nodes = std::env::var("FIDUCIA_TARGET_NODES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(3)
+        .max(cluster.replication_factor);
     let plan = Arc::new(Mutex::new(ScalePlan {
-        target_nodes: std::env::var("FIDUCIA_TARGET_NODES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3),
+        target_nodes,
         replication_factor: cluster.replication_factor,
     }));
 

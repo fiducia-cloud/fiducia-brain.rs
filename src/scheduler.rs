@@ -65,27 +65,54 @@ impl Scheduler {
     /// One reconciliation tick: recompute every shard's desired replicas + leader
     /// and write the ones that changed.
     pub fn reconcile(&self) {
-        let rf = self.plan.lock().unwrap().replication_factor.max(1);
+        let plan = self.plan.lock().unwrap().clone();
+        let rf = plan.replication_factor.max(1);
+        let target_nodes = plan.target_nodes.max(rf) as usize;
         let nodes = self.membership.snapshot();
 
-        // Healthy placement candidates, by id.
+        // Healthy placement candidates, by id. If more healthy nodes exist than
+        // the scale plan wants, keep the loaded ones active and let light nodes
+        // evacuate naturally as assignments are rewritten away from them.
         let domain_of: HashMap<NodeId, String> = nodes
             .iter()
             .map(|n| (n.node_id.clone(), n.failure_domain.clone()))
             .collect();
-        let healthy_ids: Vec<NodeId> = nodes
+        let cloud_of: HashMap<NodeId, String> = nodes
+            .iter()
+            .map(|n| (n.node_id.clone(), n.cloud_provider.clone()))
+            .collect();
+        let region_of: HashMap<NodeId, String> = nodes
+            .iter()
+            .map(|n| (n.node_id.clone(), n.region.clone()))
+            .collect();
+        let all_healthy_ids: Vec<NodeId> = nodes
             .iter()
             .filter(|n| n.health == NodeHealth::Healthy)
             .map(|n| n.node_id.clone())
             .collect();
-        let healthy_set: HashSet<NodeId> = healthy_ids.iter().cloned().collect();
 
         // Current per-node replica load (across the existing placement) so fills
         // pick the least-loaded node and spread evens out as we go.
-        let mut load: HashMap<NodeId, u32> = healthy_ids.iter().map(|id| (id.clone(), 0)).collect();
-        for a in self.placement.snapshot() {
+        let assignments = self.placement.snapshot();
+        let mut load: HashMap<NodeId, u32> =
+            all_healthy_ids.iter().map(|id| (id.clone(), 0)).collect();
+        for a in &assignments {
             for r in &a.replicas {
                 if let Some(l) = load.get_mut(r) {
+                    *l += 1;
+                }
+            }
+        }
+
+        let healthy_ids = active_nodes_for_target(all_healthy_ids, &load, target_nodes);
+        let healthy_set: HashSet<NodeId> = healthy_ids.iter().cloned().collect();
+        load.retain(|id, _| healthy_set.contains(id));
+
+        let mut leader_load: HashMap<NodeId, u32> =
+            healthy_ids.iter().map(|id| (id.clone(), 0)).collect();
+        for a in &assignments {
+            if let Some(leader) = &a.preferred_leader {
+                if let Some(l) = leader_load.get_mut(leader) {
                     *l += 1;
                 }
             }
@@ -130,22 +157,80 @@ impl Scheduler {
                 }
             }
 
+            let policy = self.placement.policy(shard);
+            let leader_slots: Vec<crate::leadership::LeaderSlot> = desired
+                .iter()
+                .map(|id| crate::leadership::LeaderSlot {
+                    node_id: id.clone(),
+                    cloud_provider: cloud_of.get(id).cloned().unwrap_or_default(),
+                    region: region_of.get(id).cloned().unwrap_or_default(),
+                    leader_load: leader_load.get(id).copied().unwrap_or(0),
+                })
+                .collect();
+            let affinity_target = crate::leadership::preferred_leader_for_policy(
+                policy.as_ref(),
+                &desired,
+                &healthy_set,
+                &leader_slots,
+            );
             let preferred_leader = crate::leadership::desired_leader(
-                current.as_ref().and_then(|a| a.preferred_leader.as_ref()),
+                affinity_target.as_ref(),
                 &desired,
                 &healthy_set,
                 observed_leader.get(&shard),
             );
+            if let Some(previous) = current.as_ref().and_then(|a| a.preferred_leader.as_ref()) {
+                if let Some(l) = leader_load.get_mut(previous) {
+                    *l = l.saturating_sub(1);
+                }
+            }
+            if let Some(next) = &preferred_leader {
+                if let Some(l) = leader_load.get_mut(next) {
+                    *l += 1;
+                }
+            }
+            if let (Some(observed), Some(target)) = (observed_leader.get(&shard), &preferred_leader)
+            {
+                if observed != target {
+                    tracing::info!(
+                        metric.name = "fiducia.brain.leader_transfer_intent",
+                        shard,
+                        from = %observed,
+                        to = %target,
+                        preferred_region = policy
+                            .as_ref()
+                            .and_then(|p| p.home_region.as_deref())
+                            .unwrap_or(""),
+                        preferred_cloud_provider = policy
+                            .as_ref()
+                            .and_then(|p| p.preferred_cloud_provider.as_deref())
+                            .unwrap_or(""),
+                        "preferred leader differs from observed leader"
+                    );
+                }
+            }
 
             let changed = match &current {
                 None => !desired.is_empty(),
-                Some(a) => a.replicas != desired || a.preferred_leader != preferred_leader,
+                Some(a) => {
+                    a.replicas != desired
+                        || a.preferred_leader != preferred_leader
+                        || a.preferred_region != policy.as_ref().and_then(|p| p.home_region.clone())
+                        || a.preferred_cloud_provider
+                            != policy
+                                .as_ref()
+                                .and_then(|p| p.preferred_cloud_provider.clone())
+                }
             };
             if changed {
                 self.placement.assign(ShardAssignment {
                     shard_id: shard,
                     replicas: desired,
                     preferred_leader,
+                    preferred_region: policy.as_ref().and_then(|p| p.home_region.clone()),
+                    preferred_cloud_provider: policy
+                        .as_ref()
+                        .and_then(|p| p.preferred_cloud_provider.clone()),
                 });
             }
         }
@@ -175,16 +260,51 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn active_nodes_for_target(
+    mut healthy_ids: Vec<NodeId>,
+    load: &HashMap<NodeId, u32>,
+    target_nodes: usize,
+) -> Vec<NodeId> {
+    if healthy_ids.len() <= target_nodes {
+        return healthy_ids;
+    }
+
+    healthy_ids.sort_by(|a, b| {
+        load.get(b)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&load.get(a).copied().unwrap_or(0))
+            .then(a.cmp(b))
+    });
+    healthy_ids.truncate(target_nodes);
+    healthy_ids.sort();
+    healthy_ids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::membership::MembershipConfig;
-    use crate::model::HeartbeatReport;
+    use crate::model::{HeartbeatReport, PlacementPolicy};
 
     fn hb(domain: &str) -> HeartbeatReport {
         HeartbeatReport {
             address: "10.0.0.1:8090".to_string(),
+            cloud_provider: String::new(),
+            region: String::new(),
+            cluster_id: String::new(),
             failure_domain: domain.to_string(),
+            hosted_shards: vec![],
+            leading_shards: vec![],
+        }
+    }
+    fn hb_cloud(cloud_provider: &str, region: &str, cluster_id: &str) -> HeartbeatReport {
+        HeartbeatReport {
+            address: "10.0.0.1:8090".to_string(),
+            cloud_provider: cloud_provider.to_string(),
+            region: region.to_string(),
+            cluster_id: cluster_id.to_string(),
+            failure_domain: String::new(),
             hosted_shards: vec![],
             leading_shards: vec![],
         }
@@ -249,6 +369,68 @@ mod tests {
     }
 
     #[test]
+    fn rf3_spreads_across_clouds_and_biases_leader_to_policy_region() {
+        let s = scheduler(1, 3);
+        s.membership.heartbeat(
+            &"aws-us".to_string(),
+            0,
+            hb_cloud("aws", "us-east-1", "aws-prod"),
+        );
+        s.membership.heartbeat(
+            &"gcp-us".to_string(),
+            0,
+            hb_cloud("gcp", "us-east-1", "gcp-prod"),
+        );
+        s.membership.heartbeat(
+            &"hetzner-eu".to_string(),
+            0,
+            hb_cloud("hetzner", "nbg1", "hetzner-prod"),
+        );
+        s.placement.set_policy(PlacementPolicy {
+            namespace: "tenant-a".to_string(),
+            shard_id: 0,
+            home_region: Some("us-east-1".to_string()),
+            preferred_cloud_provider: None,
+        });
+
+        s.reconcile();
+
+        let assignment = s.placement.get(0).expect("shard placed");
+        let nodes = s.membership.snapshot();
+        let clouds: HashSet<String> = assignment
+            .replicas
+            .iter()
+            .filter_map(|replica| {
+                nodes
+                    .iter()
+                    .find(|node| &node.node_id == replica)
+                    .map(|node| node.cloud_provider.clone())
+            })
+            .collect();
+        let clusters: HashSet<String> = assignment
+            .replicas
+            .iter()
+            .filter_map(|replica| {
+                nodes
+                    .iter()
+                    .find(|node| &node.node_id == replica)
+                    .map(|node| node.cluster_id.clone())
+            })
+            .collect();
+        assert_eq!(assignment.replicas.len(), 3);
+        assert_eq!(clouds.len(), 3, "one replica per cloud provider");
+        assert_eq!(clusters.len(), 3, "one replica per Kubernetes cluster");
+
+        let preferred = assignment.preferred_leader.as_deref().unwrap();
+        let preferred_node = nodes
+            .iter()
+            .find(|node| node.node_id == preferred)
+            .expect("preferred leader exists");
+        assert_eq!(preferred_node.region, "us-east-1");
+        assert_eq!(assignment.preferred_region.as_deref(), Some("us-east-1"));
+    }
+
+    #[test]
     fn a_dead_node_is_evacuated_to_a_surviving_node_on_the_next_tick() {
         let s = scheduler(4, 3);
         for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner"), ("d", "gcp")] {
@@ -271,6 +453,67 @@ mod tests {
                 "shard {shard} evacuated a"
             );
             assert_eq!(a.replicas.len(), 3, "shard {shard} restored to RF");
+        }
+    }
+
+    #[test]
+    fn scale_up_rebalance_moves_some_replicas_to_a_new_node() {
+        let s = scheduler(12, 3);
+        s.plan.lock().unwrap().target_nodes = 4;
+        s.membership.heartbeat(&"a".to_string(), 0, hb("gcp"));
+        s.membership.heartbeat(&"b".to_string(), 0, hb("aws"));
+        s.membership.heartbeat(&"c".to_string(), 0, hb("hetzner"));
+        s.reconcile();
+
+        s.membership.heartbeat(&"d".to_string(), 100, hb("gcp"));
+        s.reconcile();
+
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        for shard in 0..12 {
+            let assignment = s.placement.get(shard).expect("placed");
+            assert_eq!(assignment.replicas.len(), 3);
+            for replica in assignment.replicas {
+                *counts.entry(replica).or_default() += 1;
+            }
+        }
+        assert!(
+            counts.get("d").copied().unwrap_or(0) > 0,
+            "new node should receive replicas during scale-up rebalance"
+        );
+        assert!(
+            counts.get("a").copied().unwrap_or(0) < 12,
+            "existing node in the same failure domain should shed some replicas"
+        );
+    }
+
+    #[test]
+    fn target_nodes_excludes_lightest_nodes_from_future_placement() {
+        let s = scheduler(6, 3);
+        s.plan.lock().unwrap().target_nodes = 4;
+        for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner"), ("d", "gcp")] {
+            s.membership.heartbeat(&id.to_string(), 0, hb(dom));
+        }
+        s.reconcile();
+        assert!(
+            (0..6).any(|shard| s
+                .placement
+                .get(shard)
+                .unwrap()
+                .replicas
+                .contains(&"d".to_string())),
+            "fourth node participates before scale-down"
+        );
+
+        s.plan.lock().unwrap().target_nodes = 3;
+        s.reconcile();
+
+        for shard in 0..6 {
+            let assignment = s.placement.get(shard).unwrap();
+            assert_eq!(assignment.replicas.len(), 3);
+            assert!(
+                !assignment.replicas.contains(&"d".to_string()),
+                "lightest extra node should be evacuated from shard {shard}"
+            );
         }
     }
 }

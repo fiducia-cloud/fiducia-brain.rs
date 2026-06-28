@@ -60,6 +60,7 @@ control plane do the same thing for their range/region maps.
 | `DELETE /v1/nodes/{id}`            | operators   | drain + remove a node (scale-down)       |
 | `GET  /v1/placement`               | data plane  | full shard map to reconcile toward       |
 | `GET  /v1/placement/{shard}`       | data plane  | one shard's assignment                   |
+| `GET/POST /v1/policies`            | operators   | namespace home-region/provider policies |
 | `POST /v1/scale`                   | operators   | set the desired `ScalePlan`              |
 | `GET  /v1/status`                  | all         | control-plane status + placement health |
 
@@ -79,6 +80,12 @@ Plus `/healthz`, `/readyz`.
   moves when you add/remove nodes**. Every component computes `key → shard`
   locally (same `fnv1a`); only `shard → nodes` needs the central map.
 - **Node count is elastic.** Scaling rewrites only the `shard → nodes` placement.
+- **RF is fixed at 3 for the multi-cloud baseline.** Each shard gets one voter
+  per Kubernetes cluster / cloud provider (AWS, GCP, Hetzner). `/v1/scale`
+  preserves RF=3 even if a caller submits another replication factor.
+- **Leader placement is policy-driven.** `/v1/policies` can pin a namespace's
+  home region/provider so the scheduler prefers a nearby leader while preserving
+  the three-cloud replica spread.
 
 **Central configuration** = the brain's replicated state: the immutable
 `ClusterConfig` + the mutable `shard → {replicas, preferred_leader}` placement
@@ -116,15 +123,15 @@ replicas per node · even **leaders** per node (the real write hotspot).
 | `src/scheduler.rs` | reconciliation loop (sweep failures → recompute placement)|
 | `src/model.rs`     | shared types                                              |
 
-> HA note: the brain's own state (membership + placement) is meant to be
-> replicated by the brain's *own* Raft group (a 3–5 node "brain cluster"), so the
-> control plane survives losing a brain node. That replication is a `TODO`.
+> HA note: the brain's own state (membership + placement) should run on a
+> durable control-plane backend or a small replicated brain cluster, so the
+> control plane survives losing a brain node.
 
 ## Run locally
 
 ```bash
 cargo run     # listens on :8095 (override PORT)
-# env: FIDUCIA_SHARD_COUNT, FIDUCIA_TARGET_NODES, FIDUCIA_REPLICATION_FACTOR
+# env: FIDUCIA_SHARD_COUNT, FIDUCIA_TARGET_NODES
 curl localhost:8095/v1/status
 ```
 
