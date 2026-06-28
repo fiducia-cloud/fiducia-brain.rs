@@ -145,6 +145,8 @@ pub struct RaftControlPlane {
     /// Durable WAL. `None` disables persistence (kept for tests / in-memory runs).
     store: Option<RaftStore>,
     transport: Transport,
+    /// Shared secret a peer must present (bearer) on `/raft/*`; `None` ⇒ auth off.
+    raft_secret: Option<String>,
     /// Outbound Raft messages, drained by the spawned outbox task.
     outbox: mpsc::UnboundedSender<Vec<Addressed>>,
     outbox_rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<Addressed>>>>,
