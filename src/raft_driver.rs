@@ -38,6 +38,11 @@ use crate::raft_store::RaftStore;
 /// heartbeat and a ~500–900ms election timeout.
 const TICK_MS: u64 = 50;
 
+/// Compact the Raft log once it grows past this many live entries (folding the
+/// prefix into a state-machine snapshot). The brain's write rate is low, so this
+/// is rarely reached; it just bounds the log + WAL + restart-replay over a long life.
+const COMPACT_LOG_THRESHOLD: usize = 256;
+
 /// Peer transport for Raft RPCs. `None` from `send` means "couldn't reach the
 /// peer this time" — Raft tolerates dropped messages and retries on the next tick.
 pub enum Transport {
