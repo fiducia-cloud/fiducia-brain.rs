@@ -194,12 +194,21 @@ pub struct Raft {
     current_term: u64,
     voted_for: Option<NodeId>,
     log: Vec<LogEntry>,
+    // Snapshot base: the log's first entry is at index `base_index + 1`; entries at
+    // or before `base_index` are compacted into `snapshot` (the serialized state
+    // machine at `base_index`, term `base_term`). All zero / None ⇒ no compaction.
+    base_index: u64,
+    base_term: u64,
+    snapshot: Option<Vec<u8>>,
 
     // Volatile.
     role: Role,
     commit_index: u64,
     last_applied: u64,
     leader_id: Option<NodeId>,
+    // Set when an InstallSnapshot replaced our state; `ready()` surfaces the bytes
+    // once so the driver resets its state machine before applying newer entries.
+    pending_restore: bool,
 
     // Candidate / pre-candidate vote tally (includes self).
     votes: HashSet<NodeId>,
