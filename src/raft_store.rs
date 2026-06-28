@@ -51,10 +51,17 @@ impl RaftStore {
         fs::create_dir_all(&dir)?;
         let meta_path = dir.join("meta");
         let log_path = dir.join("log");
+        let snapshot_path = dir.join("snapshot");
 
         let meta: Meta = match fs::read(&meta_path) {
             Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes).map_err(invalid)?,
             _ => Meta::default(),
+        };
+
+        // The state-machine snapshot, present once the log has been compacted.
+        let snapshot = match fs::read(&snapshot_path) {
+            Ok(bytes) if !bytes.is_empty() => Some(bytes),
+            _ => None,
         };
 
         // Parse every complete JSON line; stop at the first that fails — that's a
