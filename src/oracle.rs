@@ -15,14 +15,18 @@
 //!     i.e. exactly the prior behavior.
 //!
 //! The default [`NullOracle`] answers `Unknown` for everything, so a brain built
-//! without a k8s client behaves byte-for-byte as before. The real
-//! [`KubeOracle`] (kube-rs Pod watch + node topology labels) is Milestone 3 — its
-//! shape is documented at the bottom of this file.
+//! without a k8s client behaves byte-for-byte as before. [`KubeOracle`] is the
+//! real implementation: a lightweight poller over the k8s API (no kube-rs
+//! dependency — just the in-cluster service-account token + CA over reqwest),
+//! caching pod status so `liveness()` is a cheap in-memory lookup.
+//!
+//! It is deliberately **conservative**: it reports `Gone` only on *positive*
+//! evidence (a pod that is present but `Failed`/`CrashLoopBackOff`/terminating)
+//! and `Running` only for a pod that is present and running. A pod merely
+//! *absent* from the (possibly slightly stale) cache is `Unknown`, never `Gone` —
+//! so a brand-new node can't be killed by a cache that predates it.
 
 /// What an external oracle believes about a node's backing pod.
-// `Running`/`Gone` are constructed by the real `KubeOracle` (Milestone 3) and in
-// tests; the default `NullOracle` only ever returns `Unknown`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PodLiveness {
     /// The pod exists and is `Running` — silence is a blip, not death.
