@@ -175,6 +175,9 @@ impl Default for RaftConfig {
 pub struct Ready {
     /// If set, persist this **before** sending `messages` or applying `committed`.
     pub persist: Option<Persisted>,
+    /// If set (after receiving an InstallSnapshot), the driver must **reset** its
+    /// state machine to these snapshot bytes before applying `committed`.
+    pub restore: Option<Vec<u8>>,
     /// Messages to send to peers (after persisting).
     pub messages: Vec<Addressed>,
     /// Newly-committed commands to apply to the state machine (after persisting).
