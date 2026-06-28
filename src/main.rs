@@ -78,9 +78,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_factor: cluster.replication_factor,
     }));
 
-    // Liveness uses pure timeouts until the k8s `KubeOracle` is wired (Milestone
-    // 3); `Membership::new` installs the `NullOracle`.
-    let membership = Arc::new(Membership::new(membership::MembershipConfig::default()));
+    // Liveness oracle: in-cluster, the `KubeOracle` confirms deaths and damps
+    // WAN blips from the k8s API; otherwise (local dev / no RBAC) the `NullOracle`
+    // keeps pure-timeout behavior.
+    let oracle: Arc<dyn oracle::LivenessOracle> = match oracle::KubeOracle::spawn() {
+        Some(kube) => {
+            tracing::info!("liveness: k8s KubeOracle active (confirmed-gone + blip damping)");
+            kube
+        }
+        None => {
+            tracing::info!("liveness: NullOracle (not in-cluster / no RBAC) — pure timeouts");
+            Arc::new(oracle::NullOracle)
+        }
+    };
+    let membership = Arc::new(Membership::with_oracle(
+        membership::MembershipConfig::default(),
+        oracle,
+    ));
     let placement = Arc::new(Placement::new(cluster.shard_count));
 
     // Where this brain member listens (and the default for its own address).
