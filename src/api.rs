@@ -210,16 +210,16 @@ async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) ->
 async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Json<Value> {
     plan.replication_factor = plan.replication_factor.max(1);
     // Operator intent is durable state: route it through the control plane so it
-    // replicates. Only the leader accepts a write; a follower reports where the
-    // leader is so the caller can retry there (transparent forwarding is the
-    // sidecar-era follow-up).
+    // replicates. Only the leader may accept a write — a follower transparently
+    // forwards there; if no leader is known (mid-election) we report not_leader.
     if s.control_plane.propose(Command::SetScalePlan(plan.clone())) {
-        Json(json!({ "ok": true, "plan": plan }))
-    } else {
-        Json(json!({
-            "ok": false,
-            "error": "not_leader",
-            "leader": s.control_plane.leader_addr(),
-        }))
+        return Json(json!({ "ok": true, "plan": plan }));
+    }
+    match s.control_plane.leader_addr() {
+        Some(leader) => {
+            let url = format!("{}/v1/scale", leader.trim_end_matches('/'));
+            forwarded(s.http.post(url).json(&plan)).await
+        }
+        None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null })),
     }
 }
