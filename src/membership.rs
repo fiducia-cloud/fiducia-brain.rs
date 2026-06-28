@@ -59,6 +59,7 @@ impl Membership {
     /// operator's intent to remove it isn't undone by liveness.
     pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) {
         let mut nodes = self.nodes.lock().unwrap();
+        let known = nodes.contains_key(node_id);
         let entry = nodes.entry(node_id.clone()).or_insert_with(|| NodeInfo {
             node_id: node_id.clone(),
             address: report.address.clone(),
