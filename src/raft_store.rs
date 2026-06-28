@@ -199,6 +199,7 @@ mod tests {
                     voted_for: Some("brain-b".to_string()),
                     commit_index: 2,
                     log: vec![entry(1, 7), entry(2, 7)],
+                    ..Default::default()
                 })
                 .unwrap();
         }
