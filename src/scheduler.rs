@@ -108,6 +108,7 @@ impl Scheduler {
             }
         }
 
+        let mut changes = 0u32;
         for shard in 0..self.placement.shard_count() {
             let current = self.placement.get(shard);
             let current_replicas: Vec<NodeId> = current
