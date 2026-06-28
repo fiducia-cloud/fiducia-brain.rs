@@ -57,8 +57,9 @@ impl Membership {
     /// store its reported address, failure domain, and shard set (registering it
     /// if new). A `Draining` node that keeps heartbeating stays `Draining` — the
     /// operator's intent to remove it isn't undone by liveness.
-    pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) {
+    pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) -> NodeHealth {
         let mut nodes = self.nodes.lock().unwrap();
+        let known = nodes.contains_key(node_id);
         let entry = nodes.entry(node_id.clone()).or_insert_with(|| NodeInfo {
             node_id: node_id.clone(),
             address: report.address.clone(),
@@ -80,6 +81,14 @@ impl Membership {
         if entry.health != NodeHealth::Draining {
             entry.health = NodeHealth::Healthy;
         }
+        if !known {
+            tracing::info!(
+                node = %node_id,
+                domain = %entry.failure_domain,
+                "membership: new node registered via heartbeat"
+            );
+        }
+        entry.health
     }
 
     /// Begin draining a node ahead of removal (scale-down / maintenance): the
@@ -89,6 +98,7 @@ impl Membership {
         let mut nodes = self.nodes.lock().unwrap();
         if let Some(info) = nodes.get_mut(node_id) {
             info.health = NodeHealth::Draining;
+            tracing::info!(node = %node_id, "membership: node marked Draining (operator scale-down/maintenance)");
             true
         } else {
             false
@@ -130,6 +140,14 @@ impl Membership {
                 NodeHealth::Healthy
             };
             if new_health == NodeHealth::Dead && info.health != NodeHealth::Dead {
+                tracing::warn!(
+                    node = %info.node_id,
+                    domain = %info.failure_domain,
+                    silent_for_ms = silent_for,
+                    hosted_shards = info.hosted_shards.len(),
+                    leading_shards = info.leading_shards.len(),
+                    "membership: node declared DEAD (missed heartbeats) — its shards will be re-placed"
+                );
                 newly_dead.push(info.node_id.clone());
             }
             info.health = new_health;

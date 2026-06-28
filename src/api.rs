@@ -19,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -27,7 +29,7 @@ use serde_json::{json, Value};
 
 use crate::config::ClusterConfig;
 use crate::membership::Membership;
-use crate::model::{HeartbeatReport, ScalePlan};
+use crate::model::{HeartbeatReport, NodeHealth, ScalePlan};
 use crate::placement::Placement;
 
 /// Shared control-plane state handed to handlers.
@@ -61,15 +63,34 @@ pub fn router(state: BrainState) -> Router {
         .with_state(state)
 }
 
-/// `GET /v1/status` — control-plane summary.
+/// `GET /v1/status` — control-plane summary + placement health. Surfaces the gap
+/// between *desired* (`ScalePlan`) and *observed* (membership) so operators can
+/// see at a glance whether the cluster is converged or under-replicated.
 async fn status(State(s): State<BrainState>) -> Json<Value> {
+    let nodes = s.membership.snapshot();
+    let healthy = nodes
+        .iter()
+        .filter(|n| n.health == NodeHealth::Healthy)
+        .count();
+    let plan = s.plan.lock().unwrap().clone();
+    let rf = plan.replication_factor.max(1);
+    let placed = s.placement.snapshot();
+    let under_replicated = placed
+        .iter()
+        .filter(|a| (a.replicas.len() as u32) < rf)
+        .count();
     Json(json!({
         "service": "fiducia-brain",
         "version": env!("CARGO_PKG_VERSION"),
         "cluster_id": s.config.cluster_id,
-        "nodes": s.membership.snapshot().len(),
         "shard_count": s.config.shard_count,
-        "replication_factor": s.config.replication_factor,
+        "replication_factor": rf,
+        "nodes": nodes.len(),
+        "healthy_nodes": healthy,
+        "desired_nodes": plan.target_nodes,
+        "placed_shards": placed.len(),
+        "under_replicated_shards": under_replicated,
+        "placement_generation": s.placement.generation(),
     }))
 }
 
@@ -110,13 +131,7 @@ async fn heartbeat(
     report: Option<Json<HeartbeatReport>>,
 ) -> Json<Value> {
     let report = report.map(|Json(r)| r).unwrap_or_default();
-    s.membership.heartbeat(&id, now_ms(), report);
-    let health = s
-        .membership
-        .snapshot()
-        .into_iter()
-        .find(|n| n.node_id == id)
-        .map(|n| n.health);
+    let health = s.membership.heartbeat(&id, now_ms(), report);
     Json(json!({ "ok": true, "node_id": id, "health": health }))
 }
 
@@ -127,16 +142,23 @@ async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Jso
     Json(json!({ "draining": known, "node_id": id }))
 }
 
-/// `GET /v1/placement` — full shard map for nodes to reconcile against.
+/// `GET /v1/placement` — full shard map for nodes to reconcile against. The
+/// `generation` lets pollers skip re-diffing the map when nothing changed.
 async fn placement(State(s): State<BrainState>) -> Json<Value> {
-    Json(json!({ "shards": s.placement.snapshot() }))
+    Json(json!({
+        "generation": s.placement.generation(),
+        "shards": s.placement.snapshot(),
+    }))
 }
 
-/// `GET /v1/placement/{shard}` — one shard's assignment.
-async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) -> Json<Value> {
+/// `GET /v1/placement/{shard}` — one shard's assignment (404 if unplaced).
+async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) -> impl IntoResponse {
     match s.placement.get(shard) {
-        Some(a) => Json(json!(a)),
-        None => Json(json!({ "error": "not_found", "shard": shard })),
+        Some(a) => (StatusCode::OK, Json(json!(a))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "not_found", "shard": shard })),
+        ),
     }
 }
 

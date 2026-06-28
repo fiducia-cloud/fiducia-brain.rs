@@ -79,6 +79,13 @@ impl Scheduler {
             .map(|n| n.node_id.clone())
             .collect();
         let healthy_set: HashSet<NodeId> = healthy_ids.iter().cloned().collect();
+        if healthy_ids.len() < rf as usize {
+            tracing::warn!(
+                healthy_nodes = healthy_ids.len(),
+                rf,
+                "scheduler: fewer healthy nodes than replication factor — shards will be under-replicated"
+            );
+        }
 
         // Current per-node replica load (across the existing placement) so fills
         // pick the least-loaded node and spread evens out as we go.
@@ -91,22 +98,38 @@ impl Scheduler {
             }
         }
 
-        // Observed leader per shard, from heartbeated `leading_shards`.
+        // Observed hosting per shard, from heartbeated `hosted_shards` /
+        // `leading_shards`. `observed_replicas` lets a freshly (re)started brain —
+        // whose in-memory placement map is empty — ADOPT the data plane's actual
+        // layout as its starting point, instead of recomputing a fresh placement
+        // and ordering a wave of needless data movement on every brain restart.
         let mut observed_leader: HashMap<ShardId, NodeId> = HashMap::new();
+        let mut observed_replicas: HashMap<ShardId, Vec<NodeId>> = HashMap::new();
         for n in &nodes {
             if n.health == NodeHealth::Healthy {
+                for s in &n.hosted_shards {
+                    observed_replicas
+                        .entry(*s)
+                        .or_default()
+                        .push(n.node_id.clone());
+                }
                 for s in &n.leading_shards {
                     observed_leader.insert(*s, n.node_id.clone());
                 }
             }
         }
 
+        let mut changes = 0u32;
         for shard in 0..self.placement.shard_count() {
             let current = self.placement.get(shard);
-            let current_replicas: Vec<NodeId> = current
-                .as_ref()
-                .map(|a| a.replicas.clone())
-                .unwrap_or_default();
+            // The brain's own desired state is authoritative; but on a cold start
+            // (no desired state yet) fall back to what the nodes actually report
+            // hosting, so we reconcile observed → desired rather than blowing the
+            // existing layout away and re-placing from scratch.
+            let current_replicas: Vec<NodeId> = match &current {
+                Some(a) => a.replicas.clone(),
+                None => observed_replicas.get(&shard).cloned().unwrap_or_default(),
+            };
 
             let slots: Vec<NodeSlot> = healthy_ids
                 .iter()
@@ -142,12 +165,27 @@ impl Scheduler {
                 Some(a) => a.replicas != desired || a.preferred_leader != preferred_leader,
             };
             if changed {
+                tracing::info!(
+                    shard,
+                    replicas = ?desired,
+                    preferred_leader = ?preferred_leader,
+                    "scheduler: (re)assigning shard placement"
+                );
+                changes += 1;
                 self.placement.assign(ShardAssignment {
                     shard_id: shard,
                     replicas: desired,
                     preferred_leader,
                 });
             }
+        }
+        if changes > 0 {
+            tracing::info!(
+                changes,
+                healthy_nodes = healthy_ids.len(),
+                rf,
+                "scheduler: reconcile applied placement changes"
+            );
         }
     }
 
@@ -246,6 +284,40 @@ mod tests {
         let assignment = s.placement.get(0).expect("shard placed");
         assert_eq!(assignment.preferred_leader.as_deref(), Some("a"));
         assert!(assignment.replicas.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn cold_started_brain_adopts_reported_hosting_instead_of_recomputing() {
+        // Data plane was already running (nodes host shard 0, b leads it) before
+        // the brain (re)started with an empty placement map. The reconcile must
+        // ADOPT the observed layout, not churn the data by re-placing from scratch.
+        let s = scheduler(1, 3);
+        for (id, dom, leads) in [("a", "gcp", false), ("b", "aws", true), ("c", "hetzner", false)] {
+            s.membership.heartbeat(
+                &id.to_string(),
+                0,
+                HeartbeatReport {
+                    hosted_shards: vec![0],
+                    leading_shards: if leads { vec![0] } else { vec![] },
+                    ..hb(dom)
+                },
+            );
+        }
+
+        s.reconcile();
+
+        let a = s.placement.get(0).expect("placed");
+        let got: HashSet<String> = a.replicas.into_iter().collect();
+        assert_eq!(
+            got,
+            ["a", "b", "c"].iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
+            "keeps exactly the nodes that already host the shard"
+        );
+        assert_eq!(
+            a.preferred_leader.as_deref(),
+            Some("b"),
+            "adopts the observed leader rather than picking a new one"
+        );
     }
 
     #[test]
