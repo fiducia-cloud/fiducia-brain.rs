@@ -413,13 +413,7 @@ mod tests {
 
     #[test]
     fn driver_replays_persisted_log_into_a_fresh_state_machine_on_restart() {
-        let dir = std::env::temp_dir().join(format!(
-            "fiducia-driver-restart-{:?}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = unique_dir("restart");
 
         // First boot: elect, propose, persist.
         {
