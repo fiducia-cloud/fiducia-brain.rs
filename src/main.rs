@@ -13,10 +13,12 @@
 //! replicating the brain's *own* state in its own Raft group (HA), tracked below.
 
 mod api;
+mod cluster;
 mod config;
 mod leadership;
 mod membership;
 mod model;
+mod oracle;
 mod placement;
 mod plan;
 mod scheduler;
