@@ -22,13 +22,15 @@ use std::time::Duration;
 use axum::{extract::State, routing::post, Json, Router};
 use tokio::sync::mpsc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::cluster::{apply_command, Command, ControlPlane};
 use crate::membership::Membership;
-use crate::model::ScalePlan;
+use crate::model::{ScalePlan, ShardAssignment};
 use crate::placement::Placement;
 use crate::raft::{
-    Addressed, AppendEntriesReq, AppendEntriesResp, NodeId, Persisted, Raft, RaftConfig,
-    RaftMessage, Ready, RequestVoteReq, RequestVoteResp,
+    Addressed, AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, NodeId,
+    Persisted, Raft, RaftConfig, RaftMessage, Ready, RequestVoteReq, RequestVoteResp,
 };
 use crate::raft_store::RaftStore;
 
