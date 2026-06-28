@@ -238,9 +238,19 @@ impl RaftControlPlane {
             }
         }
 
+        // Reset the state machine to an installed snapshot before applying anything
+        // newer on top of it (an InstallSnapshot jumps us past compacted entries).
+        if let Some(data) = &ready.restore {
+            restore_state_machine(data, &self.placement, &self.plan);
+        }
+
         for command in ready.committed {
             apply_command(&self.membership, &self.placement, &self.plan, command);
         }
+
+        // Bound the log: once it grows past the threshold, fold its committed prefix
+        // into a state-machine snapshot and drop those entries.
+        self.maybe_compact(ready.applied_upto);
 
         let mut reply = None;
         let mut others = Vec::new();
