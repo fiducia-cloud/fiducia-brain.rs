@@ -313,6 +313,25 @@ mod tests {
     }
 
     #[test]
+    fn drained_and_evacuated_node_is_forgotten_on_reconcile() {
+        let s = scheduler(2, 2);
+        for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner")] {
+            s.membership.heartbeat(&id.to_string(), 0, hb(dom));
+        }
+        s.reconcile();
+
+        // Operator drains "a"; it evacuates and reports hosting nothing.
+        assert!(s.membership.drain(&"a".to_string()));
+        s.membership.heartbeat(&"a".to_string(), 1, hb("gcp")); // hb() reports no hosted shards
+        s.reconcile();
+
+        assert!(
+            s.membership.snapshot().iter().all(|n| n.node_id != "a"),
+            "a drained, fully-evacuated node is removed from membership"
+        );
+    }
+
+    #[test]
     fn cold_started_brain_adopts_reported_hosting_instead_of_recomputing() {
         // Data plane was already running (nodes host shard 0, b leads it) before
         // the brain (re)started with an empty placement map. The reconcile must
