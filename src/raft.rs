@@ -246,10 +246,16 @@ impl Raft {
             current_term: restored.current_term,
             voted_for: restored.voted_for,
             log: restored.log,
+            base_index: restored.base_index,
+            base_term: restored.base_term,
+            snapshot: restored.snapshot,
             role: Role::Follower,
-            commit_index: restored.commit_index,
-            last_applied: 0, // volatile: the state machine is rebuilt by replay
+            // The snapshot already represents the state machine up to base_index, so
+            // commit/apply resume from there and compacted entries are never re-run.
+            commit_index: restored.commit_index.max(restored.base_index),
+            last_applied: restored.base_index,
             leader_id: None,
+            pending_restore: false,
             votes: HashSet::new(),
             next_index: HashMap::new(),
             match_index: HashMap::new(),
