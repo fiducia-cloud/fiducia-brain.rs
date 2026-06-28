@@ -350,6 +350,31 @@ mod tests {
     }
 
     #[test]
+    fn holds_placement_when_membership_is_transiently_empty_after_failover() {
+        let s = scheduler(2, 3);
+        // Replicated placement exists (as if replayed from the Raft log onto a
+        // freshly-elected leader)...
+        for shard in 0..2 {
+            s.placement.assign(ShardAssignment {
+                shard_id: shard,
+                replicas: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                preferred_leader: Some("a".to_string()),
+            });
+        }
+        // ...but membership is still empty (the nodes haven't heartbeated to this
+        // leader yet). Reconcile must NOT wipe the placement to empty.
+        s.reconcile();
+        for shard in 0..2 {
+            let asg = s.placement.get(shard).expect("placement held");
+            assert_eq!(
+                asg.replicas.len(),
+                3,
+                "shard {shard} placement held across the membership gap, not wiped"
+            );
+        }
+    }
+
+    #[test]
     fn cold_started_brain_adopts_reported_hosting_instead_of_recomputing() {
         // Data plane was already running (nodes host shard 0, b leads it) before
         // the brain (re)started with an empty placement map. The reconcile must
