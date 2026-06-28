@@ -108,6 +108,9 @@ pub struct RaftControlPlane {
     /// Outbound Raft messages, drained by the spawned outbox task.
     outbox: mpsc::UnboundedSender<Vec<Addressed>>,
     outbox_rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<Addressed>>>>,
+    /// Serializes WAL writes so concurrent delivers can't race on the temp file
+    /// or persist an older snapshot after a newer one.
+    io_lock: Mutex<()>,
     // State-machine handles the committed log is applied to.
     membership: Arc<Membership>,
     placement: Arc<Placement>,
