@@ -44,13 +44,22 @@ impl Default for MembershipConfig {
 pub struct Membership {
     nodes: Mutex<HashMap<NodeId, NodeInfo>>,
     config: MembershipConfig,
+    /// External liveness signal (k8s). [`NullOracle`] by default ⇒ pure timeouts.
+    oracle: Arc<dyn LivenessOracle>,
 }
 
 impl Membership {
     pub fn new(config: MembershipConfig) -> Self {
+        Self::with_oracle(config, Arc::new(NullOracle))
+    }
+
+    /// Construct with an external liveness oracle (the k8s read-side of the
+    /// hybrid detector). See [`crate::oracle`].
+    pub fn with_oracle(config: MembershipConfig, oracle: Arc<dyn LivenessOracle>) -> Self {
         Membership {
             nodes: Mutex::new(HashMap::new()),
             config,
+            oracle,
         }
     }
 
