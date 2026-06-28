@@ -86,6 +86,10 @@ impl Scheduler {
             .map(|n| n.node_id.clone())
             .collect();
         let healthy_set: HashSet<NodeId> = healthy_ids.iter().cloned().collect();
+        // Every node membership currently knows about (at any health). Lets us tell
+        // "this replica's node is absent because it hasn't heartbeated to this
+        // leader yet" (hold) apart from "membership knows it is Dead/Draining" (act).
+        let known: HashSet<NodeId> = nodes.iter().map(|n| n.node_id.clone()).collect();
         if healthy_ids.len() < rf as usize {
             tracing::warn!(
                 healthy_nodes = healthy_ids.len(),
