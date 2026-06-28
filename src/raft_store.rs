@@ -84,6 +84,7 @@ impl RaftStore {
             dir,
             meta_path,
             log_path,
+            snapshot_path,
         };
         // Canonicalize on disk so the next write starts from clean bytes.
         store.write_log(&log)?;
@@ -93,6 +94,9 @@ impl RaftStore {
             voted_for: meta.voted_for,
             commit_index: meta.commit_index,
             log,
+            base_index: meta.base_index,
+            base_term: meta.base_term,
+            snapshot,
         };
         Ok((store, restored))
     }
