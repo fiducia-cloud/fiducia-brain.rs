@@ -179,13 +179,23 @@ impl Scheduler {
                     "scheduler: (re)assigning shard placement"
                 );
                 changes += 1;
-                self.placement.assign(ShardAssignment {
+                self.cp.propose(Command::AssignShard(ShardAssignment {
                     shard_id: shard,
                     replicas: desired,
                     preferred_leader,
-                });
+                }));
             }
         }
+
+        // Scale-down finalize: a drained node that now reports hosting **nothing**
+        // has fully evacuated, so remove it from membership (the last step the
+        // README promised but nothing did — `DELETE` only *starts* the drain).
+        for n in &nodes {
+            if n.health == NodeHealth::Draining && n.hosted_shards.is_empty() {
+                self.cp.propose(Command::ForgetNode(n.node_id.clone()));
+            }
+        }
+
         if changes > 0 {
             tracing::info!(
                 changes,
