@@ -624,12 +624,87 @@ impl Raft {
         }
     }
 
+    /// A follower receiving the leader's snapshot: jump the state machine straight
+    /// to `last_included_index` instead of replaying log entries the leader no
+    /// longer has. Keeps any log suffix consistent with the snapshot boundary.
+    fn handle_install_snapshot(&mut self, from: NodeId, req: InstallSnapshotReq) {
+        if req.term < self.current_term {
+            let resp = InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+                last_included_index: 0,
+            };
+            self.send(&from, RaftMessage::InstallSnapshotResp(resp));
+            return;
+        }
+        // Valid leader: adopt its term and recognize it (refreshes the election timer).
+        self.become_follower(req.term, Some(from.clone()));
+
+        // Already at or past this snapshot ⇒ ack without applying (it's stale to us).
+        if req.last_included_index <= self.base_index
+            || req.last_included_index <= self.commit_index
+        {
+            let resp = InstallSnapshotResp {
+                term: self.current_term,
+                success: true,
+                last_included_index: self.commit_index.max(self.base_index),
+            };
+            self.send(&from, RaftMessage::InstallSnapshotResp(resp));
+            return;
+        }
+
+        // Install it. Keep any log suffix consistent with the snapshot boundary
+        // (same term at last_included_index); otherwise discard the whole log.
+        if self.term_at(req.last_included_index) == req.last_included_term
+            && req.last_included_index <= self.last_index()
+        {
+            let keep_from = (req.last_included_index - self.base_index) as usize;
+            self.log = self.log.split_off(keep_from);
+        } else {
+            self.log.clear();
+        }
+        self.base_index = req.last_included_index;
+        self.base_term = req.last_included_term;
+        self.snapshot = Some(req.data);
+        self.commit_index = self.commit_index.max(self.base_index);
+        self.last_applied = self.base_index;
+        self.pending_restore = true;
+        self.dirty = true;
+
+        let resp = InstallSnapshotResp {
+            term: self.current_term,
+            success: true,
+            last_included_index: self.base_index,
+        };
+        self.send(&from, RaftMessage::InstallSnapshotResp(resp));
+    }
+
+    fn handle_install_snapshot_resp(&mut self, from: NodeId, resp: InstallSnapshotResp) {
+        if resp.term > self.current_term {
+            self.become_follower(resp.term, None);
+            return;
+        }
+        if self.role != Role::Leader || resp.term != self.current_term {
+            return;
+        }
+        if resp.success {
+            let matched = resp
+                .last_included_index
+                .max(self.match_index.get(&from).copied().unwrap_or(0));
+            self.match_index.insert(from.clone(), matched);
+            self.next_index.insert(from, matched + 1);
+            if self.maybe_advance_commit() {
+                self.broadcast_append();
+            }
+        }
+    }
+
     /// Drop entries with index ≥ `index`. Never touches committed entries (Raft's
     /// rules guarantee a conflict can only appear above `commit_index`).
     fn truncate_from(&mut self, index: u64) {
         debug_assert!(index > self.commit_index, "would truncate a committed entry");
-        if index >= 1 {
-            self.log.truncate((index - 1) as usize);
+        if let Some(slot) = self.log_slot(index) {
+            self.log.truncate(slot);
             self.dirty = true;
         }
     }
