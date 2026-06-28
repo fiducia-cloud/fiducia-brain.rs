@@ -404,23 +404,46 @@ pub fn raft_router(cp: Arc<RaftControlPlane>) -> Router {
 
 async fn vote(
     State(cp): State<Arc<RaftControlPlane>>,
+    headers: HeaderMap,
     Json(req): Json<RequestVoteReq>,
-) -> Json<RequestVoteResp> {
-    Json(cp.handle_request_vote(req))
+) -> Result<Json<RequestVoteResp>, StatusCode> {
+    authorize(&cp, &headers)?;
+    Ok(Json(cp.handle_request_vote(req)))
 }
 
 async fn append(
     State(cp): State<Arc<RaftControlPlane>>,
+    headers: HeaderMap,
     Json(req): Json<AppendEntriesReq>,
-) -> Json<AppendEntriesResp> {
-    Json(cp.handle_append_entries(req))
+) -> Result<Json<AppendEntriesResp>, StatusCode> {
+    authorize(&cp, &headers)?;
+    Ok(Json(cp.handle_append_entries(req)))
 }
 
 async fn snapshot(
     State(cp): State<Arc<RaftControlPlane>>,
+    headers: HeaderMap,
     Json(req): Json<InstallSnapshotReq>,
-) -> Json<InstallSnapshotResp> {
-    Json(cp.handle_install_snapshot(req))
+) -> Result<Json<InstallSnapshotResp>, StatusCode> {
+    authorize(&cp, &headers)?;
+    Ok(Json(cp.handle_install_snapshot(req)))
+}
+
+/// Reject a peer Raft RPC that doesn't present the shared secret (when one is
+/// configured). `Ok(())` when auth is disabled or the bearer token matches.
+fn authorize(cp: &RaftControlPlane, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let Some(secret) = &cp.raft_secret else {
+        return Ok(()); // auth disabled (FIDUCIA_BRAIN_RAFT_SECRET unset)
+    };
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if presented == Some(secret.as_str()) {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
 }
 
 /// The brain's replicated state machine, serialized for a Raft snapshot: the
