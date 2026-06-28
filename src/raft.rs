@@ -1119,4 +1119,70 @@ mod tests {
             .iter()
             .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 5)));
     }
+
+    #[test]
+    fn compaction_drops_the_log_prefix_but_keeps_serving() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+        for n in 1..=4 {
+            c.node(&leader).propose(plan(n)).unwrap();
+        }
+        c.pump();
+        let commit = c.node(&leader).commit_index();
+
+        c.node(&leader).compact(commit, b"snap".to_vec());
+        assert_eq!(c.node(&leader).base_index(), commit);
+        assert_eq!(c.node(&leader).log_len(), 0, "entries up to the snapshot are gone");
+
+        // The leader keeps committing on top of a compacted log.
+        let idx = c.node(&leader).propose(plan(99)).unwrap();
+        assert!(idx > commit, "new entries continue past the snapshot base");
+        c.pump();
+        for id in c.ids() {
+            assert!(c.applied[&id]
+                .iter()
+                .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 99)));
+        }
+    }
+
+    #[test]
+    fn a_lagging_follower_is_caught_up_by_install_snapshot() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+
+        // Commit a batch while one follower is partitioned away, so it misses them.
+        let lagger = c.ids().into_iter().find(|i| *i != leader).unwrap();
+        c.down.insert(lagger.clone());
+        for n in 1..=6 {
+            c.node(&leader).propose(plan(n)).unwrap();
+        }
+        c.pump();
+        let commit = c.node(&leader).commit_index();
+        assert!(commit >= 6);
+
+        // Leader compacts past everything the lagger is missing.
+        let snap = b"state@compact".to_vec();
+        c.node(&leader).compact(commit, snap.clone());
+        assert_eq!(c.node(&leader).log_len(), 0);
+
+        // Bring the lagger back. It needs entries the leader no longer has, so the
+        // leader must catch it up with an InstallSnapshot, not AppendEntries.
+        c.down.remove(&lagger);
+        for _ in 0..6 {
+            c.tick_all();
+            c.pump();
+        }
+
+        assert_eq!(
+            c.node(&lagger).base_index(),
+            commit,
+            "follower jumped to the snapshot base"
+        );
+        assert_eq!(
+            c.snapshots.get(&lagger),
+            Some(&snap),
+            "follower restored the snapshot bytes the leader sent"
+        );
+        assert!(c.node(&lagger).commit_index() >= commit);
+    }
 }
