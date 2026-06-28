@@ -663,6 +663,18 @@ impl Raft {
         self.send(peer, RaftMessage::AppendEntries(req));
     }
 
+    /// Ship the current snapshot to a follower that has fallen behind the log base.
+    fn send_snapshot(&mut self, peer: &NodeId) {
+        let req = InstallSnapshotReq {
+            term: self.current_term,
+            leader_id: self.id.clone(),
+            last_included_index: self.base_index,
+            last_included_term: self.base_term,
+            data: self.snapshot.clone().unwrap_or_default(),
+        };
+        self.send(peer, RaftMessage::InstallSnapshot(req));
+    }
+
     fn maybe_advance_commit(&mut self) -> bool {
         let last = self.last_index();
         let mut new_commit = self.commit_index;
