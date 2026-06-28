@@ -150,12 +150,27 @@ impl Scheduler {
                 Some(a) => a.replicas != desired || a.preferred_leader != preferred_leader,
             };
             if changed {
+                tracing::info!(
+                    shard,
+                    replicas = ?desired,
+                    preferred_leader = ?preferred_leader,
+                    "scheduler: (re)assigning shard placement"
+                );
+                changes += 1;
                 self.placement.assign(ShardAssignment {
                     shard_id: shard,
                     replicas: desired,
                     preferred_leader,
                 });
             }
+        }
+        if changes > 0 {
+            tracing::info!(
+                changes,
+                healthy_nodes = healthy_ids.len(),
+                rf,
+                "scheduler: reconcile applied placement changes"
+            );
         }
     }
 
