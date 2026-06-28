@@ -49,6 +49,9 @@ pub struct Membership {
 }
 
 impl Membership {
+    // Convenience constructor with the default (no-op) oracle. Used widely in
+    // tests; production wires an oracle via `with_oracle`.
+    #[allow(dead_code)]
     pub fn new(config: MembershipConfig) -> Self {
         Self::with_oracle(config, Arc::new(NullOracle))
     }
