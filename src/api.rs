@@ -27,6 +27,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::cluster::{Command, ControlPlane};
 use crate::config::ClusterConfig;
 use crate::membership::Membership;
 use crate::model::{HeartbeatReport, NodeHealth, ScalePlan};
@@ -40,6 +41,8 @@ pub struct BrainState {
     pub placement: Arc<Placement>,
     /// The live scale intent the reconciler drives toward (`POST /v1/scale`).
     pub plan: Arc<Mutex<ScalePlan>>,
+    /// The brain's own control plane; durable writes (`/v1/scale`) go through it.
+    pub control_plane: Arc<dyn ControlPlane>,
 }
 
 fn now_ms() -> u64 {
