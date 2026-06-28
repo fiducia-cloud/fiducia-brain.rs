@@ -19,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -27,7 +29,7 @@ use serde_json::{json, Value};
 
 use crate::config::ClusterConfig;
 use crate::membership::Membership;
-use crate::model::{HeartbeatReport, ScalePlan};
+use crate::model::{HeartbeatReport, NodeHealth, ScalePlan};
 use crate::placement::Placement;
 
 /// Shared control-plane state handed to handlers.
