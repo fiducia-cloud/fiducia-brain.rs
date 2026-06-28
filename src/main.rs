@@ -158,6 +158,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement,
         plan: plan.clone(),
         control_plane,
+        // Short-timeout client for forwarding follower writes/heartbeats to the leader.
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_default(),
     };
 
     let mut app = Router::new()
