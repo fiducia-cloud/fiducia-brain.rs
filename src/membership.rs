@@ -203,6 +203,7 @@ mod tests {
             failure_domain: domain.to_string(),
             hosted_shards: shards.to_vec(),
             leading_shards: shards.to_vec(),
+            seq: 0,
         }
     }
 
