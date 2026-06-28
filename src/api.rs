@@ -43,6 +43,27 @@ pub struct BrainState {
     pub plan: Arc<Mutex<ScalePlan>>,
     /// The brain's own control plane; durable writes (`/v1/scale`) go through it.
     pub control_plane: Arc<dyn ControlPlane>,
+    /// Client for forwarding writes/heartbeats from a follower to the leader.
+    pub http: reqwest::Client,
+}
+
+/// Forward a request to the leader and relay its JSON response. Used when a
+/// non-leader receives a write or a heartbeat (liveness + durable state live on
+/// the leader). Keeps the data-plane sidecar dumb: it heartbeats any member and
+/// the brain routes internally.
+async fn forwarded(req: reqwest::RequestBuilder) -> Json<Value> {
+    match req.send().await {
+        Ok(resp) => Json(
+            resp.json::<Value>()
+                .await
+                .unwrap_or_else(|_| json!({ "ok": true, "forwarded": true })),
+        ),
+        Err(err) => Json(json!({
+            "ok": false,
+            "error": "leader_forward_failed",
+            "detail": err.to_string(),
+        })),
+    }
 }
 
 fn now_ms() -> u64 {
