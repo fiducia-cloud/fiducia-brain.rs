@@ -21,6 +21,12 @@ mod model;
 mod oracle;
 mod placement;
 mod plan;
+// The brain's own Raft engine + WAL. Wired into `ControlPlane` by the driver
+// (next step); `allow(dead_code)` until then so the proven core can land first.
+#[allow(dead_code)]
+mod raft;
+#[allow(dead_code)]
+mod raft_store;
 mod scheduler;
 
 use std::net::SocketAddr;
