@@ -111,12 +111,35 @@ pub struct AppendEntriesResp {
     pub match_index: u64,
 }
 
+/// Sent by a leader to a follower that needs an entry the leader has already
+/// compacted away: it carries the serialized state machine at `last_included_*`
+/// so the follower can jump straight to that point instead of replaying the log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotReq {
+    pub term: u64,
+    pub leader_id: NodeId,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    /// The serialized state machine at `last_included_index` (opaque to Raft).
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotResp {
+    pub term: u64,
+    pub success: bool,
+    /// The index the follower now has durably (its new `match_index`).
+    pub last_included_index: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RaftMessage {
     RequestVote(RequestVoteReq),
     RequestVoteResp(RequestVoteResp),
     AppendEntries(AppendEntriesReq),
     AppendEntriesResp(AppendEntriesResp),
+    InstallSnapshot(InstallSnapshotReq),
+    InstallSnapshotResp(InstallSnapshotResp),
 }
 
 /// An outbound message and its recipient (the sender is always `self.id`).
