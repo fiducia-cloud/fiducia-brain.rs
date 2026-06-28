@@ -246,6 +246,7 @@ mod tests {
             failure_domain: domain.to_string(),
             hosted_shards: vec![],
             leading_shards: vec![],
+            seq: 0,
         }
     }
 
