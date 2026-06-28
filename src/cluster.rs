@@ -26,13 +26,16 @@
 
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::membership::Membership;
 use crate::model::{ScalePlan, ShardAssignment};
 use crate::placement::Placement;
 
 /// A durable, replicated state mutation. (Liveness heartbeats are intentionally
-/// *not* here — see the module docs.)
-#[derive(Debug, Clone)]
+/// *not* here — see the module docs.) `Serialize`/`Deserialize` so it can be
+/// written to the Raft WAL and shipped between brain members.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     /// Install/replace a shard's authoritative placement.
     AssignShard(ShardAssignment),
