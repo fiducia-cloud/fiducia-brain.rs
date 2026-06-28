@@ -801,6 +801,41 @@ impl Raft {
         Ok(index)
     }
 
+    // ── compaction ─────────────────────────────────────────────────────────────
+
+    /// Number of live (un-compacted) log entries — the driver's compaction trigger.
+    pub fn log_len(&self) -> usize {
+        self.log.len()
+    }
+
+    /// The snapshot base index (entries at or before this are compacted out).
+    pub fn base_index(&self) -> u64 {
+        self.base_index
+    }
+
+    /// Compact the log up to `index`: drop every entry at or before it and fold them
+    /// into `snapshot` (the caller's serialized state machine *as of* `index`).
+    /// Bounds the log and the WAL; a follower that later needs a compacted entry is
+    /// caught up via [`InstallSnapshotReq`]. No-op if `index` is not newer than the
+    /// current base or would discard an uncommitted entry (only committed state is
+    /// safe to fold into a snapshot).
+    pub fn compact(&mut self, index: u64, snapshot: Vec<u8>) {
+        if index <= self.base_index || index > self.commit_index {
+            return;
+        }
+        let term = self.term_at(index);
+        let keep_from = (index - self.base_index) as usize;
+        self.log = if keep_from <= self.log.len() {
+            self.log.split_off(keep_from)
+        } else {
+            Vec::new()
+        };
+        self.base_index = index;
+        self.base_term = term;
+        self.snapshot = Some(snapshot);
+        self.dirty = true;
+    }
+
     // ── outbound ─────────────────────────────────────────────────────────────
 
     /// Drain side effects. The driver must persist `ready.persist` (if any)
