@@ -38,6 +38,7 @@ pub struct RaftStore {
     dir: PathBuf,
     meta_path: PathBuf,
     log_path: PathBuf,
+    snapshot_path: PathBuf,
 }
 
 impl RaftStore {
