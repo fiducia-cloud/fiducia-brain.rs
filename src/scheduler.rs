@@ -287,6 +287,40 @@ mod tests {
     }
 
     #[test]
+    fn cold_started_brain_adopts_reported_hosting_instead_of_recomputing() {
+        // Data plane was already running (nodes host shard 0, b leads it) before
+        // the brain (re)started with an empty placement map. The reconcile must
+        // ADOPT the observed layout, not churn the data by re-placing from scratch.
+        let s = scheduler(1, 3);
+        for (id, dom, leads) in [("a", "gcp", false), ("b", "aws", true), ("c", "hetzner", false)] {
+            s.membership.heartbeat(
+                &id.to_string(),
+                0,
+                HeartbeatReport {
+                    hosted_shards: vec![0],
+                    leading_shards: if leads { vec![0] } else { vec![] },
+                    ..hb(dom)
+                },
+            );
+        }
+
+        s.reconcile();
+
+        let a = s.placement.get(0).expect("placed");
+        let got: HashSet<String> = a.replicas.into_iter().collect();
+        assert_eq!(
+            got,
+            ["a", "b", "c"].iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
+            "keeps exactly the nodes that already host the shard"
+        );
+        assert_eq!(
+            a.preferred_leader.as_deref(),
+            Some("b"),
+            "adopts the observed leader rather than picking a new one"
+        );
+    }
+
+    #[test]
     fn a_dead_node_is_evacuated_to_a_surviving_node_on_the_next_tick() {
         let s = scheduler(4, 3);
         for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner"), ("d", "gcp")] {
