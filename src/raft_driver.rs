@@ -306,6 +306,47 @@ impl RaftControlPlane {
             },
         }
     }
+
+    /// Handle an inbound `InstallSnapshot` and produce the reply (for `/raft/snapshot`).
+    pub fn handle_install_snapshot(&self, req: InstallSnapshotReq) -> InstallSnapshotResp {
+        let from = req.leader_id.clone();
+        match self.step_inbound(from, RaftMessage::InstallSnapshot(req)) {
+            Some(RaftMessage::InstallSnapshotResp(resp)) => resp,
+            _ => InstallSnapshotResp {
+                term: self.engine.lock().unwrap().term(),
+                success: false,
+                last_included_index: 0,
+            },
+        }
+    }
+
+    /// Once the live log passes [`COMPACT_LOG_THRESHOLD`], snapshot the state
+    /// machine as of `applied_upto` and drop the folded-in log prefix, then persist
+    /// the compacted state. All commands are idempotent, so a snapshot that reflects
+    /// a slightly newer index than `applied_upto` is still safe to compact at it.
+    fn maybe_compact(&self, applied_upto: u64) {
+        let should = {
+            let engine = self.engine.lock().unwrap();
+            engine.log_len() >= COMPACT_LOG_THRESHOLD && applied_upto > engine.base_index()
+        };
+        if !should {
+            return;
+        }
+        let data = snapshot_state_machine(&self.placement, &self.plan);
+        {
+            let mut engine = self.engine.lock().unwrap();
+            engine.compact(applied_upto, data);
+        }
+        // Persist the now-compacted log + snapshot immediately (ordered under io_lock,
+        // re-reading current state — same discipline as `drain`).
+        if let Some(store) = &self.store {
+            let _io = self.io_lock.lock().unwrap();
+            let snapshot = self.engine.lock().unwrap().persisted_snapshot();
+            if let Err(err) = store.save(&snapshot) {
+                tracing::error!("raft: failed to persist after compaction: {err}");
+            }
+        }
+    }
 }
 
 impl ControlPlane for RaftControlPlane {
