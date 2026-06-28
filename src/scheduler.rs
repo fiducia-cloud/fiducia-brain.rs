@@ -142,6 +142,19 @@ impl Scheduler {
                 None => observed_replicas.get(&shard).cloned().unwrap_or_default(),
             };
 
+            // Don't shrink placement on incomplete membership. Just after a leader
+            // failover or brain restart the (soft, leader-local) membership is
+            // briefly empty while nodes re-heartbeat, even though the replicated
+            // placement still references them. Holding a shard whose current replicas
+            // aren't all known yet avoids dropping live replicas we simply haven't
+            // heard from — a genuinely failed node stays KNOWN as Dead, so real
+            // failures still reconcile.
+            if !current_replicas.is_empty()
+                && !current_replicas.iter().all(|id| known.contains(id))
+            {
+                continue;
+            }
+
             let slots: Vec<NodeSlot> = healthy_ids
                 .iter()
                 .map(|id| NodeSlot {
