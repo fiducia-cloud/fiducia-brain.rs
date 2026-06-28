@@ -584,7 +584,7 @@ impl Raft {
         self.send(peer, RaftMessage::AppendEntries(req));
     }
 
-    fn maybe_advance_commit(&mut self) {
+    fn maybe_advance_commit(&mut self) -> bool {
         let last = self.last_index();
         let mut new_commit = self.commit_index;
         for n in (self.commit_index + 1)..=last {
@@ -606,6 +606,9 @@ impl Raft {
         if new_commit > self.commit_index {
             self.commit_index = new_commit;
             self.dirty = true;
+            true
+        } else {
+            false
         }
     }
 
