@@ -142,12 +142,21 @@ impl Membership {
                 continue;
             }
             let silent_for = now_ms.saturating_sub(info.last_seen_ms);
-            let new_health = if silent_for >= self.config.dead_after_ms {
+            let by_timeout = if silent_for >= self.config.dead_after_ms {
                 NodeHealth::Dead
             } else if silent_for >= self.config.suspect_after_ms {
                 NodeHealth::Suspect
             } else {
                 NodeHealth::Healthy
+            };
+            // Reconcile the timeout verdict with the external oracle (k8s): a
+            // confirmed-gone pod is Dead immediately; a pod that is still Running
+            // can't be declared Dead on silence alone (it's a partition/blip), so
+            // we hold it at Suspect. Unknown ⇒ trust the timeout.
+            let new_health = match self.oracle.liveness(&info.node_id) {
+                PodLiveness::Gone => NodeHealth::Dead,
+                PodLiveness::Running if by_timeout == NodeHealth::Dead => NodeHealth::Suspect,
+                PodLiveness::Running | PodLiveness::Unknown => by_timeout,
             };
             if new_health == NodeHealth::Dead && info.health != NodeHealth::Dead {
                 tracing::warn!(
