@@ -102,7 +102,21 @@ async fn http_send(client: &reqwest::Client, to: &NodeId, msg: RaftMessage) -> O
                 .ok()?;
             Some(RaftMessage::AppendEntriesResp(resp))
         }
-        RaftMessage::RequestVoteResp(_) | RaftMessage::AppendEntriesResp(_) => None,
+        RaftMessage::InstallSnapshot(req) => {
+            let resp: InstallSnapshotResp = client
+                .post(format!("{base}/raft/snapshot"))
+                .json(&req)
+                .send()
+                .await
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            Some(RaftMessage::InstallSnapshotResp(resp))
+        }
+        RaftMessage::RequestVoteResp(_)
+        | RaftMessage::AppendEntriesResp(_)
+        | RaftMessage::InstallSnapshotResp(_) => None,
     }
 }
 
