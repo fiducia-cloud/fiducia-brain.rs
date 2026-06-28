@@ -256,7 +256,12 @@ mod tests {
             target_nodes: 3,
             replication_factor: rf,
         }));
-        Scheduler::new(membership, placement, plan)
+        let cp: Arc<dyn ControlPlane> = Arc::new(crate::cluster::LocalControlPlane::new(
+            membership.clone(),
+            placement.clone(),
+            plan.clone(),
+        ));
+        Scheduler::new(membership, placement, plan, cp)
     }
 
     #[test]
