@@ -158,6 +158,15 @@ async fn heartbeat(
     report: Option<Json<HeartbeatReport>>,
 ) -> Json<Value> {
     let report = report.map(|Json(r)| r).unwrap_or_default();
+    // Liveness is leader-local soft state, so it must land on the leader. A
+    // follower forwards there (the sidecar heartbeats any member); only if no
+    // leader is known yet — mid-election — do we accept best-effort locally.
+    if !s.control_plane.is_leader() {
+        if let Some(leader) = s.control_plane.leader_addr() {
+            let url = format!("{}/v1/nodes/{}/heartbeat", leader.trim_end_matches('/'), id);
+            return forwarded(s.http.post(url).json(&report)).await;
+        }
+    }
     let health = s.membership.heartbeat(&id, now_ms(), report);
     Json(json!({ "ok": true, "node_id": id, "health": health }))
 }
@@ -165,6 +174,13 @@ async fn heartbeat(
 /// `DELETE /v1/nodes/{id}` — begin draining a node. The reconciler evacuates its
 /// replicas/leadership onto healthy nodes; the operator removes it once empty.
 async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Json<Value> {
+    // Draining is leader-local intent; forward from a follower to the leader.
+    if !s.control_plane.is_leader() {
+        if let Some(leader) = s.control_plane.leader_addr() {
+            let url = format!("{}/v1/nodes/{}", leader.trim_end_matches('/'), id);
+            return forwarded(s.http.delete(url)).await;
+        }
+    }
     let known = s.membership.drain(&id);
     Json(json!({ "draining": known, "node_id": id }))
 }
