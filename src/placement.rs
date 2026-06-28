@@ -5,9 +5,11 @@
 //! toward it; the [`crate::scheduler`] rewrites it as nodes join, fail, or
 //! rebalance.
 //!
-//! In a real deployment this map is itself replicated by the brain's own Raft
-//! group, so the control plane survives losing a brain node. Skeleton: an
-//! in-memory table with the assignment logic left as `TODO`s.
+//! The assignment logic itself lives in [`crate::scheduler`] (it reconciles
+//! observed membership toward the desired [`crate::model::ScalePlan`]); this type
+//! is just the resulting map. It is authoritative in-memory today. Making it
+//! survive losing a brain node — replicating it through the brain's own Raft
+//! group — is the remaining HA work (see `assign`).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
