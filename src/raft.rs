@@ -923,6 +923,7 @@ mod tests {
                 nodes,
                 durable: HashMap::new(),
                 applied,
+                snapshots: HashMap::new(),
                 down: HashSet::new(),
             }
         }
