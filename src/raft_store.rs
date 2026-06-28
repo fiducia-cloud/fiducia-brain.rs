@@ -222,6 +222,7 @@ mod tests {
                     voted_for: None,
                     commit_index: 1,
                     log: vec![entry(1, 1)],
+                    ..Default::default()
                 })
                 .unwrap();
         }
