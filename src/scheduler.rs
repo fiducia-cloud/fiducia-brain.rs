@@ -35,18 +35,23 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::cluster::{Command, ControlPlane};
 use crate::membership::Membership;
 use crate::model::{NodeHealth, NodeId, ScalePlan, ShardAssignment, ShardId};
 use crate::placement::Placement;
 use crate::plan::{plan_replicas, NodeSlot};
 
 /// The reconciler: reads observed state (membership), writes desired state
-/// (placement), mediated by the current [`ScalePlan`].
+/// (placement) **through the control plane** so the change is replicated, all
+/// mediated by the current [`ScalePlan`].
 pub struct Scheduler {
     membership: Arc<Membership>,
     placement: Arc<Placement>,
     /// The live scale intent; `POST /v1/scale` updates this and the loop reads it.
     plan: Arc<Mutex<ScalePlan>>,
+    /// The brain's own control plane: writes go through `propose`, and the loop
+    /// only acts while `is_leader()`.
+    cp: Arc<dyn ControlPlane>,
 }
 
 impl Scheduler {
@@ -54,11 +59,13 @@ impl Scheduler {
         membership: Arc<Membership>,
         placement: Arc<Placement>,
         plan: Arc<Mutex<ScalePlan>>,
+        cp: Arc<dyn ControlPlane>,
     ) -> Self {
         Scheduler {
             membership,
             placement,
             plan,
+            cp,
         }
     }
 
@@ -172,13 +179,23 @@ impl Scheduler {
                     "scheduler: (re)assigning shard placement"
                 );
                 changes += 1;
-                self.placement.assign(ShardAssignment {
+                self.cp.propose(Command::AssignShard(ShardAssignment {
                     shard_id: shard,
                     replicas: desired,
                     preferred_leader,
-                });
+                }));
             }
         }
+
+        // Scale-down finalize: a drained node that now reports hosting **nothing**
+        // has fully evacuated, so remove it from membership (the last step the
+        // README promised but nothing did — `DELETE` only *starts* the drain).
+        for n in &nodes {
+            if n.health == NodeHealth::Draining && n.hosted_shards.is_empty() {
+                self.cp.propose(Command::ForgetNode(n.node_id.clone()));
+            }
+        }
+
         if changes > 0 {
             tracing::info!(
                 changes,
@@ -189,18 +206,22 @@ impl Scheduler {
         }
     }
 
-    /// Background loop: sweep failures, then reconcile, on an interval.
+    /// Background loop: sweep failures, then reconcile, on an interval. Only the
+    /// leader acts — followers stand by so multiple brain replicas don't each
+    /// compute (and replicate) a competing placement map.
     pub async fn run(self: Arc<Self>) {
         loop {
-            let now = now_ms();
-            let newly_dead = self.membership.sweep(now);
-            if !newly_dead.is_empty() {
-                tracing::warn!(
-                    ?newly_dead,
-                    "nodes declared dead; re-replicating their shards"
-                );
+            if self.cp.is_leader() {
+                let now = now_ms();
+                let newly_dead = self.membership.sweep(now);
+                if !newly_dead.is_empty() {
+                    tracing::warn!(
+                        ?newly_dead,
+                        "nodes declared dead; re-replicating their shards"
+                    );
+                }
+                self.reconcile();
             }
-            self.reconcile();
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
@@ -225,6 +246,7 @@ mod tests {
             failure_domain: domain.to_string(),
             hosted_shards: vec![],
             leading_shards: vec![],
+            seq: 0,
         }
     }
 
@@ -235,7 +257,12 @@ mod tests {
             target_nodes: 3,
             replication_factor: rf,
         }));
-        Scheduler::new(membership, placement, plan)
+        let cp: Arc<dyn ControlPlane> = Arc::new(crate::cluster::LocalControlPlane::new(
+            membership.clone(),
+            placement.clone(),
+            plan.clone(),
+        ));
+        Scheduler::new(membership, placement, plan, cp)
     }
 
     #[test]
@@ -284,6 +311,25 @@ mod tests {
         let assignment = s.placement.get(0).expect("shard placed");
         assert_eq!(assignment.preferred_leader.as_deref(), Some("a"));
         assert!(assignment.replicas.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn drained_and_evacuated_node_is_forgotten_on_reconcile() {
+        let s = scheduler(2, 2);
+        for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner")] {
+            s.membership.heartbeat(&id.to_string(), 0, hb(dom));
+        }
+        s.reconcile();
+
+        // Operator drains "a"; it evacuates and reports hosting nothing.
+        assert!(s.membership.drain(&"a".to_string()));
+        s.membership.heartbeat(&"a".to_string(), 1, hb("gcp")); // hb() reports no hosted shards
+        s.reconcile();
+
+        assert!(
+            s.membership.snapshot().iter().all(|n| n.node_id != "a"),
+            "a drained, fully-evacuated node is removed from membership"
+        );
     }
 
     #[test]

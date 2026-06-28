@@ -13,12 +13,21 @@
 //! replicating the brain's *own* state in its own Raft group (HA), tracked below.
 
 mod api;
+mod cluster;
 mod config;
 mod leadership;
 mod membership;
 mod model;
+mod oracle;
 mod placement;
 mod plan;
+// The brain's own Raft: the pure engine, its WAL, and the async driver that wires
+// it into `ControlPlane`. `allow(dead_code)` on the engine — it exposes a fuller
+// accessor API (role/term/commit_index) than the driver currently consumes.
+#[allow(dead_code)]
+mod raft;
+mod raft_driver;
+mod raft_store;
 mod scheduler;
 
 use std::net::SocketAddr;
@@ -35,9 +44,13 @@ use tower_http::{
 };
 
 use api::BrainState;
+use cluster::{ControlPlane, LocalControlPlane};
 use membership::Membership;
 use model::ScalePlan;
 use placement::Placement;
+use raft::RaftConfig;
+use raft_driver::RaftControlPlane;
+use raft_store::RaftStore;
 use scheduler::Scheduler;
 
 const SERVICE: &str = "fiducia-brain";
@@ -65,15 +78,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         replication_factor: cluster.replication_factor,
     }));
 
-    let membership = Arc::new(Membership::new(membership::MembershipConfig::default()));
+    // Liveness oracle: in-cluster, the `KubeOracle` confirms deaths and damps
+    // WAN blips from the k8s API; otherwise (local dev / no RBAC) the `NullOracle`
+    // keeps pure-timeout behavior.
+    let oracle: Arc<dyn oracle::LivenessOracle> = match oracle::KubeOracle::spawn() {
+        Some(kube) => {
+            tracing::info!("liveness: k8s KubeOracle active (confirmed-gone + blip damping)");
+            kube
+        }
+        None => {
+            tracing::info!("liveness: NullOracle (not in-cluster / no RBAC) — pure timeouts");
+            Arc::new(oracle::NullOracle)
+        }
+    };
+    let membership = Arc::new(Membership::with_oracle(
+        membership::MembershipConfig::default(),
+        oracle,
+    ));
     let placement = Arc::new(Placement::new(cluster.shard_count));
+
+    // Where this brain member listens (and the default for its own address).
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8095);
+
+    // The brain's own control plane. With `FIDUCIA_BRAIN_PEERS` set, run the
+    // replicated Raft (one member per cloud): durable state in `FIDUCIA_DATA_DIR`,
+    // and a single elected leader that alone reconciles. Unset ⇒ a single-member
+    // `LocalControlPlane` (local dev / one box) — always leader, no replication.
+    let peers: Vec<String> = std::env::var("FIDUCIA_BRAIN_PEERS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (control_plane, raft): (Arc<dyn ControlPlane>, Option<Arc<RaftControlPlane>>) =
+        if peers.is_empty() {
+            tracing::info!("control plane: single-member (FIDUCIA_BRAIN_PEERS unset) — no replication");
+            (
+                Arc::new(LocalControlPlane::new(
+                    membership.clone(),
+                    placement.clone(),
+                    plan.clone(),
+                )),
+                None,
+            )
+        } else {
+            let id = std::env::var("FIDUCIA_BRAIN_ID")
+                .unwrap_or_else(|_| format!("http://localhost:{port}"));
+            // Peers must EXCLUDE self. Operators commonly list every member
+            // (including this one) in FIDUCIA_BRAIN_PEERS, so filter our own id out
+            // — otherwise quorum is inflated (a 3-member group would wrongly need
+            // all 3, losing fault tolerance) and the member would RPC itself.
+            let peers: Vec<String> = peers.into_iter().filter(|p| p != &id).collect();
+            let data_dir = std::env::var("FIDUCIA_DATA_DIR")
+                .unwrap_or_else(|_| "/tmp/fiducia-brain".to_string());
+            // Fail closed: if we can't open our durable Raft home, we must not run.
+            let (store, restored) = RaftStore::open(&data_dir)?;
+            tracing::info!(
+                %id, ?peers, %data_dir,
+                "control plane: Raft ({} members) — replicating placement + scale plan",
+                peers.len() + 1
+            );
+            let rcp = RaftControlPlane::new(
+                id,
+                peers,
+                RaftConfig::default(),
+                Some(store),
+                restored,
+                raft_driver::Transport::http(),
+                membership.clone(),
+                placement.clone(),
+                plan.clone(),
+            );
+            rcp.spawn();
+            (rcp.clone(), Some(rcp))
+        };
+
     let scheduler = Arc::new(Scheduler::new(
         membership.clone(),
         placement.clone(),
         plan.clone(),
+        control_plane.clone(),
     ));
 
-    // Kick off the reconciliation loop (sweeps failures, then reconciles).
+    // Kick off the reconciliation loop (sweeps failures, then reconciles) — it
+    // only acts while this member is the leader.
     tokio::spawn(scheduler.clone().run());
 
     let state = BrainState {
@@ -81,12 +176,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         membership,
         placement,
         plan: plan.clone(),
+        control_plane,
+        // Short-timeout client for forwarding follower writes/heartbeats to the leader.
+        http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_default(),
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(health))
-        .nest("/v1", api::router(state))
+        .nest("/v1", api::router(state));
+    // Peer-facing Raft RPC endpoints — only when replication is enabled.
+    if let Some(rcp) = raft {
+        app = app.merge(raft_driver::raft_router(rcp));
+    }
+    let app = app
         // Hardening stack (outermost last): catch handler panics → 500, bound
         // request time, and cap body size.
         .layer(TraceLayer::new_for_http())
@@ -94,10 +200,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(CatchPanicLayer::new());
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8095);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     let shape = plan.lock().unwrap().clone();

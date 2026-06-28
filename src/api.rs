@@ -27,6 +27,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::cluster::{Command, ControlPlane};
 use crate::config::ClusterConfig;
 use crate::membership::Membership;
 use crate::model::{HeartbeatReport, NodeHealth, ScalePlan};
@@ -40,6 +41,29 @@ pub struct BrainState {
     pub placement: Arc<Placement>,
     /// The live scale intent the reconciler drives toward (`POST /v1/scale`).
     pub plan: Arc<Mutex<ScalePlan>>,
+    /// The brain's own control plane; durable writes (`/v1/scale`) go through it.
+    pub control_plane: Arc<dyn ControlPlane>,
+    /// Client for forwarding writes/heartbeats from a follower to the leader.
+    pub http: reqwest::Client,
+}
+
+/// Forward a request to the leader and relay its JSON response. Used when a
+/// non-leader receives a write or a heartbeat (liveness + durable state live on
+/// the leader). Keeps the data-plane sidecar dumb: it heartbeats any member and
+/// the brain routes internally.
+async fn forwarded(req: reqwest::RequestBuilder) -> Json<Value> {
+    match req.send().await {
+        Ok(resp) => Json(
+            resp.json::<Value>()
+                .await
+                .unwrap_or_else(|_| json!({ "ok": true, "forwarded": true })),
+        ),
+        Err(err) => Json(json!({
+            "ok": false,
+            "error": "leader_forward_failed",
+            "detail": err.to_string(),
+        })),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -91,6 +115,9 @@ async fn status(State(s): State<BrainState>) -> Json<Value> {
         "placed_shards": placed.len(),
         "under_replicated_shards": under_replicated,
         "placement_generation": s.placement.generation(),
+        // Brain's own control plane: which member is driving reconciliation.
+        "is_leader": s.control_plane.is_leader(),
+        "leader": s.control_plane.leader_addr(),
     }))
 }
 
@@ -131,6 +158,15 @@ async fn heartbeat(
     report: Option<Json<HeartbeatReport>>,
 ) -> Json<Value> {
     let report = report.map(|Json(r)| r).unwrap_or_default();
+    // Liveness is leader-local soft state, so it must land on the leader. A
+    // follower forwards there (the sidecar heartbeats any member); only if no
+    // leader is known yet — mid-election — do we accept best-effort locally.
+    if !s.control_plane.is_leader() {
+        if let Some(leader) = s.control_plane.leader_addr() {
+            let url = format!("{}/v1/nodes/{}/heartbeat", leader.trim_end_matches('/'), id);
+            return forwarded(s.http.post(url).json(&report)).await;
+        }
+    }
     let health = s.membership.heartbeat(&id, now_ms(), report);
     Json(json!({ "ok": true, "node_id": id, "health": health }))
 }
@@ -138,6 +174,13 @@ async fn heartbeat(
 /// `DELETE /v1/nodes/{id}` — begin draining a node. The reconciler evacuates its
 /// replicas/leadership onto healthy nodes; the operator removes it once empty.
 async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Json<Value> {
+    // Draining is leader-local intent; forward from a follower to the leader.
+    if !s.control_plane.is_leader() {
+        if let Some(leader) = s.control_plane.leader_addr() {
+            let url = format!("{}/v1/nodes/{}", leader.trim_end_matches('/'), id);
+            return forwarded(s.http.delete(url)).await;
+        }
+    }
     let known = s.membership.drain(&id);
     Json(json!({ "draining": known, "node_id": id }))
 }
@@ -166,6 +209,17 @@ async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) ->
 /// its next tick. `replication_factor` is clamped to ≥ 1.
 async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Json<Value> {
     plan.replication_factor = plan.replication_factor.max(1);
-    *s.plan.lock().unwrap() = plan.clone();
-    Json(json!({ "ok": true, "plan": plan }))
+    // Operator intent is durable state: route it through the control plane so it
+    // replicates. Only the leader may accept a write — a follower transparently
+    // forwards there; if no leader is known (mid-election) we report not_leader.
+    if s.control_plane.propose(Command::SetScalePlan(plan.clone())) {
+        return Json(json!({ "ok": true, "plan": plan }));
+    }
+    match s.control_plane.leader_addr() {
+        Some(leader) => {
+            let url = format!("{}/v1/scale", leader.trim_end_matches('/'));
+            forwarded(s.http.post(url).json(&plan)).await
+        }
+        None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null })),
+    }
 }

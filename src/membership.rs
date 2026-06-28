@@ -11,9 +11,10 @@
 //! `dead_after` ms it is `Dead` and its replicas are re-placed.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::model::{HeartbeatReport, NodeHealth, NodeId, NodeInfo};
+use crate::oracle::{LivenessOracle, NullOracle, PodLiveness};
 
 /// Failure-detector timing. Defaults assume a ~1s heartbeat from the sidecar.
 #[derive(Debug, Clone, Copy)]
@@ -43,13 +44,25 @@ impl Default for MembershipConfig {
 pub struct Membership {
     nodes: Mutex<HashMap<NodeId, NodeInfo>>,
     config: MembershipConfig,
+    /// External liveness signal (k8s). [`NullOracle`] by default ⇒ pure timeouts.
+    oracle: Arc<dyn LivenessOracle>,
 }
 
 impl Membership {
+    // Convenience constructor with the default (no-op) oracle. Used widely in
+    // tests; production wires an oracle via `with_oracle`.
+    #[allow(dead_code)]
     pub fn new(config: MembershipConfig) -> Self {
+        Self::with_oracle(config, Arc::new(NullOracle))
+    }
+
+    /// Construct with an external liveness oracle (the k8s read-side of the
+    /// hybrid detector). See [`crate::oracle`].
+    pub fn with_oracle(config: MembershipConfig, oracle: Arc<dyn LivenessOracle>) -> Self {
         Membership {
             nodes: Mutex::new(HashMap::new()),
             config,
+            oracle,
         }
     }
 
@@ -59,6 +72,23 @@ impl Membership {
     /// operator's intent to remove it isn't undone by liveness.
     pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) -> NodeHealth {
         let mut nodes = self.nodes.lock().unwrap();
+        // Reject a reordered or duplicated heartbeat: if the sender stamps a
+        // monotonic `seq` and this one is not strictly newer than the highest we
+        // have accepted, it carries stale state and applying it would revert newer
+        // reported shards/address. `seq == 0` means the sender doesn't sequence
+        // (legacy), so it is never rejected on that basis. Liveness is unaffected —
+        // a strictly newer heartbeat already refreshed it more recently.
+        if let Some(existing) = nodes.get(node_id) {
+            if report.seq != 0 && report.seq <= existing.last_seq {
+                tracing::debug!(
+                    node = %node_id,
+                    seq = report.seq,
+                    last_seq = existing.last_seq,
+                    "membership: ignoring stale/duplicate heartbeat (seq not newer)"
+                );
+                return existing.health;
+            }
+        }
         let known = nodes.contains_key(node_id);
         let entry = nodes.entry(node_id.clone()).or_insert_with(|| NodeInfo {
             node_id: node_id.clone(),
@@ -68,6 +98,7 @@ impl Membership {
             last_seen_ms: now_ms,
             hosted_shards: Vec::new(),
             leading_shards: Vec::new(),
+            last_seq: 0,
         });
         entry.last_seen_ms = now_ms;
         if !report.address.is_empty() {
@@ -78,6 +109,7 @@ impl Membership {
         }
         entry.hosted_shards = report.hosted_shards;
         entry.leading_shards = report.leading_shards;
+        entry.last_seq = entry.last_seq.max(report.seq);
         if entry.health != NodeHealth::Draining {
             entry.health = NodeHealth::Healthy;
         }
@@ -106,9 +138,8 @@ impl Membership {
     }
 
     /// Drop a node from the registry entirely (after it has been drained and holds
-    /// nothing). Returns whether it was present. Exposed for the operator
-    /// "finalize removal" step once a drained node's replicas have all moved.
-    #[allow(dead_code)]
+    /// nothing). Returns whether it was present. Driven by the reconciler's
+    /// scale-down finalize via [`crate::cluster::Command::ForgetNode`].
     pub fn forget(&self, node_id: &NodeId) -> bool {
         self.nodes.lock().unwrap().remove(node_id).is_some()
     }
@@ -132,12 +163,21 @@ impl Membership {
                 continue;
             }
             let silent_for = now_ms.saturating_sub(info.last_seen_ms);
-            let new_health = if silent_for >= self.config.dead_after_ms {
+            let by_timeout = if silent_for >= self.config.dead_after_ms {
                 NodeHealth::Dead
             } else if silent_for >= self.config.suspect_after_ms {
                 NodeHealth::Suspect
             } else {
                 NodeHealth::Healthy
+            };
+            // Reconcile the timeout verdict with the external oracle (k8s): a
+            // confirmed-gone pod is Dead immediately; a pod that is still Running
+            // can't be declared Dead on silence alone (it's a partition/blip), so
+            // we hold it at Suspect. Unknown ⇒ trust the timeout.
+            let new_health = match self.oracle.liveness(&info.node_id) {
+                PodLiveness::Gone => NodeHealth::Dead,
+                PodLiveness::Running if by_timeout == NodeHealth::Dead => NodeHealth::Suspect,
+                PodLiveness::Running | PodLiveness::Unknown => by_timeout,
             };
             if new_health == NodeHealth::Dead && info.health != NodeHealth::Dead {
                 tracing::warn!(
@@ -166,6 +206,7 @@ mod tests {
             failure_domain: domain.to_string(),
             hosted_shards: shards.to_vec(),
             leading_shards: shards.to_vec(),
+            seq: 0,
         }
     }
 
@@ -198,6 +239,40 @@ mod tests {
         assert_eq!(m.snapshot()[0].health, NodeHealth::Healthy);
     }
 
+    /// An oracle with a fixed verdict, for exercising the hybrid detector.
+    struct FixedOracle(PodLiveness);
+    impl LivenessOracle for FixedOracle {
+        fn liveness(&self, _node_id: &str) -> PodLiveness {
+            self.0
+        }
+    }
+
+    #[test]
+    fn oracle_confirmed_gone_declares_dead_before_the_timeout() {
+        // Pod is gone per k8s: declare Dead immediately, without waiting out
+        // dead_after (here the node has been silent for only 1ms).
+        let m = Membership::with_oracle(
+            MembershipConfig { suspect_after_ms: 1_000, dead_after_ms: 60_000 },
+            Arc::new(FixedOracle(PodLiveness::Gone)),
+        );
+        m.heartbeat(&"a".to_string(), 0, report("gcp", &[0]));
+        assert_eq!(m.sweep(1), vec!["a".to_string()], "gone pod is dead now");
+        assert_eq!(m.snapshot()[0].health, NodeHealth::Dead);
+    }
+
+    #[test]
+    fn oracle_running_holds_a_silent_node_at_suspect_not_dead() {
+        // Pod is Running per k8s but heartbeats stopped (network blip): we must
+        // NOT declare it Dead and trigger re-replication — hold it at Suspect.
+        let m = Membership::with_oracle(
+            MembershipConfig { suspect_after_ms: 1_000, dead_after_ms: 5_000 },
+            Arc::new(FixedOracle(PodLiveness::Running)),
+        );
+        m.heartbeat(&"a".to_string(), 0, report("gcp", &[0]));
+        assert!(m.sweep(1_000_000).is_empty(), "running pod is never declared dead on silence");
+        assert_eq!(m.snapshot()[0].health, NodeHealth::Suspect);
+    }
+
     #[test]
     fn draining_is_sticky_across_heartbeats_and_sweeps() {
         let m = Membership::new(MembershipConfig::default());
@@ -209,5 +284,68 @@ mod tests {
         // And the failure sweep never flips a draining node to Dead.
         assert!(m.sweep(1_000_000).is_empty());
         assert_eq!(m.snapshot()[0].health, NodeHealth::Draining);
+    }
+
+    #[test]
+    fn a_stale_or_duplicate_heartbeat_does_not_overwrite_newer_state() {
+        let m = Membership::new(MembershipConfig::default());
+        // seq 5: node leads shards [0, 1].
+        m.heartbeat(
+            &"a".to_string(),
+            1_000,
+            HeartbeatReport { seq: 5, ..report("gcp", &[0, 1]) },
+        );
+        assert_eq!(m.snapshot()[0].leading_shards, vec![0, 1]);
+
+        // A delayed/duplicated heartbeat with an OLDER seq and no shards arrives.
+        // It must be ignored, not revert the node to leading nothing.
+        m.heartbeat(
+            &"a".to_string(),
+            2_000,
+            HeartbeatReport { seq: 3, ..report("gcp", &[]) },
+        );
+        assert_eq!(
+            m.snapshot()[0].leading_shards,
+            vec![0, 1],
+            "older heartbeat ignored — newer reported state preserved"
+        );
+
+        // A duplicate of the latest seq is likewise ignored.
+        m.heartbeat(
+            &"a".to_string(),
+            2_500,
+            HeartbeatReport { seq: 5, ..report("gcp", &[]) },
+        );
+        assert_eq!(
+            m.snapshot()[0].leading_shards,
+            vec![0, 1],
+            "duplicate seq ignored"
+        );
+
+        // A strictly newer seq is applied.
+        m.heartbeat(
+            &"a".to_string(),
+            3_000,
+            HeartbeatReport { seq: 6, ..report("gcp", &[7]) },
+        );
+        assert_eq!(
+            m.snapshot()[0].leading_shards,
+            vec![7],
+            "newer heartbeat applied"
+        );
+    }
+
+    #[test]
+    fn unsequenced_heartbeats_seq_zero_are_always_applied() {
+        // A legacy sidecar that doesn't stamp seq (always 0) must keep working:
+        // every heartbeat is accepted (no false "stale" rejection).
+        let m = Membership::new(MembershipConfig::default());
+        m.heartbeat(&"a".to_string(), 0, report("gcp", &[0]));
+        m.heartbeat(&"a".to_string(), 1, report("gcp", &[1]));
+        assert_eq!(
+            m.snapshot()[0].leading_shards,
+            vec![1],
+            "latest unsequenced heartbeat wins"
+        );
     }
 }

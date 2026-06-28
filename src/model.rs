@@ -39,10 +39,17 @@ pub struct NodeInfo {
     /// Shards this node reports hosting, and whether it leads them.
     pub hosted_shards: Vec<ShardId>,
     pub leading_shards: Vec<ShardId>,
+    /// Highest heartbeat `seq` accepted from this node. A heartbeat whose `seq`
+    /// is not strictly greater is a reordered or duplicated delivery and is
+    /// ignored, so older in-flight state can never overwrite newer (see
+    /// [`HeartbeatReport::seq`]).
+    #[serde(default)]
+    pub last_seq: u64,
 }
 
 /// The body a data-plane node (its sidecar) posts to `/v1/nodes/{id}/heartbeat`.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// `Serialize` too, so a follower can forward it verbatim to the leader.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HeartbeatReport {
     /// Where to reach this node (host:port), echoed into the placement redirects.
     #[serde(default)]
@@ -56,11 +63,18 @@ pub struct HeartbeatReport {
     /// Subset of `hosted_shards` this node currently leads.
     #[serde(default)]
     pub leading_shards: Vec<ShardId>,
+    /// Monotonic per-node sequence the sidecar stamps on each heartbeat (seeded
+    /// from its boot time, incremented per send). The brain ignores any heartbeat
+    /// whose `seq` is not strictly greater than the last it accepted, so a
+    /// reordered or duplicated POST can't revert newer reported state. `0` (the
+    /// default) means the sender doesn't sequence — never rejected on that basis.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// The authoritative placement for one shard: which nodes replicate it and which
 /// one the brain wants to lead it. Data-plane nodes reconcile toward this.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardAssignment {
     pub shard_id: ShardId,
     /// Nodes that should hold a replica of this shard.
