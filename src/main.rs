@@ -37,6 +37,7 @@ use tower_http::{
 };
 
 use api::BrainState;
+use cluster::{ControlPlane, LocalControlPlane};
 use membership::Membership;
 use model::ScalePlan;
 use placement::Placement;
