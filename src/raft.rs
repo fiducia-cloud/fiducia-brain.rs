@@ -947,6 +947,11 @@ mod tests {
                     if let Some(p) = ready.persist {
                         self.durable.insert(id.clone(), p); // persist BEFORE send/apply
                     }
+                    if let Some(data) = ready.restore {
+                        // An installed snapshot resets the state machine: in the
+                        // harness, record the bytes (a real driver would reload them).
+                        self.snapshots.insert(id.clone(), data);
+                    }
                     self.applied.get_mut(&id).unwrap().extend(ready.committed);
                     for m in ready.messages {
                         queue.push((id.clone(), m));
