@@ -48,7 +48,8 @@ pub struct NodeInfo {
 }
 
 /// The body a data-plane node (its sidecar) posts to `/v1/nodes/{id}/heartbeat`.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// `Serialize` too, so a follower can forward it verbatim to the leader.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HeartbeatReport {
     /// Where to reach this node (host:port), echoed into the placement redirects.
     #[serde(default)]
