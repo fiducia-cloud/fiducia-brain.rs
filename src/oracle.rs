@@ -168,13 +168,14 @@ fn parse_pod_list(list: &Value) -> HashMap<String, PodLiveness> {
 struct KubeApi {
     client: reqwest::Client,
     base: String,
-    token: String,
     namespace: String,
 }
 
 impl KubeApi {
     fn in_cluster() -> Option<KubeApi> {
-        let token = std::fs::read_to_string(format!("{SA_DIR}/token")).ok()?;
+        // Confirm we're in-cluster: the token must be readable now (re-read per
+        // request below). The CA, by contrast, is stable for the cluster's life.
+        std::fs::read_to_string(format!("{SA_DIR}/token")).ok()?;
         let ca = std::fs::read(format!("{SA_DIR}/ca.crt")).ok()?;
         let namespace = std::fs::read_to_string(format!("{SA_DIR}/namespace"))
             .ok()
@@ -190,12 +191,15 @@ impl KubeApi {
         Some(KubeApi {
             client,
             base: "https://kubernetes.default.svc".to_string(),
-            token: token.trim().to_string(),
             namespace,
         })
     }
 
     async fn list_node_pods(&self) -> Option<Value> {
+        // Re-read the token each poll: projected bound SA tokens rotate (~1h) and
+        // the kubelet refreshes the file, so caching it would 401 after expiry and
+        // silently kill the oracle. A local file read per 3s poll is negligible.
+        let token = std::fs::read_to_string(format!("{SA_DIR}/token")).ok()?;
         let url = format!(
             "{}/api/v1/namespaces/{}/pods?labelSelector={}",
             self.base,
@@ -204,7 +208,7 @@ impl KubeApi {
         );
         self.client
             .get(url)
-            .bearer_auth(&self.token)
+            .bearer_auth(token.trim())
             .send()
             .await
             .ok()?
