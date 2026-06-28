@@ -206,18 +206,22 @@ impl Scheduler {
         }
     }
 
-    /// Background loop: sweep failures, then reconcile, on an interval.
+    /// Background loop: sweep failures, then reconcile, on an interval. Only the
+    /// leader acts — followers stand by so multiple brain replicas don't each
+    /// compute (and replicate) a competing placement map.
     pub async fn run(self: Arc<Self>) {
         loop {
-            let now = now_ms();
-            let newly_dead = self.membership.sweep(now);
-            if !newly_dead.is_empty() {
-                tracing::warn!(
-                    ?newly_dead,
-                    "nodes declared dead; re-replicating their shards"
-                );
+            if self.cp.is_leader() {
+                let now = now_ms();
+                let newly_dead = self.membership.sweep(now);
+                if !newly_dead.is_empty() {
+                    tracing::warn!(
+                        ?newly_dead,
+                        "nodes declared dead; re-replicating their shards"
+                    );
+                }
+                self.reconcile();
             }
-            self.reconcile();
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
