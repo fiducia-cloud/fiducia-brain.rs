@@ -79,6 +79,13 @@ impl Scheduler {
             .map(|n| n.node_id.clone())
             .collect();
         let healthy_set: HashSet<NodeId> = healthy_ids.iter().cloned().collect();
+        if healthy_ids.len() < rf as usize {
+            tracing::warn!(
+                healthy_nodes = healthy_ids.len(),
+                rf,
+                "scheduler: fewer healthy nodes than replication factor — shards will be under-replicated"
+            );
+        }
 
         // Current per-node replica load (across the existing placement) so fills
         // pick the least-loaded node and spread evens out as we go.
