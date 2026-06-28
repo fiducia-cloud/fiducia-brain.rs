@@ -178,6 +178,9 @@ pub struct Ready {
     /// If set (after receiving an InstallSnapshot), the driver must **reset** its
     /// state machine to these snapshot bytes before applying `committed`.
     pub restore: Option<Vec<u8>>,
+    /// The engine's `last_applied` after this batch — the index the state machine
+    /// now reflects. The driver compacts no further than this (a safe snapshot point).
+    pub applied_upto: u64,
     /// Messages to send to peers (after persisting).
     pub messages: Vec<Addressed>,
     /// Newly-committed commands to apply to the state machine (after persisting).
