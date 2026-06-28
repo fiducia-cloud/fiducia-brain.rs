@@ -48,8 +48,9 @@ impl Placement {
 
     /// Install a new assignment for a shard (called by the scheduler).
     ///
-    /// TODO(cluster): propose this through the brain's Raft group so the
-    /// placement map is durable and consistent across brain nodes.
+    /// Authoritative in-memory. HA follow-up: propose this through the brain's
+    /// own Raft group so the placement map is durable and consistent across
+    /// brain nodes (until then a brain restart re-derives it from heartbeats).
     pub fn assign(&self, assignment: ShardAssignment) {
         self.assignments
             .lock()
