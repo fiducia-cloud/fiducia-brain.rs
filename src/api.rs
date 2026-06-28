@@ -142,16 +142,23 @@ async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Jso
     Json(json!({ "draining": known, "node_id": id }))
 }
 
-/// `GET /v1/placement` — full shard map for nodes to reconcile against.
+/// `GET /v1/placement` — full shard map for nodes to reconcile against. The
+/// `generation` lets pollers skip re-diffing the map when nothing changed.
 async fn placement(State(s): State<BrainState>) -> Json<Value> {
-    Json(json!({ "shards": s.placement.snapshot() }))
+    Json(json!({
+        "generation": s.placement.generation(),
+        "shards": s.placement.snapshot(),
+    }))
 }
 
-/// `GET /v1/placement/{shard}` — one shard's assignment.
-async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) -> Json<Value> {
+/// `GET /v1/placement/{shard}` — one shard's assignment (404 if unplaced).
+async fn placement_shard(State(s): State<BrainState>, Path(shard): Path<u32>) -> impl IntoResponse {
     match s.placement.get(shard) {
-        Some(a) => Json(json!(a)),
-        None => Json(json!({ "error": "not_found", "shard": shard })),
+        Some(a) => (StatusCode::OK, Json(json!(a))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "not_found", "shard": shard })),
+        ),
     }
 }
 
