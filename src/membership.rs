@@ -81,6 +81,13 @@ impl Membership {
         if entry.health != NodeHealth::Draining {
             entry.health = NodeHealth::Healthy;
         }
+        if !known {
+            tracing::info!(
+                node = %node_id,
+                domain = %entry.failure_domain,
+                "membership: new node registered via heartbeat"
+            );
+        }
     }
 
     /// Begin draining a node ahead of removal (scale-down / maintenance): the
