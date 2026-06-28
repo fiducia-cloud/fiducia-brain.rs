@@ -20,6 +20,9 @@
 //! shape is documented at the bottom of this file.
 
 /// What an external oracle believes about a node's backing pod.
+// `Running`/`Gone` are constructed by the real `KubeOracle` (Milestone 3) and in
+// tests; the default `NullOracle` only ever returns `Unknown`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PodLiveness {
     /// The pod exists and is `Running` — silence is a blip, not death.
