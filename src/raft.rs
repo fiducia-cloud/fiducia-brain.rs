@@ -215,6 +215,8 @@ impl Raft {
             heartbeat_elapsed: 0,
             randomized_election_timeout: 0,
             rng: seed | 1, // xorshift needs a non-zero state
+            out: Vec::new(),
+            dirty: false,
         };
         raft.reset_election_timer();
         raft
