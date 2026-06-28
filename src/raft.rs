@@ -310,17 +310,27 @@ impl Raft {
     }
 
     fn last_index(&self) -> u64 {
-        self.log.last().map(|e| e.index).unwrap_or(0)
+        self.log.last().map(|e| e.index).unwrap_or(self.base_index)
     }
     fn last_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        self.log.last().map(|e| e.term).unwrap_or(self.base_term)
     }
-    /// Term of the entry at 1-based `index` (0 for index 0 or beyond the log).
-    fn term_at(&self, index: u64) -> u64 {
-        if index == 0 || index > self.last_index() {
-            0
+    /// Slab position of 1-based log `index`, or `None` if it is compacted
+    /// (≤ `base_index`) or beyond the end of the log.
+    fn log_slot(&self, index: u64) -> Option<usize> {
+        if index <= self.base_index || index > self.last_index() {
+            None
         } else {
-            self.log[(index - 1) as usize].term
+            Some((index - self.base_index - 1) as usize)
+        }
+    }
+    /// Term of the entry at 1-based `index`: `base_term` at the snapshot boundary,
+    /// the entry's term within the live log, else 0 (compacted or beyond the log).
+    fn term_at(&self, index: u64) -> u64 {
+        if index == self.base_index {
+            self.base_term
+        } else {
+            self.log_slot(index).map(|i| self.log[i].term).unwrap_or(0)
         }
     }
 
