@@ -283,15 +283,11 @@ impl Scheduler {
                     shard_id: shard,
                     replicas: desired,
                     preferred_leader,
-<<<<<<< HEAD
-                }));
-=======
                     preferred_region: policy.as_ref().and_then(|p| p.home_region.clone()),
                     preferred_cloud_provider: policy
                         .as_ref()
                         .and_then(|p| p.preferred_cloud_provider.clone()),
-                });
->>>>>>> origin/main
+                }));
             }
         }
 
