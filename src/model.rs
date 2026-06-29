@@ -1,4 +1,4 @@
-//! Shared control-plane types (skeleton).
+//! Shared control-plane types.
 
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,17 @@ pub struct NodeInfo {
     pub node_id: NodeId,
     pub address: String,
     pub health: NodeHealth,
+    /// Cloud this node belongs to (`aws`, `gcp`, `hetzner`, ...). Kept separate
+    /// from region so placement can reason about both provider failure and user
+    /// proximity.
+    #[serde(default)]
+    pub cloud_provider: String,
+    /// Cloud/edge region (`us-east-1`, `europe-west1`, `nbg1`, ...).
+    #[serde(default)]
+    pub region: String,
+    /// Kubernetes cluster identity, distinct from provider/region.
+    #[serde(default)]
+    pub cluster_id: String,
     /// Failure domain (region/AZ/rack) the sidecar reports. The scheduler spreads
     /// a shard's replicas across **distinct** domains so one domain loss can't
     /// take a quorum. Empty string = "unknown" (treated as its own domain).
@@ -54,6 +65,15 @@ pub struct HeartbeatReport {
     /// Where to reach this node (host:port), echoed into the placement redirects.
     #[serde(default)]
     pub address: String,
+    /// Cloud provider for placement/failure-domain normalization.
+    #[serde(default)]
+    pub cloud_provider: String,
+    /// Region for leader affinity and latency-aware placement.
+    #[serde(default)]
+    pub region: String,
+    /// Kubernetes cluster identity.
+    #[serde(default)]
+    pub cluster_id: String,
     /// Failure domain (region/AZ/rack).
     #[serde(default)]
     pub failure_domain: String,
@@ -81,6 +101,38 @@ pub struct ShardAssignment {
     pub replicas: Vec<NodeId>,
     /// The node the brain prefers as leader (leadership balancing).
     pub preferred_leader: Option<NodeId>,
+    /// Region requested by the shard/namespace placement policy, when any.
+    #[serde(default)]
+    pub preferred_region: Option<String>,
+    /// Cloud requested by the shard/namespace placement policy, when any.
+    #[serde(default)]
+    pub preferred_cloud_provider: Option<String>,
+}
+
+/// Region/provider affinity for the shard that owns a namespace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlacementPolicy {
+    /// Namespace/customer key used to pick the shard.
+    pub namespace: String,
+    /// Shard affected by this policy (`hash(namespace) % shard_count`).
+    pub shard_id: ShardId,
+    /// Preferred user/home region for this namespace.
+    #[serde(default)]
+    pub home_region: Option<String>,
+    /// Optional provider affinity, mostly useful when two providers exist in the
+    /// same broad geography.
+    #[serde(default)]
+    pub preferred_cloud_provider: Option<String>,
+}
+
+/// Body accepted by `POST /v1/policies`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlacementPolicyUpdate {
+    pub namespace: String,
+    #[serde(default)]
+    pub home_region: Option<String>,
+    #[serde(default)]
+    pub preferred_cloud_provider: Option<String>,
 }
 
 /// A scaling intent the reconciler drives toward.

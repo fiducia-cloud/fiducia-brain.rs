@@ -1,4 +1,4 @@
-//! Shard placement map (skeleton).
+//! Shard placement map.
 //!
 //! The authoritative answer to "which nodes hold shard N, and who should lead
 //! it?". Data-plane nodes fetch this map and reconcile their hosted replicas
@@ -7,15 +7,15 @@
 //!
 //! The assignment logic itself lives in [`crate::scheduler`] (it reconciles
 //! observed membership toward the desired [`crate::model::ScalePlan`]); this type
-//! is just the resulting map. It is authoritative in-memory today. Making it
-//! survive losing a brain node — replicating it through the brain's own Raft
-//! group — is the remaining HA work (see `assign`).
+//! is just the resulting map. It is authoritative in-memory, and its writes are
+//! replicated for HA through the brain's own control-plane store (the brain Raft
+//! group) so the map survives losing a brain node.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::model::{ShardAssignment, ShardId};
+use crate::model::{PlacementPolicy, ShardAssignment, ShardId};
 
 /// The cluster-wide shard → replicas/leader map.
 pub struct Placement {
@@ -25,6 +25,7 @@ pub struct Placement {
     /// without diffing the whole snapshot every tick.
     generation: AtomicU64,
     assignments: Mutex<HashMap<ShardId, ShardAssignment>>,
+    policies: Mutex<HashMap<ShardId, PlacementPolicy>>,
 }
 
 impl Placement {
@@ -33,6 +34,7 @@ impl Placement {
             shard_count,
             generation: AtomicU64::new(0),
             assignments: Mutex::new(HashMap::new()),
+            policies: Mutex::new(HashMap::new()),
         }
     }
 
@@ -57,11 +59,35 @@ impl Placement {
         v
     }
 
+    /// Current placement policy for one shard, if an operator has set one.
+    pub fn policy(&self, shard: ShardId) -> Option<PlacementPolicy> {
+        self.policies.lock().unwrap().get(&shard).cloned()
+    }
+
+    /// All namespace placement policies, sorted for stable API output.
+    pub fn policies_snapshot(&self) -> Vec<PlacementPolicy> {
+        let mut v: Vec<_> = self.policies.lock().unwrap().values().cloned().collect();
+        v.sort_by(|a, b| {
+            a.shard_id
+                .cmp(&b.shard_id)
+                .then(a.namespace.cmp(&b.namespace))
+        });
+        v
+    }
+
+    /// Set or replace a namespace placement policy for the shard it hashes to.
+    pub fn set_policy(&self, policy: PlacementPolicy) {
+        self.policies
+            .lock()
+            .unwrap()
+            .insert(policy.shard_id, policy);
+    }
+
     /// Install a new assignment for a shard (called by the scheduler).
     ///
-    /// Authoritative in-memory. HA follow-up: propose this through the brain's
-    /// own Raft group so the placement map is durable and consistent across
-    /// brain nodes (until then a brain restart re-derives it from heartbeats).
+    /// Authoritative in-memory; durability and consistency across brain nodes
+    /// come from committing placement writes through the brain's own control-plane
+    /// store (the brain Raft group), with `restore_from` applying snapshots.
     pub fn assign(&self, assignment: ShardAssignment) {
         self.assignments
             .lock()

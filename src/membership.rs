@@ -27,15 +27,14 @@ pub struct MembershipConfig {
 
 impl Default for MembershipConfig {
     fn default() -> Self {
+        let suspect_after_ms = positive_u64_env("FIDUCIA_SUSPECT_AFTER_MS", 6_000);
+        let dead_after_ms = dead_after_ms_after(
+            suspect_after_ms,
+            positive_u64_env("FIDUCIA_DEAD_AFTER_MS", 30_000),
+        );
         MembershipConfig {
-            suspect_after_ms: std::env::var("FIDUCIA_SUSPECT_AFTER_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3_000),
-            dead_after_ms: std::env::var("FIDUCIA_DEAD_AFTER_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(10_000),
+            suspect_after_ms,
+            dead_after_ms,
         }
     }
 }
@@ -71,6 +70,7 @@ impl Membership {
     /// if new). A `Draining` node that keeps heartbeating stays `Draining` — the
     /// operator's intent to remove it isn't undone by liveness.
     pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) -> NodeHealth {
+        let normalized_domain = normalized_failure_domain(&report);
         let mut nodes = self.nodes.lock().unwrap();
         // Reject a reordered or duplicated heartbeat: if the sender stamps a
         // monotonic `seq` and this one is not strictly newer than the highest we
@@ -94,7 +94,10 @@ impl Membership {
             node_id: node_id.clone(),
             address: report.address.clone(),
             health: NodeHealth::Healthy,
-            failure_domain: report.failure_domain.clone(),
+            cloud_provider: report.cloud_provider.clone(),
+            region: report.region.clone(),
+            cluster_id: report.cluster_id.clone(),
+            failure_domain: normalized_domain.clone(),
             last_seen_ms: now_ms,
             hosted_shards: Vec::new(),
             leading_shards: Vec::new(),
@@ -104,8 +107,24 @@ impl Membership {
         if !report.address.is_empty() {
             entry.address = report.address;
         }
+        if !report.cloud_provider.is_empty() {
+            entry.cloud_provider = report.cloud_provider;
+        }
+        if !report.region.is_empty() {
+            entry.region = report.region;
+        }
+        if !report.cluster_id.is_empty() {
+            entry.cluster_id = report.cluster_id;
+        }
         if !report.failure_domain.is_empty() {
-            entry.failure_domain = report.failure_domain;
+            entry.failure_domain = normalized_domain;
+        } else if entry.failure_domain.is_empty() {
+            entry.failure_domain = normalized_failure_domain_from_parts(
+                &entry.cloud_provider,
+                &entry.region,
+                &entry.cluster_id,
+                node_id,
+            );
         }
         entry.hosted_shards = report.hosted_shards;
         entry.leading_shards = report.leading_shards;
@@ -196,6 +215,55 @@ impl Membership {
     }
 }
 
+fn normalized_failure_domain(report: &HeartbeatReport) -> String {
+    if !report.failure_domain.trim().is_empty() {
+        return report.failure_domain.trim().to_ascii_lowercase();
+    }
+    normalized_failure_domain_from_parts(
+        &report.cloud_provider,
+        &report.region,
+        &report.cluster_id,
+        "",
+    )
+}
+
+fn positive_u64_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+fn dead_after_ms_after(suspect_after_ms: u64, configured_dead_after_ms: u64) -> u64 {
+    configured_dead_after_ms.max(suspect_after_ms.saturating_add(1))
+}
+
+fn normalized_failure_domain_from_parts(
+    cloud_provider: &str,
+    region: &str,
+    cluster_id: &str,
+    fallback: &str,
+) -> String {
+    let cloud_provider = cloud_provider.trim().to_ascii_lowercase();
+    let region = region.trim().to_ascii_lowercase();
+    let cluster_id = cluster_id.trim().to_ascii_lowercase();
+    match (
+        cloud_provider.is_empty(),
+        region.is_empty(),
+        cluster_id.is_empty(),
+    ) {
+        (false, false, false) => format!("{cloud_provider}/{region}/{cluster_id}"),
+        (false, false, true) => format!("{cloud_provider}/{region}"),
+        (false, true, false) => format!("{cloud_provider}/{cluster_id}"),
+        (false, true, true) => cloud_provider,
+        (true, false, false) => format!("{region}/{cluster_id}"),
+        (true, false, true) => region,
+        (true, true, false) => cluster_id,
+        (true, true, true) => fallback.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +271,9 @@ mod tests {
     fn report(domain: &str, shards: &[u32]) -> HeartbeatReport {
         HeartbeatReport {
             address: "10.0.0.1:8090".to_string(),
+            cloud_provider: String::new(),
+            region: String::new(),
+            cluster_id: String::new(),
             failure_domain: domain.to_string(),
             hosted_shards: shards.to_vec(),
             leading_shards: shards.to_vec(),
@@ -347,5 +418,81 @@ mod tests {
             vec![1],
             "latest unsequenced heartbeat wins"
         );
+    }
+
+    #[test]
+    fn heartbeat_derives_failure_domain_from_cloud_and_region() {
+        let m = Membership::new(MembershipConfig::default());
+        m.heartbeat(
+            &"node-a".to_string(),
+            0,
+            HeartbeatReport {
+                address: "10.0.0.1:8090".to_string(),
+                cloud_provider: "AWS".to_string(),
+                region: "us-east-1".to_string(),
+                cluster_id: "aws-prod".to_string(),
+                failure_domain: String::new(),
+                hosted_shards: vec![],
+                leading_shards: vec![],
+                seq: 0,
+            },
+        );
+
+        let node = m.snapshot().remove(0);
+        assert_eq!(node.cloud_provider, "AWS");
+        assert_eq!(node.region, "us-east-1");
+        assert_eq!(node.cluster_id, "aws-prod");
+        assert_eq!(node.failure_domain, "aws/us-east-1/aws-prod");
+    }
+
+    #[test]
+    fn snapshot_is_sorted_by_node_id() {
+        let m = Membership::new(MembershipConfig::default());
+        m.heartbeat(&"node-c".to_string(), 0, report("c", &[2]));
+        m.heartbeat(&"node-a".to_string(), 0, report("a", &[0]));
+        m.heartbeat(&"node-b".to_string(), 0, report("b", &[1]));
+
+        let ids: Vec<String> = m.snapshot().into_iter().map(|node| node.node_id).collect();
+
+        assert_eq!(ids, vec!["node-a", "node-b", "node-c"]);
+    }
+
+    #[test]
+    fn forget_removes_known_node_and_reports_absent_nodes() {
+        let m = Membership::new(MembershipConfig::default());
+        m.heartbeat(&"node-a".to_string(), 0, report("gcp", &[0]));
+
+        assert_eq!(m.snapshot().len(), 1);
+        assert!(m.forget(&"node-a".to_string()));
+        assert!(m.snapshot().is_empty());
+        assert!(!m.forget(&"node-a".to_string()));
+    }
+
+    #[test]
+    fn empty_heartbeat_fields_do_not_erase_existing_address_or_domain() {
+        let m = Membership::new(MembershipConfig::default());
+        m.heartbeat(&"node-a".to_string(), 0, report("GCP/US", &[0]));
+        m.heartbeat(
+            &"node-a".to_string(),
+            1_000,
+            HeartbeatReport {
+                address: String::new(),
+                failure_domain: String::new(),
+                hosted_shards: vec![1],
+                leading_shards: vec![],
+                ..HeartbeatReport::default()
+            },
+        );
+
+        let node = m.snapshot().remove(0);
+        assert_eq!(node.address, "10.0.0.1:8090");
+        assert_eq!(node.failure_domain, "gcp/us");
+        assert_eq!(node.hosted_shards, vec![1]);
+    }
+
+    #[test]
+    fn detector_config_keeps_dead_after_suspect() {
+        assert_eq!(dead_after_ms_after(6_000, 1_000), 6_001);
+        assert_eq!(dead_after_ms_after(6_000, 30_000), 30_000);
     }
 }

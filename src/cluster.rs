@@ -156,6 +156,8 @@ mod tests {
             shard_id: shard,
             replicas: vec!["a".into(), "b".into()],
             preferred_leader: Some("a".into()),
+            preferred_region: None,
+            preferred_cloud_provider: None,
         }));
         assert_eq!(placement.get(shard).unwrap().replicas, vec!["a", "b"]);
 
