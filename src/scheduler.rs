@@ -221,6 +221,7 @@ impl Scheduler {
                 &desired,
                 &healthy_set,
                 &leader_slots,
+                observed_leader.get(&shard),
             );
             let preferred_leader = crate::leadership::desired_leader(
                 affinity_target.as_ref(),
