@@ -316,11 +316,13 @@ async fn set_policy(
 /// its next tick. `replication_factor` is fixed at RF=3 for the multi-cloud
 /// baseline.
 async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Json<Value> {
-<<<<<<< HEAD
-    plan.replication_factor = plan.replication_factor.max(1);
+    // RF is fixed at the multi-cloud baseline; target can't drop below it.
+    plan.replication_factor = SUPPORTED_REPLICATION_FACTOR;
+    plan.target_nodes = plan.target_nodes.max(SUPPORTED_REPLICATION_FACTOR);
     // Operator intent is durable state: route it through the control plane so it
-    // replicates. Only the leader may accept a write — a follower transparently
-    // forwards there; if no leader is known (mid-election) we report not_leader.
+    // replicates (apply_command writes it into `s.plan` once committed). Only the
+    // leader may accept a write — a follower transparently forwards there; if no
+    // leader is known (mid-election) we report not_leader.
     if s.control_plane.propose(Command::SetScalePlan(plan.clone())) {
         return Json(json!({ "ok": true, "plan": plan }));
     }
@@ -331,12 +333,6 @@ async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>)
         }
         None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null })),
     }
-=======
-    plan.replication_factor = SUPPORTED_REPLICATION_FACTOR;
-    plan.target_nodes = plan.target_nodes.max(SUPPORTED_REPLICATION_FACTOR);
-    *s.plan.lock().unwrap() = plan.clone();
-    Json(json!({ "ok": true, "plan": plan }))
->>>>>>> origin/main
 }
 
 fn health_name(health: NodeHealth) -> &'static str {
