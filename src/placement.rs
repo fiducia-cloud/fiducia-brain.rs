@@ -85,14 +85,9 @@ impl Placement {
 
     /// Install a new assignment for a shard (called by the scheduler).
     ///
-<<<<<<< HEAD
-    /// Authoritative in-memory. HA follow-up: propose this through the brain's
-    /// own Raft group so the placement map is durable and consistent across
-    /// brain nodes (until then a brain restart re-derives it from heartbeats).
-=======
-    /// Production HA should commit this through the brain control-plane store so
-    /// placement is durable and consistent across brain nodes.
->>>>>>> origin/main
+    /// Authoritative in-memory; durability and consistency across brain nodes
+    /// come from committing placement writes through the brain's own control-plane
+    /// store (the brain Raft group), with `restore_from` applying snapshots.
     pub fn assign(&self, assignment: ShardAssignment) {
         self.assignments
             .lock()
