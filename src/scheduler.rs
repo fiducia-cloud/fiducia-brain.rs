@@ -528,7 +528,9 @@ mod tests {
             Some("b"),
             "adopts the observed leader rather than picking a new one"
         );
-=======
+    }
+
+    #[test]
     fn rf3_spreads_across_clouds_and_biases_leader_to_policy_region() {
         let s = scheduler(1, 3);
         s.membership.heartbeat(
