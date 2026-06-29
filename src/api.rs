@@ -96,19 +96,6 @@ pub fn router(state: BrainState) -> Router {
 /// see at a glance whether the cluster is converged or under-replicated.
 async fn status(State(s): State<BrainState>) -> Json<Value> {
     let nodes = s.membership.snapshot();
-<<<<<<< HEAD
-    let healthy = nodes
-        .iter()
-        .filter(|n| n.health == NodeHealth::Healthy)
-        .count();
-    let plan = s.plan.lock().unwrap().clone();
-    let rf = plan.replication_factor.max(1);
-    let placed = s.placement.snapshot();
-    let under_replicated = placed
-        .iter()
-        .filter(|a| (a.replicas.len() as u32) < rf)
-        .count();
-=======
     let placement = s.placement.snapshot();
     let plan = s.plan.lock().unwrap().clone();
     let rf = SUPPORTED_REPLICATION_FACTOR as usize;
