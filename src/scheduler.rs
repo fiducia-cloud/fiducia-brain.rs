@@ -86,6 +86,10 @@ impl Scheduler {
             .map(|n| n.node_id.clone())
             .collect();
         let healthy_set: HashSet<NodeId> = healthy_ids.iter().cloned().collect();
+        // Every node membership currently knows about (at any health). Lets us tell
+        // "this replica's node is absent because it hasn't heartbeated to this
+        // leader yet" (hold) apart from "membership knows it is Dead/Draining" (act).
+        let known: HashSet<NodeId> = nodes.iter().map(|n| n.node_id.clone()).collect();
         if healthy_ids.len() < rf as usize {
             tracing::warn!(
                 healthy_nodes = healthy_ids.len(),
@@ -137,6 +141,19 @@ impl Scheduler {
                 Some(a) => a.replicas.clone(),
                 None => observed_replicas.get(&shard).cloned().unwrap_or_default(),
             };
+
+            // Don't shrink placement on incomplete membership. Just after a leader
+            // failover or brain restart the (soft, leader-local) membership is
+            // briefly empty while nodes re-heartbeat, even though the replicated
+            // placement still references them. Holding a shard whose current replicas
+            // aren't all known yet avoids dropping live replicas we simply haven't
+            // heard from — a genuinely failed node stays KNOWN as Dead, so real
+            // failures still reconcile.
+            if !current_replicas.is_empty()
+                && !current_replicas.iter().all(|id| known.contains(id))
+            {
+                continue;
+            }
 
             let slots: Vec<NodeSlot> = healthy_ids
                 .iter()
@@ -330,6 +347,31 @@ mod tests {
             s.membership.snapshot().iter().all(|n| n.node_id != "a"),
             "a drained, fully-evacuated node is removed from membership"
         );
+    }
+
+    #[test]
+    fn holds_placement_when_membership_is_transiently_empty_after_failover() {
+        let s = scheduler(2, 3);
+        // Replicated placement exists (as if replayed from the Raft log onto a
+        // freshly-elected leader)...
+        for shard in 0..2 {
+            s.placement.assign(ShardAssignment {
+                shard_id: shard,
+                replicas: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                preferred_leader: Some("a".to_string()),
+            });
+        }
+        // ...but membership is still empty (the nodes haven't heartbeated to this
+        // leader yet). Reconcile must NOT wipe the placement to empty.
+        s.reconcile();
+        for shard in 0..2 {
+            let asg = s.placement.get(shard).expect("placement held");
+            assert_eq!(
+                asg.replicas.len(),
+                3,
+                "shard {shard} placement held across the membership gap, not wiped"
+            );
+        }
     }
 
     #[test]
