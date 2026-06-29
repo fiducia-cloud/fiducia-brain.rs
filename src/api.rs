@@ -55,6 +55,9 @@ pub struct BrainState {
 /// the leader). Keeps the data-plane sidecar dumb: it heartbeats any member and
 /// the brain routes internally.
 async fn forwarded(req: reqwest::RequestBuilder) -> Json<Value> {
+    // The leader's /v1 enforces the trusted-hop secret when configured, so a
+    // follower forwarding a heartbeat/scale/drain must present it too.
+    let req = crate::internal_auth::attach(req);
     match req.send().await {
         Ok(resp) => Json(
             resp.json::<Value>()
