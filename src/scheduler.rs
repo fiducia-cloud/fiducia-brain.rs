@@ -453,7 +453,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn drained_and_evacuated_node_is_forgotten_on_reconcile() {
         let s = scheduler(2, 2);
         for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner")] {
