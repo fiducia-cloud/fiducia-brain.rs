@@ -222,4 +222,34 @@ mod tests {
             Some("b")
         );
     }
+
+    #[test]
+    fn even_load_keeps_the_observed_leader_instead_of_churning() {
+        // No policy and all candidates equally loaded: the currently-observed
+        // leader ("c") must be kept rather than defaulting to the lexically-first
+        // node ("a"), so a brain restart doesn't needlessly transfer leadership.
+        let replicas = ids(&["a", "b", "c"]);
+        let healthy = set(&["a", "b", "c"]);
+        let slots = vec![
+            leader_slot("a", "gcp", "us", 0),
+            leader_slot("b", "aws", "us", 0),
+            leader_slot("c", "hetzner", "eu", 0),
+        ];
+
+        assert_eq!(
+            preferred_leader_for_policy(None, &replicas, &healthy, &slots, Some(&id("c"))).as_deref(),
+            Some("c")
+        );
+        // But a strictly lighter node still wins over the observed leader.
+        let imbalanced = vec![
+            leader_slot("a", "gcp", "us", 0),
+            leader_slot("b", "aws", "us", 2),
+            leader_slot("c", "hetzner", "eu", 2),
+        ];
+        assert_eq!(
+            preferred_leader_for_policy(None, &replicas, &healthy, &imbalanced, Some(&id("c")))
+                .as_deref(),
+            Some("a")
+        );
+    }
 }
