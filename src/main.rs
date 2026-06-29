@@ -30,6 +30,7 @@ mod raft_driver;
 mod raft_store;
 mod scheduler;
 
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
