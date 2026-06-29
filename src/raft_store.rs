@@ -26,6 +26,11 @@ struct Meta {
     current_term: u64,
     voted_for: Option<String>,
     commit_index: u64,
+    /// Snapshot base (0 until the log has been compacted at least once).
+    #[serde(default)]
+    base_index: u64,
+    #[serde(default)]
+    base_term: u64,
 }
 
 /// A brain member's durable Raft home under `<dir>/`: a `meta` file and a `log`.
@@ -33,6 +38,7 @@ pub struct RaftStore {
     dir: PathBuf,
     meta_path: PathBuf,
     log_path: PathBuf,
+    snapshot_path: PathBuf,
 }
 
 impl RaftStore {
@@ -45,10 +51,17 @@ impl RaftStore {
         fs::create_dir_all(&dir)?;
         let meta_path = dir.join("meta");
         let log_path = dir.join("log");
+        let snapshot_path = dir.join("snapshot");
 
         let meta: Meta = match fs::read(&meta_path) {
             Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes).map_err(invalid)?,
             _ => Meta::default(),
+        };
+
+        // The state-machine snapshot, present once the log has been compacted.
+        let snapshot = match fs::read(&snapshot_path) {
+            Ok(bytes) if !bytes.is_empty() => Some(bytes),
+            _ => None,
         };
 
         // Parse every complete JSON line; stop at the first that fails — that's a
@@ -71,6 +84,7 @@ impl RaftStore {
             dir,
             meta_path,
             log_path,
+            snapshot_path,
         };
         // Canonicalize on disk so the next write starts from clean bytes.
         store.write_log(&log)?;
@@ -80,6 +94,9 @@ impl RaftStore {
             voted_for: meta.voted_for,
             commit_index: meta.commit_index,
             log,
+            base_index: meta.base_index,
+            base_term: meta.base_term,
+            snapshot,
         };
         Ok((store, restored))
     }
@@ -87,11 +104,18 @@ impl RaftStore {
     /// Durably save hard state + log. The log is written **first**, then meta, so
     /// `commit_index` can never reference entries that aren't yet on disk.
     pub fn save(&self, p: &Persisted) -> io::Result<()> {
+        // Snapshot first, then log, then meta — so the `base_index`/`commit_index`
+        // recorded in meta can never reference a snapshot or entries not yet on disk.
+        if let Some(snapshot) = &p.snapshot {
+            atomic_write(&self.snapshot_path, snapshot, &self.dir)?;
+        }
         self.write_log(&p.log)?;
         self.write_meta(&Meta {
             current_term: p.current_term,
             voted_for: p.voted_for.clone(),
             commit_index: p.commit_index,
+            base_index: p.base_index,
+            base_term: p.base_term,
         })
     }
 
@@ -175,6 +199,7 @@ mod tests {
                     voted_for: Some("brain-b".to_string()),
                     commit_index: 2,
                     log: vec![entry(1, 7), entry(2, 7)],
+                    ..Default::default()
                 })
                 .unwrap();
         }
@@ -197,6 +222,7 @@ mod tests {
                     voted_for: None,
                     commit_index: 1,
                     log: vec![entry(1, 1)],
+                    ..Default::default()
                 })
                 .unwrap();
         }
