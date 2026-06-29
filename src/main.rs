@@ -15,6 +15,7 @@
 mod api;
 mod cluster;
 mod config;
+mod internal_auth;
 mod leadership;
 mod membership;
 mod model;
