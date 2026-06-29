@@ -115,16 +115,18 @@ impl Scheduler {
             }
         }
 
-<<<<<<< HEAD
-        // Observed hosting per shard, from heartbeated `hosted_shards` /
-        // `leading_shards`. `observed_replicas` lets a freshly (re)started brain —
-        // whose in-memory placement map is empty — ADOPT the data plane's actual
-        // layout as its starting point, instead of recomputing a fresh placement
-        // and ordering a wave of needless data movement on every brain restart.
-=======
+        // Keep only as many healthy nodes active as the scale plan wants; the
+        // loaded ones stay, light nodes evacuate as assignments move off them.
         let healthy_ids = active_nodes_for_target(all_healthy_ids, &load, target_nodes);
         let healthy_set: HashSet<NodeId> = healthy_ids.iter().cloned().collect();
         load.retain(|id, _| healthy_set.contains(id));
+        if healthy_ids.len() < rf as usize {
+            tracing::warn!(
+                healthy_nodes = healthy_ids.len(),
+                rf,
+                "scheduler: fewer healthy nodes than replication factor — shards will be under-replicated"
+            );
+        }
 
         let mut leader_load: HashMap<NodeId, u32> =
             healthy_ids.iter().map(|id| (id.clone(), 0)).collect();
@@ -136,8 +138,11 @@ impl Scheduler {
             }
         }
 
-        // Observed leader per shard, from heartbeated `leading_shards`.
->>>>>>> origin/main
+        // Observed hosting/leading per shard, from heartbeated `hosted_shards` /
+        // `leading_shards`. `observed_replicas` lets a freshly (re)started brain —
+        // whose in-memory placement map is empty — ADOPT the data plane's actual
+        // layout as its starting point, instead of recomputing a fresh placement
+        // and ordering a wave of needless data movement on every brain restart.
         let mut observed_leader: HashMap<ShardId, NodeId> = HashMap::new();
         let mut observed_replicas: HashMap<ShardId, Vec<NodeId>> = HashMap::new();
         for n in &nodes {
