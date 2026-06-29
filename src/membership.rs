@@ -434,6 +434,7 @@ mod tests {
                 failure_domain: String::new(),
                 hosted_shards: vec![],
                 leading_shards: vec![],
+                seq: 0,
             },
         );
 
