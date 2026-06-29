@@ -97,21 +97,10 @@ impl Scheduler {
             .filter(|n| n.health == NodeHealth::Healthy)
             .map(|n| n.node_id.clone())
             .collect();
-<<<<<<< HEAD
-        let healthy_set: HashSet<NodeId> = healthy_ids.iter().cloned().collect();
         // Every node membership currently knows about (at any health). Lets us tell
         // "this replica's node is absent because it hasn't heartbeated to this
         // leader yet" (hold) apart from "membership knows it is Dead/Draining" (act).
         let known: HashSet<NodeId> = nodes.iter().map(|n| n.node_id.clone()).collect();
-        if healthy_ids.len() < rf as usize {
-            tracing::warn!(
-                healthy_nodes = healthy_ids.len(),
-                rf,
-                "scheduler: fewer healthy nodes than replication factor — shards will be under-replicated"
-            );
-        }
-=======
->>>>>>> origin/main
 
         // Current per-node replica load (across the existing placement) so fills
         // pick the least-loaded node and spread evens out as we go.
