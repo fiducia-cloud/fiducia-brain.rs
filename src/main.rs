@@ -38,7 +38,7 @@ use std::sync::Mutex;
 
 use std::time::Duration;
 
-use axum::{routing::get, Json, Router};
+use axum::{middleware, routing::get, Json, Router};
 use serde_json::{json, Value};
 use tower_http::{
     catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
