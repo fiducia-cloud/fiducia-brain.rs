@@ -202,7 +202,7 @@ mod tests {
         ];
 
         assert_eq!(
-            preferred_leader_for_policy(Some(&policy), &replicas, &healthy, &slots).as_deref(),
+            preferred_leader_for_policy(Some(&policy), &replicas, &healthy, &slots, None).as_deref(),
             Some("aws-b")
         );
     }
