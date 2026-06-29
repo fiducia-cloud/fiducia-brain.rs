@@ -493,6 +493,5 @@ mod tests {
     fn detector_config_keeps_dead_after_suspect() {
         assert_eq!(dead_after_ms_after(6_000, 1_000), 6_001);
         assert_eq!(dead_after_ms_after(6_000, 30_000), 30_000);
->>>>>>> origin/main
     }
 }
