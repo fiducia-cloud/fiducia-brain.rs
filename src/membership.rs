@@ -418,7 +418,9 @@ mod tests {
             vec![1],
             "latest unsequenced heartbeat wins"
         );
-=======
+    }
+
+    #[test]
     fn heartbeat_derives_failure_domain_from_cloud_and_region() {
         let m = Membership::new(MembershipConfig::default());
         m.heartbeat(
