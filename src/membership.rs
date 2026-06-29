@@ -358,7 +358,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn a_stale_or_duplicate_heartbeat_does_not_overwrite_newer_state() {
         let m = Membership::new(MembershipConfig::default());
         // seq 5: node leads shards [0, 1].
