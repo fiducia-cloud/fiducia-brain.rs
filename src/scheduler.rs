@@ -590,7 +590,6 @@ mod tests {
             .expect("preferred leader exists");
         assert_eq!(preferred_node.region, "us-east-1");
         assert_eq!(assignment.preferred_region.as_deref(), Some("us-east-1"));
->>>>>>> origin/main
     }
 
     #[test]
