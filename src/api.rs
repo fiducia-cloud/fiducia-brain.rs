@@ -267,13 +267,9 @@ async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Jso
 /// `generation` lets pollers skip re-diffing the map when nothing changed.
 async fn placement(State(s): State<BrainState>) -> Json<Value> {
     Json(json!({
-<<<<<<< HEAD
         "generation": s.placement.generation(),
         "shards": s.placement.snapshot(),
-=======
-        "shards": s.placement.snapshot(),
         "policies": s.placement.policies_snapshot(),
->>>>>>> origin/main
     }))
 }
 
