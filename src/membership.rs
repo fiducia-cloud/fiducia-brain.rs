@@ -69,12 +69,8 @@ impl Membership {
     /// store its reported address, failure domain, and shard set (registering it
     /// if new). A `Draining` node that keeps heartbeating stays `Draining` — the
     /// operator's intent to remove it isn't undone by liveness.
-<<<<<<< HEAD
     pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) -> NodeHealth {
-=======
-    pub fn heartbeat(&self, node_id: &NodeId, now_ms: u64, report: HeartbeatReport) {
         let normalized_domain = normalized_failure_domain(&report);
->>>>>>> origin/main
         let mut nodes = self.nodes.lock().unwrap();
         // Reject a reordered or duplicated heartbeat: if the sender stamps a
         // monotonic `seq` and this one is not strictly newer than the highest we
