@@ -5,16 +5,11 @@
 //! toward it; the [`crate::scheduler`] rewrites it as nodes join, fail, or
 //! rebalance.
 //!
-<<<<<<< HEAD
 //! The assignment logic itself lives in [`crate::scheduler`] (it reconciles
 //! observed membership toward the desired [`crate::model::ScalePlan`]); this type
-//! is just the resulting map. It is authoritative in-memory today. Making it
-//! survive losing a brain node — replicating it through the brain's own Raft
-//! group — is the remaining HA work (see `assign`).
-=======
-//! In this process the table is in-memory; production HA persists/replicates the
-//! same assignments through the brain control-plane store.
->>>>>>> origin/main
+//! is just the resulting map. It is authoritative in-memory, and its writes are
+//! replicated for HA through the brain's own control-plane store (the brain Raft
+//! group) so the map survives losing a brain node.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
