@@ -160,24 +160,10 @@ async fn status(State(s): State<BrainState>) -> Json<Value> {
         && leaderless_shards == 0
         && shards_with_unhealthy_replicas == 0;
 
->>>>>>> origin/main
     Json(json!({
         "service": "fiducia-brain",
         "version": env!("CARGO_PKG_VERSION"),
         "cluster_id": s.config.cluster_id,
-<<<<<<< HEAD
-        "shard_count": s.config.shard_count,
-        "replication_factor": rf,
-        "nodes": nodes.len(),
-        "healthy_nodes": healthy,
-        "desired_nodes": plan.target_nodes,
-        "placed_shards": placed.len(),
-        "under_replicated_shards": under_replicated,
-        "placement_generation": s.placement.generation(),
-        // Brain's own control plane: which member is driving reconciliation.
-        "is_leader": s.control_plane.is_leader(),
-        "leader": s.control_plane.leader_addr(),
-=======
         "local_cluster": s.config.local_cluster,
         "nodes": s.membership.snapshot().len(),
         "shard_count": s.config.shard_count,
