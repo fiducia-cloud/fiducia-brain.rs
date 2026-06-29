@@ -188,34 +188,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default(),
     };
 
-    let mut app = Router::new()
-        .route("/healthz", get(health))
-        .route("/readyz", get(health))
-        .nest("/v1", api::router(state));
-    // Peer-facing Raft RPC endpoints — only when replication is enabled.
-    if let Some(rcp) = raft {
-        app = app.merge(raft_driver::raft_router(rcp));
+    // Reusable hardening stack (outermost last): catch handler panics → 500,
+    // bound request time, and cap body size.
+    fn harden(router: Router) -> Router {
+        router
+            .layer(TraceLayer::new_for_http())
+            .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+            .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+            .layer(CatchPanicLayer::new())
     }
-    let app = app
-        // Hardening stack (outermost last): catch handler panics → 500, bound
-        // request time, and cap body size.
-        .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // Control plane (:PORT, 8095): health + /v1 — the sidecar heartbeat, the LB's
+    // placement/membership reads, and admin. A NetworkPolicy locks this to
+    // in-namespace (see fiducia-infra).
+    let control_app = harden(
+        Router::new()
+            .route("/healthz", get(health))
+            .route("/readyz", get(health))
+            .nest("/v1", api::router(state)),
+    );
 
     let shape = plan.lock().unwrap().clone();
-    tracing::info!(
-        "{SERVICE} listening on http://{addr} (cluster={}, shards={}, target_nodes={}, rf={})",
-        cluster.cluster_id,
-        cluster.shard_count,
-        shape.target_nodes,
-        shape.replication_factor
-    );
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let control_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let control_listener = tokio::net::TcpListener::bind(control_addr).await?;
+
+    match raft {
+        // Replicated: serve peer-facing Raft RPC on a SEPARATE port (the declared
+        // brain_endpoint / FIDUCIA_BRAIN_PEERS port, default 9095), reachable
+        // cross-cluster, while the control plane stays in-namespace. /raft is
+        // additionally bearer-authenticated by FIDUCIA_BRAIN_RAFT_SECRET.
+        // Previously /raft was merged onto :8095, so cross-cluster RPCs to :9095
+        // hit nothing.
+        Some(rcp) => {
+            let peer_port: u16 = std::env::var("FIDUCIA_BRAIN_PEER_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(9095);
+            let peer_app = harden(
+                Router::new()
+                    .route("/healthz", get(health))
+                    .merge(raft_driver::raft_router(rcp)),
+            );
+            let peer_addr = SocketAddr::from(([0, 0, 0, 0], peer_port));
+            let peer_listener = tokio::net::TcpListener::bind(peer_addr).await?;
+            tracing::info!(
+                "{SERVICE} control plane on http://{control_addr} (/v1), brain-Raft peer plane on \
+                 http://{peer_addr} (/raft) (cluster={}, shards={}, target_nodes={}, rf={})",
+                cluster.cluster_id,
+                cluster.shard_count,
+                shape.target_nodes,
+                shape.replication_factor
+            );
+            tokio::try_join!(
+                axum::serve(control_listener, control_app).into_future(),
+                axum::serve(peer_listener, peer_app).into_future(),
+            )?;
+        }
+        // Single-member (no peers): no Raft router, one listener — unchanged.
+        None => {
+            tracing::info!(
+                "{SERVICE} listening on http://{control_addr} (cluster={}, shards={}, target_nodes={}, rf={})",
+                cluster.cluster_id,
+                cluster.shard_count,
+                shape.target_nodes,
+                shape.replication_factor
+            );
+            axum::serve(control_listener, control_app).await?;
+        }
+    }
     Ok(())
 }
 
