@@ -50,6 +50,13 @@ pub struct Persisted {
     pub voted_for: Option<NodeId>,
     pub commit_index: u64,
     pub log: Vec<LogEntry>,
+    /// Snapshot base: everything at or before `base_index` (term `base_term`) is
+    /// compacted out of `log` and folded into `snapshot` (the serialized state
+    /// machine at that point). `0` / `None` ⇒ nothing compacted yet (the log
+    /// still starts at index 1, exactly as before compaction existed).
+    pub base_index: u64,
+    pub base_term: u64,
+    pub snapshot: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,12 +111,35 @@ pub struct AppendEntriesResp {
     pub match_index: u64,
 }
 
+/// Sent by a leader to a follower that needs an entry the leader has already
+/// compacted away: it carries the serialized state machine at `last_included_*`
+/// so the follower can jump straight to that point instead of replaying the log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotReq {
+    pub term: u64,
+    pub leader_id: NodeId,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    /// The serialized state machine at `last_included_index` (opaque to Raft).
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotResp {
+    pub term: u64,
+    pub success: bool,
+    /// The index the follower now has durably (its new `match_index`).
+    pub last_included_index: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RaftMessage {
     RequestVote(RequestVoteReq),
     RequestVoteResp(RequestVoteResp),
     AppendEntries(AppendEntriesReq),
     AppendEntriesResp(AppendEntriesResp),
+    InstallSnapshot(InstallSnapshotReq),
+    InstallSnapshotResp(InstallSnapshotResp),
 }
 
 /// An outbound message and its recipient (the sender is always `self.id`).
@@ -145,6 +175,12 @@ impl Default for RaftConfig {
 pub struct Ready {
     /// If set, persist this **before** sending `messages` or applying `committed`.
     pub persist: Option<Persisted>,
+    /// If set (after receiving an InstallSnapshot), the driver must **reset** its
+    /// state machine to these snapshot bytes before applying `committed`.
+    pub restore: Option<Vec<u8>>,
+    /// The engine's `last_applied` after this batch — the index the state machine
+    /// now reflects. The driver compacts no further than this (a safe snapshot point).
+    pub applied_upto: u64,
     /// Messages to send to peers (after persisting).
     pub messages: Vec<Addressed>,
     /// Newly-committed commands to apply to the state machine (after persisting).
@@ -161,12 +197,21 @@ pub struct Raft {
     current_term: u64,
     voted_for: Option<NodeId>,
     log: Vec<LogEntry>,
+    // Snapshot base: the log's first entry is at index `base_index + 1`; entries at
+    // or before `base_index` are compacted into `snapshot` (the serialized state
+    // machine at `base_index`, term `base_term`). All zero / None ⇒ no compaction.
+    base_index: u64,
+    base_term: u64,
+    snapshot: Option<Vec<u8>>,
 
     // Volatile.
     role: Role,
     commit_index: u64,
     last_applied: u64,
     leader_id: Option<NodeId>,
+    // Set when an InstallSnapshot replaced our state; `ready()` surfaces the bytes
+    // once so the driver resets its state machine before applying newer entries.
+    pending_restore: bool,
 
     // Candidate / pre-candidate vote tally (includes self).
     votes: HashSet<NodeId>,
@@ -204,10 +249,16 @@ impl Raft {
             current_term: restored.current_term,
             voted_for: restored.voted_for,
             log: restored.log,
+            base_index: restored.base_index,
+            base_term: restored.base_term,
+            snapshot: restored.snapshot,
             role: Role::Follower,
-            commit_index: restored.commit_index,
-            last_applied: 0, // volatile: the state machine is rebuilt by replay
+            // The snapshot already represents the state machine up to base_index, so
+            // commit/apply resume from there and compacted entries are never re-run.
+            commit_index: restored.commit_index.max(restored.base_index),
+            last_applied: restored.base_index,
             leader_id: None,
+            pending_restore: false,
             votes: HashSet::new(),
             next_index: HashMap::new(),
             match_index: HashMap::new(),
@@ -251,6 +302,9 @@ impl Raft {
             voted_for: self.voted_for.clone(),
             commit_index: self.commit_index,
             log: self.log.clone(),
+            base_index: self.base_index,
+            base_term: self.base_term,
+            snapshot: self.snapshot.clone(),
         }
     }
 
@@ -259,17 +313,27 @@ impl Raft {
     }
 
     fn last_index(&self) -> u64 {
-        self.log.last().map(|e| e.index).unwrap_or(0)
+        self.log.last().map(|e| e.index).unwrap_or(self.base_index)
     }
     fn last_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        self.log.last().map(|e| e.term).unwrap_or(self.base_term)
     }
-    /// Term of the entry at 1-based `index` (0 for index 0 or beyond the log).
-    fn term_at(&self, index: u64) -> u64 {
-        if index == 0 || index > self.last_index() {
-            0
+    /// Slab position of 1-based log `index`, or `None` if it is compacted
+    /// (≤ `base_index`) or beyond the end of the log.
+    fn log_slot(&self, index: u64) -> Option<usize> {
+        if index <= self.base_index || index > self.last_index() {
+            None
         } else {
-            self.log[(index - 1) as usize].term
+            Some((index - self.base_index - 1) as usize)
+        }
+    }
+    /// Term of the entry at 1-based `index`: `base_term` at the snapshot boundary,
+    /// the entry's term within the live log, else 0 (compacted or beyond the log).
+    fn term_at(&self, index: u64) -> u64 {
+        if index == self.base_index {
+            self.base_term
+        } else {
+            self.log_slot(index).map(|i| self.log[i].term).unwrap_or(0)
         }
     }
 
@@ -415,6 +479,8 @@ impl Raft {
             RaftMessage::RequestVoteResp(resp) => self.handle_vote_resp(from, resp),
             RaftMessage::AppendEntries(req) => self.handle_append(from, req),
             RaftMessage::AppendEntriesResp(resp) => self.handle_append_resp(from, resp),
+            RaftMessage::InstallSnapshot(req) => self.handle_install_snapshot(from, req),
+            RaftMessage::InstallSnapshotResp(resp) => self.handle_install_snapshot_resp(from, resp),
         }
     }
 
@@ -561,12 +627,87 @@ impl Raft {
         }
     }
 
+    /// A follower receiving the leader's snapshot: jump the state machine straight
+    /// to `last_included_index` instead of replaying log entries the leader no
+    /// longer has. Keeps any log suffix consistent with the snapshot boundary.
+    fn handle_install_snapshot(&mut self, from: NodeId, req: InstallSnapshotReq) {
+        if req.term < self.current_term {
+            let resp = InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+                last_included_index: 0,
+            };
+            self.send(&from, RaftMessage::InstallSnapshotResp(resp));
+            return;
+        }
+        // Valid leader: adopt its term and recognize it (refreshes the election timer).
+        self.become_follower(req.term, Some(from.clone()));
+
+        // Already at or past this snapshot ⇒ ack without applying (it's stale to us).
+        if req.last_included_index <= self.base_index
+            || req.last_included_index <= self.commit_index
+        {
+            let resp = InstallSnapshotResp {
+                term: self.current_term,
+                success: true,
+                last_included_index: self.commit_index.max(self.base_index),
+            };
+            self.send(&from, RaftMessage::InstallSnapshotResp(resp));
+            return;
+        }
+
+        // Install it. Keep any log suffix consistent with the snapshot boundary
+        // (same term at last_included_index); otherwise discard the whole log.
+        if self.term_at(req.last_included_index) == req.last_included_term
+            && req.last_included_index <= self.last_index()
+        {
+            let keep_from = (req.last_included_index - self.base_index) as usize;
+            self.log = self.log.split_off(keep_from);
+        } else {
+            self.log.clear();
+        }
+        self.base_index = req.last_included_index;
+        self.base_term = req.last_included_term;
+        self.snapshot = Some(req.data);
+        self.commit_index = self.commit_index.max(self.base_index);
+        self.last_applied = self.base_index;
+        self.pending_restore = true;
+        self.dirty = true;
+
+        let resp = InstallSnapshotResp {
+            term: self.current_term,
+            success: true,
+            last_included_index: self.base_index,
+        };
+        self.send(&from, RaftMessage::InstallSnapshotResp(resp));
+    }
+
+    fn handle_install_snapshot_resp(&mut self, from: NodeId, resp: InstallSnapshotResp) {
+        if resp.term > self.current_term {
+            self.become_follower(resp.term, None);
+            return;
+        }
+        if self.role != Role::Leader || resp.term != self.current_term {
+            return;
+        }
+        if resp.success {
+            let matched = resp
+                .last_included_index
+                .max(self.match_index.get(&from).copied().unwrap_or(0));
+            self.match_index.insert(from.clone(), matched);
+            self.next_index.insert(from, matched + 1);
+            if self.maybe_advance_commit() {
+                self.broadcast_append();
+            }
+        }
+    }
+
     /// Drop entries with index ≥ `index`. Never touches committed entries (Raft's
     /// rules guarantee a conflict can only appear above `commit_index`).
     fn truncate_from(&mut self, index: u64) {
         debug_assert!(index > self.commit_index, "would truncate a committed entry");
-        if index >= 1 {
-            self.log.truncate((index - 1) as usize);
+        if let Some(slot) = self.log_slot(index) {
+            self.log.truncate(slot);
             self.dirty = true;
         }
     }
@@ -579,12 +720,17 @@ impl Raft {
 
     fn send_append(&mut self, peer: &NodeId) {
         let next = self.next_index.get(peer).copied().unwrap_or(self.last_index() + 1);
+        // The follower needs an entry we have already compacted away → ship the
+        // snapshot instead of log entries it can no longer receive.
+        if next <= self.base_index {
+            self.send_snapshot(peer);
+            return;
+        }
         let prev_log_index = next - 1;
         let prev_log_term = self.term_at(prev_log_index);
-        let entries = if next <= self.last_index() {
-            self.log[(next - 1) as usize..].to_vec()
-        } else {
-            Vec::new()
+        let entries = match self.log_slot(next) {
+            Some(slot) => self.log[slot..].to_vec(),
+            None => Vec::new(),
         };
         let req = AppendEntriesReq {
             term: self.current_term,
@@ -595,6 +741,18 @@ impl Raft {
             leader_commit: self.commit_index,
         };
         self.send(peer, RaftMessage::AppendEntries(req));
+    }
+
+    /// Ship the current snapshot to a follower that has fallen behind the log base.
+    fn send_snapshot(&mut self, peer: &NodeId) {
+        let req = InstallSnapshotReq {
+            term: self.current_term,
+            leader_id: self.id.clone(),
+            last_included_index: self.base_index,
+            last_included_term: self.base_term,
+            data: self.snapshot.clone().unwrap_or_default(),
+        };
+        self.send(peer, RaftMessage::InstallSnapshot(req));
     }
 
     fn maybe_advance_commit(&mut self) -> bool {
@@ -646,6 +804,41 @@ impl Raft {
         Ok(index)
     }
 
+    // ── compaction ─────────────────────────────────────────────────────────────
+
+    /// Number of live (un-compacted) log entries — the driver's compaction trigger.
+    pub fn log_len(&self) -> usize {
+        self.log.len()
+    }
+
+    /// The snapshot base index (entries at or before this are compacted out).
+    pub fn base_index(&self) -> u64 {
+        self.base_index
+    }
+
+    /// Compact the log up to `index`: drop every entry at or before it and fold them
+    /// into `snapshot` (the caller's serialized state machine *as of* `index`).
+    /// Bounds the log and the WAL; a follower that later needs a compacted entry is
+    /// caught up via [`InstallSnapshotReq`]. No-op if `index` is not newer than the
+    /// current base or would discard an uncommitted entry (only committed state is
+    /// safe to fold into a snapshot).
+    pub fn compact(&mut self, index: u64, snapshot: Vec<u8>) {
+        if index <= self.base_index || index > self.commit_index {
+            return;
+        }
+        let term = self.term_at(index);
+        let keep_from = (index - self.base_index) as usize;
+        self.log = if keep_from <= self.log.len() {
+            self.log.split_off(keep_from)
+        } else {
+            Vec::new()
+        };
+        self.base_index = index;
+        self.base_term = term;
+        self.snapshot = Some(snapshot);
+        self.dirty = true;
+    }
+
     // ── outbound ─────────────────────────────────────────────────────────────
 
     /// Drain side effects. The driver must persist `ready.persist` (if any)
@@ -654,24 +847,31 @@ impl Raft {
         let messages = std::mem::take(&mut self.out);
         let persist = if self.dirty {
             self.dirty = false;
-            Some(Persisted {
-                current_term: self.current_term,
-                voted_for: self.voted_for.clone(),
-                commit_index: self.commit_index,
-                log: self.log.clone(),
-            })
+            Some(self.persisted_snapshot())
+        } else {
+            None
+        };
+        // A freshly installed snapshot must reset the driver's state machine before
+        // any newer committed entries are applied on top of it.
+        let restore = if self.pending_restore {
+            self.pending_restore = false;
+            self.snapshot.clone()
         } else {
             None
         };
         let mut committed = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            if let Some(cmd) = &self.log[(self.last_applied - 1) as usize].command {
-                committed.push(cmd.clone());
+            if let Some(slot) = self.log_slot(self.last_applied) {
+                if let Some(cmd) = &self.log[slot].command {
+                    committed.push(cmd.clone());
+                }
             }
         }
         Ready {
             persist,
+            restore,
+            applied_upto: self.last_applied,
             messages,
             committed,
         }
@@ -705,6 +905,8 @@ mod tests {
         nodes: HashMap<NodeId, Raft>,
         durable: HashMap<NodeId, Persisted>,
         applied: HashMap<NodeId, Vec<Command>>,
+        /// Last snapshot bytes each member restored via InstallSnapshot.
+        snapshots: HashMap<NodeId, Vec<u8>>,
         down: HashSet<NodeId>,
     }
 
@@ -725,6 +927,7 @@ mod tests {
                 nodes,
                 durable: HashMap::new(),
                 applied,
+                snapshots: HashMap::new(),
                 down: HashSet::new(),
             }
         }
@@ -747,6 +950,11 @@ mod tests {
                     let ready = self.nodes.get_mut(&id).unwrap().ready();
                     if let Some(p) = ready.persist {
                         self.durable.insert(id.clone(), p); // persist BEFORE send/apply
+                    }
+                    if let Some(data) = ready.restore {
+                        // An installed snapshot resets the state machine: in the
+                        // harness, record the bytes (a real driver would reload them).
+                        self.snapshots.insert(id.clone(), data);
                     }
                     self.applied.get_mut(&id).unwrap().extend(ready.committed);
                     for m in ready.messages {
@@ -914,5 +1122,71 @@ mod tests {
         assert!(c.applied[&leader]
             .iter()
             .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 5)));
+    }
+
+    #[test]
+    fn compaction_drops_the_log_prefix_but_keeps_serving() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+        for n in 1..=4 {
+            c.node(&leader).propose(plan(n)).unwrap();
+        }
+        c.pump();
+        let commit = c.node(&leader).commit_index();
+
+        c.node(&leader).compact(commit, b"snap".to_vec());
+        assert_eq!(c.node(&leader).base_index(), commit);
+        assert_eq!(c.node(&leader).log_len(), 0, "entries up to the snapshot are gone");
+
+        // The leader keeps committing on top of a compacted log.
+        let idx = c.node(&leader).propose(plan(99)).unwrap();
+        assert!(idx > commit, "new entries continue past the snapshot base");
+        c.pump();
+        for id in c.ids() {
+            assert!(c.applied[&id]
+                .iter()
+                .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 99)));
+        }
+    }
+
+    #[test]
+    fn a_lagging_follower_is_caught_up_by_install_snapshot() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+
+        // Commit a batch while one follower is partitioned away, so it misses them.
+        let lagger = c.ids().into_iter().find(|i| *i != leader).unwrap();
+        c.down.insert(lagger.clone());
+        for n in 1..=6 {
+            c.node(&leader).propose(plan(n)).unwrap();
+        }
+        c.pump();
+        let commit = c.node(&leader).commit_index();
+        assert!(commit >= 6);
+
+        // Leader compacts past everything the lagger is missing.
+        let snap = b"state@compact".to_vec();
+        c.node(&leader).compact(commit, snap.clone());
+        assert_eq!(c.node(&leader).log_len(), 0);
+
+        // Bring the lagger back. It needs entries the leader no longer has, so the
+        // leader must catch it up with an InstallSnapshot, not AppendEntries.
+        c.down.remove(&lagger);
+        for _ in 0..6 {
+            c.tick_all();
+            c.pump();
+        }
+
+        assert_eq!(
+            c.node(&lagger).base_index(),
+            commit,
+            "follower jumped to the snapshot base"
+        );
+        assert_eq!(
+            c.snapshots.get(&lagger),
+            Some(&snap),
+            "follower restored the snapshot bytes the leader sent"
+        );
+        assert!(c.node(&lagger).commit_index() >= commit);
     }
 }
