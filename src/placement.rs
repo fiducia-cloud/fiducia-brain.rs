@@ -69,4 +69,16 @@ impl Placement {
             .insert(assignment.shard_id, assignment);
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Replace the whole placement map at once — used when a Raft snapshot is
+    /// installed (the snapshot is authoritative, so any stale local entry is
+    /// dropped). Bumps `generation` so pollers notice the change.
+    pub fn restore_from(&self, assignments: Vec<ShardAssignment>) {
+        let mut map = self.assignments.lock().unwrap();
+        map.clear();
+        for assignment in assignments {
+            map.insert(assignment.shard_id, assignment);
+        }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
 }

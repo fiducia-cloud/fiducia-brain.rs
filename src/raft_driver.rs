@@ -19,16 +19,19 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::http::{HeaderMap, StatusCode};
 use axum::{extract::State, routing::post, Json, Router};
 use tokio::sync::mpsc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::cluster::{apply_command, Command, ControlPlane};
 use crate::membership::Membership;
-use crate::model::ScalePlan;
+use crate::model::{ScalePlan, ShardAssignment};
 use crate::placement::Placement;
 use crate::raft::{
-    Addressed, AppendEntriesReq, AppendEntriesResp, NodeId, Persisted, Raft, RaftConfig,
-    RaftMessage, Ready, RequestVoteReq, RequestVoteResp,
+    Addressed, AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, NodeId,
+    Persisted, Raft, RaftConfig, RaftMessage, Ready, RequestVoteReq, RequestVoteResp,
 };
 use crate::raft_store::RaftStore;
 
@@ -36,11 +39,20 @@ use crate::raft_store::RaftStore;
 /// heartbeat and a ~500–900ms election timeout.
 const TICK_MS: u64 = 50;
 
+/// Compact the Raft log once it grows past this many live entries (folding the
+/// prefix into a state-machine snapshot). The brain's write rate is low, so this
+/// is rarely reached; it just bounds the log + WAL + restart-replay over a long life.
+const COMPACT_LOG_THRESHOLD: usize = 256;
+
 /// Peer transport for Raft RPCs. `None` from `send` means "couldn't reach the
 /// peer this time" — Raft tolerates dropped messages and retries on the next tick.
 pub enum Transport {
-    /// Production: JSON-over-HTTP to a peer's `/raft/{vote,append}` endpoints.
-    Http(reqwest::Client),
+    /// Production: JSON-over-HTTP to a peer's `/raft/{vote,append,snapshot}`
+    /// endpoints, bearer-authenticated with the shared secret when one is set.
+    Http {
+        client: reqwest::Client,
+        secret: Option<String>,
+    },
     /// Tests / degenerate single-member: never sends (there are no peers).
     #[cfg(test)]
     Disabled,
@@ -48,33 +60,49 @@ pub enum Transport {
 
 impl Transport {
     pub fn http() -> Self {
-        Transport::Http(
-            reqwest::Client::builder()
+        Transport::Http {
+            client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
                 .unwrap_or_default(),
-        )
+            secret: raft_secret_from_env(),
+        }
     }
 
     async fn send(&self, to: &NodeId, msg: RaftMessage) -> Option<RaftMessage> {
         match self {
-            Transport::Http(client) => http_send(client, to, msg).await,
+            Transport::Http { client, secret } => http_send(client, secret, to, msg).await,
             #[cfg(test)]
             Transport::Disabled => None,
         }
     }
 }
 
+/// The shared secret peer brains authenticate Raft RPCs with, from
+/// `FIDUCIA_BRAIN_RAFT_SECRET`. `None` (unset/empty) ⇒ auth disabled (dev / single box).
+fn raft_secret_from_env() -> Option<String> {
+    std::env::var("FIDUCIA_BRAIN_RAFT_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// Send one Raft *request* to a peer and return its *response* message. Responses
 /// (`*Resp`) are never sent proactively — they ride back as the HTTP reply to the
 /// originating request — so they map to `None` here.
-async fn http_send(client: &reqwest::Client, to: &NodeId, msg: RaftMessage) -> Option<RaftMessage> {
+async fn http_send(
+    client: &reqwest::Client,
+    secret: &Option<String>,
+    to: &NodeId,
+    msg: RaftMessage,
+) -> Option<RaftMessage> {
     let base = to.trim_end_matches('/');
+    let auth = |req: reqwest::RequestBuilder| match secret {
+        Some(s) => req.bearer_auth(s),
+        None => req,
+    };
     match msg {
         RaftMessage::RequestVote(req) => {
-            let resp: RequestVoteResp = client
-                .post(format!("{base}/raft/vote"))
-                .json(&req)
+            let resp: RequestVoteResp = auth(client.post(format!("{base}/raft/vote")).json(&req))
                 .send()
                 .await
                 .ok()?
@@ -84,18 +112,30 @@ async fn http_send(client: &reqwest::Client, to: &NodeId, msg: RaftMessage) -> O
             Some(RaftMessage::RequestVoteResp(resp))
         }
         RaftMessage::AppendEntries(req) => {
-            let resp: AppendEntriesResp = client
-                .post(format!("{base}/raft/append"))
-                .json(&req)
-                .send()
-                .await
-                .ok()?
-                .json()
-                .await
-                .ok()?;
+            let resp: AppendEntriesResp =
+                auth(client.post(format!("{base}/raft/append")).json(&req))
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()?;
             Some(RaftMessage::AppendEntriesResp(resp))
         }
-        RaftMessage::RequestVoteResp(_) | RaftMessage::AppendEntriesResp(_) => None,
+        RaftMessage::InstallSnapshot(req) => {
+            let resp: InstallSnapshotResp =
+                auth(client.post(format!("{base}/raft/snapshot")).json(&req))
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()?;
+            Some(RaftMessage::InstallSnapshotResp(resp))
+        }
+        RaftMessage::RequestVoteResp(_)
+        | RaftMessage::AppendEntriesResp(_)
+        | RaftMessage::InstallSnapshotResp(_) => None,
     }
 }
 
@@ -105,12 +145,18 @@ pub struct RaftControlPlane {
     /// Durable WAL. `None` disables persistence (kept for tests / in-memory runs).
     store: Option<RaftStore>,
     transport: Transport,
+    /// Shared secret a peer must present (bearer) on `/raft/*`; `None` ⇒ auth off.
+    raft_secret: Option<String>,
     /// Outbound Raft messages, drained by the spawned outbox task.
     outbox: mpsc::UnboundedSender<Vec<Addressed>>,
     outbox_rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<Addressed>>>>,
     /// Serializes WAL writes so concurrent delivers can't race on the temp file
     /// or persist an older snapshot after a newer one.
     io_lock: Mutex<()>,
+    /// Serializes state-machine mutation (snapshot restore + committed apply) so
+    /// concurrent delivers can't interleave a restore's clear+rebuild with another
+    /// drain's apply and leave the placement map torn.
+    apply_lock: Mutex<()>,
     // State-machine handles the committed log is applied to.
     membership: Arc<Membership>,
     placement: Arc<Placement>,
@@ -136,9 +182,11 @@ impl RaftControlPlane {
             engine: Mutex::new(engine),
             store,
             transport,
+            raft_secret: raft_secret_from_env(),
             outbox,
             outbox_rx: Mutex::new(Some(rx)),
             io_lock: Mutex::new(()),
+            apply_lock: Mutex::new(()),
             membership,
             placement,
             plan,
@@ -207,6 +255,15 @@ impl RaftControlPlane {
                 // then lose a recorded vote or entry — a safety violation). The IO
                 // lock orders the writes, and re-reading current state under it
                 // means a later save never regresses what an earlier one persisted.
+                //
+                // The fsync is synchronous and must finish before this RPC is acked
+                // (a follower must never acknowledge an entry it has not durably
+                // stored), so the latency is fundamental, not a bug. It runs on a
+                // Tokio worker; at the brain's low write rate (3-member group,
+                // ~150ms heartbeats) that is fine, and compaction keeps each write
+                // small by bounding the log. If write rate ever grows, move the
+                // fsync to a dedicated persister thread the async handler awaits via
+                // a oneshot — keeping persist-before-ack without parking a worker.
                 let _io = self.io_lock.lock().unwrap();
                 let snapshot = self.engine.lock().unwrap().persisted_snapshot();
                 if let Err(err) = store.save(&snapshot) {
@@ -217,9 +274,24 @@ impl RaftControlPlane {
             }
         }
 
-        for command in ready.committed {
-            apply_command(&self.membership, &self.placement, &self.plan, command);
+        // Serialize state-machine mutation: a snapshot restore (clear + rebuild)
+        // must not interleave with another concurrent drain's committed apply, or
+        // the placement map is left torn. (Reset to an installed snapshot first,
+        // since an InstallSnapshot jumps us past compacted entries, then apply any
+        // newer committed entries on top.)
+        {
+            let _apply = self.apply_lock.lock().unwrap();
+            if let Some(data) = &ready.restore {
+                restore_state_machine(data, &self.placement, &self.plan);
+            }
+            for command in ready.committed {
+                apply_command(&self.membership, &self.placement, &self.plan, command);
+            }
         }
+
+        // Bound the log: once it grows past the threshold, fold its committed prefix
+        // into a state-machine snapshot and drop those entries.
+        self.maybe_compact(ready.applied_upto);
 
         let mut reply = None;
         let mut others = Vec::new();
@@ -275,6 +347,47 @@ impl RaftControlPlane {
             },
         }
     }
+
+    /// Handle an inbound `InstallSnapshot` and produce the reply (for `/raft/snapshot`).
+    pub fn handle_install_snapshot(&self, req: InstallSnapshotReq) -> InstallSnapshotResp {
+        let from = req.leader_id.clone();
+        match self.step_inbound(from, RaftMessage::InstallSnapshot(req)) {
+            Some(RaftMessage::InstallSnapshotResp(resp)) => resp,
+            _ => InstallSnapshotResp {
+                term: self.engine.lock().unwrap().term(),
+                success: false,
+                last_included_index: 0,
+            },
+        }
+    }
+
+    /// Once the live log passes [`COMPACT_LOG_THRESHOLD`], snapshot the state
+    /// machine as of `applied_upto` and drop the folded-in log prefix, then persist
+    /// the compacted state. All commands are idempotent, so a snapshot that reflects
+    /// a slightly newer index than `applied_upto` is still safe to compact at it.
+    fn maybe_compact(&self, applied_upto: u64) {
+        let should = {
+            let engine = self.engine.lock().unwrap();
+            engine.log_len() >= COMPACT_LOG_THRESHOLD && applied_upto > engine.base_index()
+        };
+        if !should {
+            return;
+        }
+        let data = snapshot_state_machine(&self.placement, &self.plan);
+        {
+            let mut engine = self.engine.lock().unwrap();
+            engine.compact(applied_upto, data);
+        }
+        // Persist the now-compacted log + snapshot immediately (ordered under io_lock,
+        // re-reading current state — same discipline as `drain`).
+        if let Some(store) = &self.store {
+            let _io = self.io_lock.lock().unwrap();
+            let snapshot = self.engine.lock().unwrap().persisted_snapshot();
+            if let Err(err) = store.save(&snapshot) {
+                tracing::error!("raft: failed to persist after compaction: {err}");
+            }
+        }
+    }
 }
 
 impl ControlPlane for RaftControlPlane {
@@ -304,21 +417,79 @@ pub fn raft_router(cp: Arc<RaftControlPlane>) -> Router {
     Router::new()
         .route("/raft/vote", post(vote))
         .route("/raft/append", post(append))
+        .route("/raft/snapshot", post(snapshot))
         .with_state(cp)
 }
 
 async fn vote(
     State(cp): State<Arc<RaftControlPlane>>,
+    headers: HeaderMap,
     Json(req): Json<RequestVoteReq>,
-) -> Json<RequestVoteResp> {
-    Json(cp.handle_request_vote(req))
+) -> Result<Json<RequestVoteResp>, StatusCode> {
+    authorize(&cp, &headers)?;
+    Ok(Json(cp.handle_request_vote(req)))
 }
 
 async fn append(
     State(cp): State<Arc<RaftControlPlane>>,
+    headers: HeaderMap,
     Json(req): Json<AppendEntriesReq>,
-) -> Json<AppendEntriesResp> {
-    Json(cp.handle_append_entries(req))
+) -> Result<Json<AppendEntriesResp>, StatusCode> {
+    authorize(&cp, &headers)?;
+    Ok(Json(cp.handle_append_entries(req)))
+}
+
+async fn snapshot(
+    State(cp): State<Arc<RaftControlPlane>>,
+    headers: HeaderMap,
+    Json(req): Json<InstallSnapshotReq>,
+) -> Result<Json<InstallSnapshotResp>, StatusCode> {
+    authorize(&cp, &headers)?;
+    Ok(Json(cp.handle_install_snapshot(req)))
+}
+
+/// Reject a peer Raft RPC that doesn't present the shared secret (when one is
+/// configured). `Ok(())` when auth is disabled or the bearer token matches.
+fn authorize(cp: &RaftControlPlane, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let Some(secret) = &cp.raft_secret else {
+        return Ok(()); // auth disabled (FIDUCIA_BRAIN_RAFT_SECRET unset)
+    };
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if presented == Some(secret.as_str()) {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// The brain's replicated state machine, serialized for a Raft snapshot: the
+/// placement map plus the scale plan. (Membership is leader-local soft state,
+/// re-derived from heartbeats, so it is deliberately not part of the snapshot.)
+#[derive(Serialize, Deserialize)]
+struct StateSnapshot {
+    shards: Vec<ShardAssignment>,
+    plan: ScalePlan,
+}
+
+fn snapshot_state_machine(placement: &Placement, plan: &Mutex<ScalePlan>) -> Vec<u8> {
+    let snapshot = StateSnapshot {
+        shards: placement.snapshot(),
+        plan: plan.lock().unwrap().clone(),
+    };
+    serde_json::to_vec(&snapshot).unwrap_or_default()
+}
+
+fn restore_state_machine(data: &[u8], placement: &Placement, plan: &Mutex<ScalePlan>) {
+    match serde_json::from_slice::<StateSnapshot>(data) {
+        Ok(snapshot) => {
+            placement.restore_from(snapshot.shards);
+            *plan.lock().unwrap() = snapshot.plan;
+        }
+        Err(err) => tracing::error!("raft: corrupt state snapshot, not restoring: {err}"),
+    }
 }
 
 /// Deterministic per-member seed (FNV-1a of the id) so members don't all use the
@@ -473,5 +644,87 @@ mod tests {
             "committed scale plan rebuilt from the persisted log after restart"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    async fn await_leader(cps: &[Arc<RaftControlPlane>], timeout: Duration) -> Option<usize> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(i) = cps.iter().position(|cp| cp.is_leader()) {
+                return Some(i);
+            }
+            if std::time::Instant::now() > deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The real thing: three drivers on localhost HTTP ports elect a leader and
+    /// replicate a command over `Transport::Http` + `raft_router` (vote/append) —
+    /// exercising the serialize → POST → handler → reply → `deliver` path that the
+    /// in-process engine harness in `raft.rs` does not.
+    #[tokio::test]
+    async fn three_brains_elect_and_replicate_over_http() {
+        // Bind three ephemeral ports first so every member knows all peers' URLs.
+        let mut listeners = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            ids.push(format!("http://{}", l.local_addr().unwrap()));
+            listeners.push(l);
+        }
+
+        let mut cps = Vec::new();
+        let mut plans = Vec::new();
+        for (i, listener) in listeners.into_iter().enumerate() {
+            let peers: Vec<String> = ids
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, id)| id.clone())
+                .collect();
+            let (membership, placement, plan) = handles();
+            let cp = RaftControlPlane::new(
+                ids[i].clone(),
+                peers,
+                cfg(),
+                None, // in-memory: this test exercises the HTTP path, not durability
+                Persisted::default(),
+                Transport::http(),
+                membership,
+                placement,
+                plan.clone(),
+            );
+            cp.spawn();
+            let app = raft_router(cp.clone());
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            cps.push(cp);
+            plans.push(plan);
+        }
+
+        // A leader must emerge from real elections over HTTP.
+        let leader = await_leader(&cps, Duration::from_secs(5))
+            .await
+            .expect("a leader is elected over HTTP");
+
+        // Propose through the leader; it must replicate + apply on all three.
+        assert!(cps[leader].propose(Command::SetScalePlan(ScalePlan {
+            target_nodes: 7,
+            replication_factor: 3,
+        })));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if plans.iter().all(|p| p.lock().unwrap().target_nodes == 7) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scale plan did not replicate to all members over HTTP"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
