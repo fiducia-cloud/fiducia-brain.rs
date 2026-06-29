@@ -26,13 +26,16 @@ pub struct LeaderSlot {
 /// Pick the preferred leader target for a shard.
 ///
 /// Region affinity wins first, provider affinity second, then the least-loaded
-/// leader candidate, then node id for deterministic plans. If no policy exists,
-/// this still balances leaders across healthy replicas.
+/// leader candidate. Ties are broken in favor of the currently-observed leader
+/// (`current`) so a brain restart adopts the data plane's existing leader instead
+/// of needlessly transferring leadership, and finally by node id for deterministic
+/// plans. If no policy exists, this still balances leaders across healthy replicas.
 pub fn preferred_leader_for_policy(
     policy: Option<&PlacementPolicy>,
     replicas: &[NodeId],
     healthy: &HashSet<NodeId>,
     slots: &[LeaderSlot],
+    current: Option<&NodeId>,
 ) -> Option<NodeId> {
     let home_region = policy.and_then(|p| p.home_region.as_deref());
     let preferred_cloud = policy.and_then(|p| p.preferred_cloud_provider.as_deref());
@@ -55,11 +58,15 @@ pub fn preferred_leader_for_policy(
             let b_cloud = preferred_cloud
                 .map(|cloud| cloud.eq_ignore_ascii_case(&b.cloud_provider))
                 .unwrap_or(false);
+            // On an otherwise-even tie, keep whoever is already leading (stability).
+            let a_current = current == Some(&a.node_id);
+            let b_current = current == Some(&b.node_id);
 
             b_region
                 .cmp(&a_region)
                 .then(b_cloud.cmp(&a_cloud))
                 .then(a.leader_load.cmp(&b.leader_load))
+                .then(b_current.cmp(&a_current))
                 .then(a.node_id.cmp(&b.node_id))
         })
         .map(|slot| slot.node_id.clone())
