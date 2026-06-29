@@ -481,6 +481,8 @@ mod tests {
                 shard_id: shard,
                 replicas: vec!["a".to_string(), "b".to_string(), "c".to_string()],
                 preferred_leader: Some("a".to_string()),
+                preferred_region: None,
+                preferred_cloud_provider: None,
             });
         }
         // ...but membership is still empty (the nodes haven't heartbeated to this
