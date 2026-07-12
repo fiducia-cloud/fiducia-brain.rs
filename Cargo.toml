@@ -1,3 +1,4 @@
+# Crate manifest: package metadata and dependencies for the fiducia-brain service.
 [package]
 name = "fiducia-brain"
 version = "0.1.0"

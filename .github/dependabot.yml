@@ -1,3 +1,4 @@
+# Dependabot: weekly dependency-update PRs for cargo and github-actions.
 version: 2
 updates:
   - package-ecosystem: cargo
