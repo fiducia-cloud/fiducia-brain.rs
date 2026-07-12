@@ -1,3 +1,4 @@
+# Build and push the service container image on push to main.
 name: docker
 on:
   push:
