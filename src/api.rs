@@ -617,6 +617,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_policy_posted_to_a_follower_lands_on_the_leader() {
+        // A real leader serving /v1 on an ephemeral port...
+        let leader = leader_state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leader_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(leader.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().nest("/v1", app))
+                .await
+                .unwrap();
+        });
+
+        // ...and a follower that knows the leader's address.
+        let follower = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: false,
+            leader_addr: Some(leader_url),
+        }));
+
+        let resp = set_policy(
+            State(follower.clone()),
+            Json(PlacementPolicyUpdate {
+                namespace: "tenant-a".to_string(),
+                home_region: Some("us-east-1".to_string()),
+                preferred_cloud_provider: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let policies = leader.placement.policies_snapshot();
+        assert_eq!(policies.len(), 1, "policy applied on the leader");
+        assert_eq!(policies[0].namespace, "tenant-a");
+        assert_eq!(policies[0].home_region.as_deref(), Some("us-east-1"));
+        assert!(
+            follower.placement.policies_snapshot().is_empty(),
+            "the follower does not keep a divergent local policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_posted_to_a_follower_without_a_leader_reports_not_leader() {
+        let follower = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: false,
+            leader_addr: None,
+        }));
+        let resp = set_policy(
+            State(follower.clone()),
+            Json(PlacementPolicyUpdate {
+                namespace: "tenant-a".to_string(),
+                home_region: None,
+                preferred_cloud_provider: None,
+            }),
+        )
+        .await;
+        // Mid-election: refuse rather than apply somewhere it will never be read.
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(follower.placement.policies_snapshot().is_empty());
+    }
+
+    #[tokio::test]
     async fn an_available_leader_still_accepts_heartbeats_and_drain() {
         let s = leader_state();
 
