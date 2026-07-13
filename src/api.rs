@@ -269,7 +269,9 @@ async fn heartbeat(
     if !s.control_plane.is_leader() {
         if let Some(leader) = s.control_plane.leader_addr() {
             let url = format!("{}/v1/nodes/{}/heartbeat", leader.trim_end_matches('/'), id);
-            return forwarded(s.http.post(url).json(&report)).await.into_response();
+            return forwarded(s.http.post(url).json(&report))
+                .await
+                .into_response();
         }
     }
     let health = s.membership.heartbeat(&id, now_ms(), report);
@@ -365,7 +367,9 @@ async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>)
     match s.control_plane.leader_addr() {
         Some(leader) => {
             let url = format!("{}/v1/scale", leader.trim_end_matches('/'));
-            forwarded(s.http.post(url).json(&plan)).await.into_response()
+            forwarded(s.http.post(url).json(&plan))
+                .await
+                .into_response()
         }
         None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
             .into_response(),
