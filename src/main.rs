@@ -38,7 +38,7 @@ use std::sync::Mutex;
 
 use std::time::Duration;
 
-use axum::{middleware, routing::get, Json, Router};
+use axum::{http::StatusCode, middleware, routing::get, Json, Router};
 use serde_json::{json, Value};
 use tower_http::{
     catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
@@ -135,6 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None,
         )
     } else {
+        // The replicated peer plane is cross-cluster reachable. It has no
+        // unauthenticated mode: abort before opening state or binding ports.
+        let raft_secret = raft_driver::RaftSecret::from_env()?;
         let id = std::env::var("FIDUCIA_BRAIN_ID")
             .unwrap_or_else(|_| format!("http://localhost:{port}"));
         // Peers must EXCLUDE self. Operators commonly list every member
@@ -157,7 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             RaftConfig::default(),
             Some(store),
             restored,
-            raft_driver::Transport::http(),
+            raft_driver::Transport::http(raft_secret.clone()),
+            raft_secret,
             membership.clone(),
             placement.clone(),
             plan.clone(),
@@ -182,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         membership,
         placement,
         plan: plan.clone(),
-        control_plane,
+        control_plane: control_plane.clone(),
         // Short-timeout client for forwarding follower writes/heartbeats to the leader.
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
@@ -209,10 +213,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `/v1` is cluster-internal and requires the trusted-hop header (attached by
     // the node sidecar, LB, admin, and the brain's own follower→leader forwarding).
     // Health probes stay open for k8s.
+    let ready_cp = control_plane.clone();
     let control_app = harden(
         Router::new()
             .route("/healthz", get(health))
-            .route("/readyz", get(health))
+            .route(
+                "/readyz",
+                get(move || {
+                    let cp = ready_cp.clone();
+                    async move { ready(cp.is_available()).await }
+                }),
+            )
             .nest(
                 "/v1",
                 api::router(state).layer(middleware::from_fn(internal_auth::guard)),
@@ -235,9 +246,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(9095);
+            tracing::info!("brain-Raft peer plane: enforcing FIDUCIA_BRAIN_RAFT_SECRET on /raft");
+            let peer_ready = rcp.clone();
             let peer_app = harden(
                 Router::new()
                     .route("/healthz", get(health))
+                    .route(
+                        "/readyz",
+                        get(move || {
+                            let cp = peer_ready.clone();
+                            async move { ready(cp.is_available()).await }
+                        }),
+                    )
                     .merge(raft_driver::raft_router(rcp)),
             );
             let peer_addr = SocketAddr::from(([0, 0, 0, 0], peer_port));
@@ -272,6 +292,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
+}
+
+async fn ready(available: bool) -> (StatusCode, Json<Value>) {
+    if available {
+        (
+            StatusCode::OK,
+            Json(json!({ "status": "ready", "service": SERVICE })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable", "service": SERVICE })),
+        )
+    }
 }
 
 #[cfg(test)]

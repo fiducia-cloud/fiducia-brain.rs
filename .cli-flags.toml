@@ -73,7 +73,7 @@ help = "Durable Raft data directory."
 
 [flags.peer-port]
 env = "FIDUCIA_BRAIN_PEER_PORT"
-aliases = ["peer-port"]
+aliases = ["peer-port", "brain-peer-port"]
 type = "integer"
 help = "Brain Raft peer listen port."
 

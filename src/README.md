@@ -18,6 +18,9 @@ Key files:
   that scales and heals the cluster toward it.
 - `cluster.rs` — the replication/leadership seam where Raft plugs in.
 - `raft.rs`, `raft_driver.rs`, `raft_store.rs` — the brain's own consensus
-  engine, its async network driver, and crash-safe persistence.
+  engine, its authenticated async network driver, and crash-safe persistence.
+  Replicated startup requires `FIDUCIA_BRAIN_RAFT_SECRET`; runtime durability
+  failures make readiness fail closed, and recovery never truncates a committed
+  WAL entry.
 - `internal_auth.rs` — trusted-hop auth for the control plane.
 - `model.rs` — shared control-plane types.

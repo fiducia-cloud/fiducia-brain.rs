@@ -48,6 +48,11 @@ pub enum Command {
 /// The seam the API and reconciler use instead of mutating state directly. The
 /// real Raft engine and the local single-member engine both implement this.
 pub trait ControlPlane: Send + Sync {
+    /// Whether this member can safely participate in the control plane. A
+    /// replicated member becomes unavailable after a durability failure and
+    /// must not acknowledge or forward further work until it is restarted.
+    fn is_available(&self) -> bool;
+
     /// Is this brain member the current leader? Only the leader runs the
     /// reconcile loop and applies writes; followers stand by / forward.
     fn is_leader(&self) -> bool;
@@ -114,6 +119,10 @@ pub fn apply_command(
 }
 
 impl ControlPlane for LocalControlPlane {
+    fn is_available(&self) -> bool {
+        true
+    }
+
     fn is_leader(&self) -> bool {
         true
     }

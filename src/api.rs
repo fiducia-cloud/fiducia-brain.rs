@@ -194,6 +194,7 @@ async fn status(State(s): State<BrainState>) -> Json<Value> {
             "configured_remote_peers": s.config.brain_peers,
             "configured_members": s.config.brain_peers.len() + 1,
             "ha_configured": s.config.brain_peers.len() + 1 >= rf,
+            "available": s.control_plane.is_available(),
             // Brain's own control plane: which member is driving reconciliation.
             "placement_generation": s.placement.generation(),
             "is_leader": s.control_plane.is_leader(),

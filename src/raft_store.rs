@@ -16,6 +16,8 @@
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +41,8 @@ pub struct RaftStore {
     meta_path: PathBuf,
     log_path: PathBuf,
     snapshot_path: PathBuf,
+    #[cfg(test)]
+    fail_saves: AtomicBool,
 }
 
 impl RaftStore {
@@ -55,29 +59,37 @@ impl RaftStore {
 
         let meta: Meta = match fs::read(&meta_path) {
             Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes).map_err(invalid)?,
-            _ => Meta::default(),
+            Ok(_) => Meta::default(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Meta::default(),
+            Err(err) => return Err(err),
         };
 
         // The state-machine snapshot, present once the log has been compacted.
         let snapshot = match fs::read(&snapshot_path) {
             Ok(bytes) if !bytes.is_empty() => Some(bytes),
-            _ => None,
+            Ok(_) => None,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
         };
 
         // Parse every complete JSON line; stop at the first that fails — that's a
         // record torn by a crash mid-write, and everything after it.
         let mut log: Vec<LogEntry> = Vec::new();
-        if let Ok(file) = File::open(&log_path) {
-            for line in BufReader::new(file).split(b'\n') {
-                let line = line?;
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_slice::<LogEntry>(&line) {
-                    Ok(entry) => log.push(entry),
-                    Err(_) => break,
+        match File::open(&log_path) {
+            Ok(file) => {
+                for line in BufReader::new(file).split(b'\n') {
+                    let line = line?;
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_slice::<LogEntry>(&line) {
+                        Ok(entry) => log.push(entry),
+                        Err(_) => break,
+                    }
                 }
             }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
 
         let store = RaftStore {
@@ -85,7 +97,10 @@ impl RaftStore {
             meta_path,
             log_path,
             snapshot_path,
+            #[cfg(test)]
+            fail_saves: AtomicBool::new(false),
         };
+        validate_recovered(&meta, snapshot.as_deref(), &log)?;
         // Canonicalize on disk so the next write starts from clean bytes.
         store.write_log(&log)?;
 
@@ -104,6 +119,10 @@ impl RaftStore {
     /// Durably save hard state + log. The log is written **first**, then meta, so
     /// `commit_index` can never reference entries that aren't yet on disk.
     pub fn save(&self, p: &Persisted) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_saves.load(Ordering::SeqCst) {
+            return Err(io::Error::other("injected RaftStore save failure"));
+        }
         // Snapshot first, then log, then meta — so the `base_index`/`commit_index`
         // recorded in meta can never reference a snapshot or entries not yet on disk.
         if let Some(snapshot) = &p.snapshot {
@@ -119,6 +138,11 @@ impl RaftStore {
         })
     }
 
+    #[cfg(test)]
+    pub fn fail_saves_for_test(&self) {
+        self.fail_saves.store(true, Ordering::SeqCst);
+    }
+
     fn write_meta(&self, meta: &Meta) -> io::Result<()> {
         let bytes = serde_json::to_vec(meta).map_err(invalid)?;
         atomic_write(&self.meta_path, &bytes, &self.dir)
@@ -132,6 +156,51 @@ impl RaftStore {
         }
         atomic_write(&self.log_path, &buf, &self.dir)
     }
+}
+
+/// Reject inconsistent durable state before canonicalizing a torn log. In
+/// particular, recovery may discard only an uncommitted torn tail; it must
+/// never erase evidence of an entry referenced by the durable commit index.
+fn validate_recovered(meta: &Meta, snapshot: Option<&[u8]>, log: &[LogEntry]) -> io::Result<()> {
+    if meta.base_index > 0 && snapshot.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Raft snapshot is missing for non-zero base_index",
+        ));
+    }
+    if meta.commit_index < meta.base_index {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Raft commit_index precedes snapshot base_index",
+        ));
+    }
+    let mut expected = meta.base_index.saturating_add(1);
+    for entry in log {
+        if entry.index != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Raft log is not contiguous: expected index {expected}, found {}",
+                    entry.index
+                ),
+            ));
+        }
+        expected = expected.saturating_add(1);
+    }
+    let last_index = log
+        .last()
+        .map(|entry| entry.index)
+        .unwrap_or(meta.base_index);
+    if meta.commit_index > last_index {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Raft commit_index {} exceeds last recoverable index {last_index}; refusing to truncate committed entries",
+                meta.commit_index
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn invalid<E>(e: E) -> io::Error
@@ -238,5 +307,43 @@ mod tests {
         let (_s, rec) = RaftStore::open(&dir).unwrap();
         assert_eq!(rec.log.len(), 1, "torn record must be dropped");
         assert_eq!(rec.log[0].index, 1);
+    }
+
+    #[test]
+    fn torn_committed_record_aborts_recovery_without_canonicalizing_log() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store
+            .write_meta(&Meta {
+                current_term: 2,
+                voted_for: None,
+                commit_index: 2,
+                base_index: 0,
+                base_term: 0,
+            })
+            .unwrap();
+        store.write_log(&[entry(1, 2)]).unwrap();
+        let torn = b"{\"term\":2,\"index\":2,\"comm";
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log"))
+            .unwrap();
+        f.write_all(torn).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let before = fs::read(dir.join("log")).unwrap();
+        let err = RaftStore::open(&dir)
+            .err()
+            .expect("recovery must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("refusing to truncate committed entries"));
+        assert_eq!(
+            fs::read(dir.join("log")).unwrap(),
+            before,
+            "failed recovery must preserve the torn WAL for diagnosis"
+        );
     }
 }
