@@ -135,6 +135,16 @@ cargo run     # listens on :8095 (override PORT)
 curl localhost:8095/v1/status
 ```
 
+The pinned `flags-2-env` parser provides an audited launcher for non-secret
+settings:
+
+```bash
+make -B -C vendor/flags-2-env all
+scripts/with-flags2env.sh --port=8095 --shard-count=16 --target-nodes=3 -- cargo run --locked
+```
+
+Control-plane and Raft secrets remain environment-only.
+
 ## Related
 
 - [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane (runs on each node; hosts shard leaders/followers).

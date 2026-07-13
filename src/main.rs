@@ -122,48 +122,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .unwrap_or_default();
 
-    let (control_plane, raft): (Arc<dyn ControlPlane>, Option<Arc<RaftControlPlane>>) =
-        if peers.is_empty() {
-            tracing::info!("control plane: single-member (FIDUCIA_BRAIN_PEERS unset) — no replication");
-            (
-                Arc::new(LocalControlPlane::new(
-                    membership.clone(),
-                    placement.clone(),
-                    plan.clone(),
-                )),
-                None,
-            )
-        } else {
-            let id = std::env::var("FIDUCIA_BRAIN_ID")
-                .unwrap_or_else(|_| format!("http://localhost:{port}"));
-            // Peers must EXCLUDE self. Operators commonly list every member
-            // (including this one) in FIDUCIA_BRAIN_PEERS, so filter our own id out
-            // — otherwise quorum is inflated (a 3-member group would wrongly need
-            // all 3, losing fault tolerance) and the member would RPC itself.
-            let peers: Vec<String> = peers.into_iter().filter(|p| p != &id).collect();
-            let data_dir = std::env::var("FIDUCIA_DATA_DIR")
-                .unwrap_or_else(|_| "/tmp/fiducia-brain".to_string());
-            // Fail closed: if we can't open our durable Raft home, we must not run.
-            let (store, restored) = RaftStore::open(&data_dir)?;
-            tracing::info!(
-                %id, ?peers, %data_dir,
-                "control plane: Raft ({} members) — replicating placement + scale plan",
-                peers.len() + 1
-            );
-            let rcp = RaftControlPlane::new(
-                id,
-                peers,
-                RaftConfig::default(),
-                Some(store),
-                restored,
-                raft_driver::Transport::http(),
+    let (control_plane, raft): (Arc<dyn ControlPlane>, Option<Arc<RaftControlPlane>>) = if peers
+        .is_empty()
+    {
+        tracing::info!("control plane: single-member (FIDUCIA_BRAIN_PEERS unset) — no replication");
+        (
+            Arc::new(LocalControlPlane::new(
                 membership.clone(),
                 placement.clone(),
                 plan.clone(),
-            );
-            rcp.spawn();
-            (rcp.clone(), Some(rcp))
-        };
+            )),
+            None,
+        )
+    } else {
+        let id = std::env::var("FIDUCIA_BRAIN_ID")
+            .unwrap_or_else(|_| format!("http://localhost:{port}"));
+        // Peers must EXCLUDE self. Operators commonly list every member
+        // (including this one) in FIDUCIA_BRAIN_PEERS, so filter our own id out
+        // — otherwise quorum is inflated (a 3-member group would wrongly need
+        // all 3, losing fault tolerance) and the member would RPC itself.
+        let peers: Vec<String> = peers.into_iter().filter(|p| p != &id).collect();
+        let data_dir =
+            std::env::var("FIDUCIA_DATA_DIR").unwrap_or_else(|_| "/tmp/fiducia-brain".to_string());
+        // Fail closed: if we can't open our durable Raft home, we must not run.
+        let (store, restored) = RaftStore::open(&data_dir)?;
+        tracing::info!(
+            %id, ?peers, %data_dir,
+            "control plane: Raft ({} members) — replicating placement + scale plan",
+            peers.len() + 1
+        );
+        let rcp = RaftControlPlane::new(
+            id,
+            peers,
+            RaftConfig::default(),
+            Some(store),
+            restored,
+            raft_driver::Transport::http(),
+            membership.clone(),
+            placement.clone(),
+            plan.clone(),
+        );
+        rcp.spawn();
+        (rcp.clone(), Some(rcp))
+    };
 
     let scheduler = Arc::new(Scheduler::new(
         membership.clone(),

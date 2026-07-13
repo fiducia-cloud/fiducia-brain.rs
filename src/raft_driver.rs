@@ -30,8 +30,8 @@ use crate::membership::Membership;
 use crate::model::{ScalePlan, ShardAssignment};
 use crate::placement::Placement;
 use crate::raft::{
-    Addressed, AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, NodeId,
-    Persisted, Raft, RaftConfig, RaftMessage, Ready, RequestVoteReq, RequestVoteResp,
+    Addressed, AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp,
+    NodeId, Persisted, Raft, RaftConfig, RaftMessage, Ready, RequestVoteReq, RequestVoteResp,
 };
 use crate::raft_store::RaftStore;
 
@@ -583,7 +583,11 @@ mod tests {
             target_nodes: 9,
             replication_factor: 3,
         })));
-        assert_eq!(plan.lock().unwrap().target_nodes, 9, "applied to the state machine");
+        assert_eq!(
+            plan.lock().unwrap().target_nodes,
+            9,
+            "applied to the state machine"
+        );
 
         // And it was persisted: a fresh store sees the committed entry.
         let (_s, reread) = RaftStore::open(&dir).unwrap();
@@ -624,7 +628,11 @@ mod tests {
         // Restart: a fresh driver + fresh (empty) state machine recovers from disk.
         let (store, restored) = RaftStore::open(&dir).unwrap();
         let (membership, placement, plan) = handles();
-        assert_eq!(plan.lock().unwrap().target_nodes, 3, "state machine starts empty");
+        assert_eq!(
+            plan.lock().unwrap().target_nodes,
+            3,
+            "state machine starts empty"
+        );
         let cp = RaftControlPlane::new(
             "http://brain-0:8095".to_string(),
             vec![],

@@ -202,7 +202,8 @@ mod tests {
         ];
 
         assert_eq!(
-            preferred_leader_for_policy(Some(&policy), &replicas, &healthy, &slots, None).as_deref(),
+            preferred_leader_for_policy(Some(&policy), &replicas, &healthy, &slots, None)
+                .as_deref(),
             Some("aws-b")
         );
     }
@@ -237,7 +238,8 @@ mod tests {
         ];
 
         assert_eq!(
-            preferred_leader_for_policy(None, &replicas, &healthy, &slots, Some(&id("c"))).as_deref(),
+            preferred_leader_for_policy(None, &replicas, &healthy, &slots, Some(&id("c")))
+                .as_deref(),
             Some("c")
         );
         // But a strictly lighter node still wins over the observed leader.

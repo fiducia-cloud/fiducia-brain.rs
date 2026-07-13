@@ -178,8 +178,7 @@ impl Scheduler {
             // aren't all known yet avoids dropping live replicas we simply haven't
             // heard from — a genuinely failed node stays KNOWN as Dead, so real
             // failures still reconcile.
-            if !current_replicas.is_empty()
-                && !current_replicas.iter().all(|id| known.contains(id))
+            if !current_replicas.is_empty() && !current_replicas.iter().all(|id| known.contains(id))
             {
                 continue;
             }
@@ -506,7 +505,11 @@ mod tests {
         // the brain (re)started with an empty placement map. The reconcile must
         // ADOPT the observed layout, not churn the data by re-placing from scratch.
         let s = scheduler(1, 3);
-        for (id, dom, leads) in [("a", "gcp", false), ("b", "aws", true), ("c", "hetzner", false)] {
+        for (id, dom, leads) in [
+            ("a", "gcp", false),
+            ("b", "aws", true),
+            ("c", "hetzner", false),
+        ] {
             s.membership.heartbeat(
                 &id.to_string(),
                 0,
@@ -524,7 +527,10 @@ mod tests {
         let got: HashSet<String> = a.replicas.into_iter().collect();
         assert_eq!(
             got,
-            ["a", "b", "c"].iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
+            ["a", "b", "c"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<HashSet<_>>(),
             "keeps exactly the nodes that already host the shard"
         );
         assert_eq!(

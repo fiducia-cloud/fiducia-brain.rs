@@ -1,0 +1,96 @@
+# Non-secret command-line configuration for fiducia-brain. Shared control-plane
+# secrets remain environment-only.
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-brain.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[env]
+ignore = ["FIDUCIA_INTERNAL_SECRET", "FIDUCIA_BRAIN_RAFT_SECRET"]
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+short = "p"
+type = "integer"
+help = "HTTP listen port."
+
+[flags.target-nodes]
+env = "FIDUCIA_TARGET_NODES"
+aliases = ["target-nodes"]
+type = "integer"
+help = "Desired number of data-plane nodes."
+
+[flags.cluster]
+env = "FIDUCIA_CLUSTER"
+aliases = ["cluster"]
+type = "string"
+help = "Local cluster name."
+
+[flags.cluster-id]
+env = "FIDUCIA_CLUSTER_ID"
+aliases = ["cluster-id"]
+type = "string"
+help = "Stable cluster identifier."
+
+[flags.shard-count]
+env = "FIDUCIA_SHARD_COUNT"
+aliases = ["shard-count"]
+type = "integer"
+help = "Number of logical shards."
+
+[flags.cloud-provider]
+env = "FIDUCIA_CLOUD_PROVIDER"
+aliases = ["cloud-provider"]
+type = "string"
+help = "Cloud provider or platform name."
+
+[flags.region]
+env = "FIDUCIA_REGION"
+aliases = ["region"]
+type = "string"
+help = "Cloud region."
+
+[flags.brain-peers]
+env = "FIDUCIA_BRAIN_PEERS"
+aliases = ["brain-peers"]
+type = "string"
+help = "Comma-separated brain Raft peers."
+
+[flags.brain-id]
+env = "FIDUCIA_BRAIN_ID"
+aliases = ["brain-id"]
+type = "string"
+help = "Stable brain Raft member identifier."
+
+[flags.data-dir]
+env = "FIDUCIA_DATA_DIR"
+aliases = ["data-dir"]
+type = "string"
+help = "Durable Raft data directory."
+
+[flags.peer-port]
+env = "FIDUCIA_BRAIN_PEER_PORT"
+aliases = ["peer-port"]
+type = "integer"
+help = "Brain Raft peer listen port."
+
+[flags.suspect-after-ms]
+env = "FIDUCIA_SUSPECT_AFTER_MS"
+aliases = ["suspect-after-ms"]
+type = "integer"
+help = "Membership suspect threshold in milliseconds."
+
+[flags.dead-after-ms]
+env = "FIDUCIA_DEAD_AFTER_MS"
+aliases = ["dead-after-ms"]
+type = "integer"
+help = "Membership dead threshold in milliseconds."
+
+[flags.log]
+env = "RUST_LOG"
+aliases = ["log"]
+type = "string"
+help = "Rust tracing filter."
