@@ -258,7 +258,10 @@ async fn heartbeat(
     State(s): State<BrainState>,
     Path(id): Path<String>,
     report: Option<Json<HeartbeatReport>>,
-) -> Json<Value> {
+) -> Response {
+    if let Some(resp) = unavailable(&s) {
+        return resp.into_response();
+    }
     let report = report.map(|Json(r)| r).unwrap_or_default();
     // Liveness is leader-local soft state, so it must land on the leader. A
     // follower forwards there (the sidecar heartbeats any member); only if no
@@ -266,11 +269,11 @@ async fn heartbeat(
     if !s.control_plane.is_leader() {
         if let Some(leader) = s.control_plane.leader_addr() {
             let url = format!("{}/v1/nodes/{}/heartbeat", leader.trim_end_matches('/'), id);
-            return forwarded(s.http.post(url).json(&report)).await;
+            return forwarded(s.http.post(url).json(&report)).await.into_response();
         }
     }
     let health = s.membership.heartbeat(&id, now_ms(), report);
-    Json(json!({ "ok": true, "node_id": id, "health": health }))
+    Json(json!({ "ok": true, "node_id": id, "health": health })).into_response()
 }
 
 /// `DELETE /v1/nodes/{id}` — begin draining a node. The reconciler evacuates its
