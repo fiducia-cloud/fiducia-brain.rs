@@ -278,16 +278,19 @@ async fn heartbeat(
 
 /// `DELETE /v1/nodes/{id}` — begin draining a node. The reconciler evacuates its
 /// replicas/leadership onto healthy nodes; the operator removes it once empty.
-async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Json<Value> {
+async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Response {
+    if let Some(resp) = unavailable(&s) {
+        return resp.into_response();
+    }
     // Draining is leader-local intent; forward from a follower to the leader.
     if !s.control_plane.is_leader() {
         if let Some(leader) = s.control_plane.leader_addr() {
             let url = format!("{}/v1/nodes/{}", leader.trim_end_matches('/'), id);
-            return forwarded(s.http.delete(url)).await;
+            return forwarded(s.http.delete(url)).await.into_response();
         }
     }
     let known = s.membership.drain(&id);
-    Json(json!({ "draining": known, "node_id": id }))
+    Json(json!({ "draining": known, "node_id": id })).into_response()
 }
 
 /// `GET /v1/placement` — full shard map for nodes to reconcile against. The
