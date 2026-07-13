@@ -127,13 +127,78 @@ replicas per node · even **leaders** per node (the real write hotspot).
 > durable control-plane backend or a small replicated brain cluster, so the
 > control plane survives losing a brain node.
 
-## Run locally
+## Configuration (env surface)
+
+Everything is configured through environment variables. Secrets are marked; see
+[Security](#security) for the trust-boundary rules.
+
+| Variable | Type | Default | Secret? | Meaning |
+|----------|------|---------|:-------:|---------|
+| `FIDUCIA_INTERNAL_SECRET`   | string  | *(required)*          | **yes** | Trusted-hop secret for the `/v1` control plane. **Startup fails closed if unset** ([`internal_auth.rs`](src/internal_auth.rs)). |
+| `FIDUCIA_BRAIN_RAFT_SECRET` | string  | *(unset ⇒ auth off)*  | **yes** | Bearer secret for brain↔brain `/raft` RPC. Unset disables peer auth (dev/single-box only); a loud `WARN` is logged when the peer plane binds without it. |
+| `PORT`                      | integer | `8095`                | no      | Control-plane (`/v1`, health) listen port. |
+| `FIDUCIA_CLUSTER_ID`        | string  | `fiducia-local`       | no      | Stable identifier for this cluster. |
+| `FIDUCIA_SHARD_COUNT`       | integer | `16`                  | no      | Number of shards; **fixed at cluster creation** (defines `key → shard`). |
+| `FIDUCIA_TARGET_NODES`      | integer | `3` (floored at RF=3) | no      | Desired data-plane node count for the scale plan. |
+| `FIDUCIA_BRAIN_PEERS`       | string  | *(unset ⇒ single-member)* | no  | Comma-separated brain member addresses; set ⇒ replicated Raft control plane. |
+| `FIDUCIA_BRAIN_ID`          | string  | `http://localhost:$PORT` | no   | This member's addressable id (must be excluded from `FIDUCIA_BRAIN_PEERS`). |
+| `FIDUCIA_BRAIN_PEER_PORT`   | integer | `9095`                | no      | Port for the peer-facing `/raft` plane (replicated mode only). |
+| `FIDUCIA_DATA_DIR`          | string  | `/tmp/fiducia-brain`  | no      | Durable home for the brain's Raft WAL + snapshots (replicated mode). |
+| `FIDUCIA_CLUSTER`           | string  | *(none)*              | no      | Local Kubernetes cluster name (`gcp`, `aws`, `hetzner`, …). |
+| `FIDUCIA_CLOUD_PROVIDER` / `FIDUCIA_PLATFORM` | string | *(falls back to `FIDUCIA_CLUSTER`)* | no | Cloud provider for the local brain member. |
+| `FIDUCIA_REGION`            | string  | *(none)*              | no      | Physical region of the local brain member. |
+| `FIDUCIA_SUSPECT_AFTER_MS`  | integer | `6000`                | no      | Silence before a node goes Healthy → Suspect. |
+| `FIDUCIA_DEAD_AFTER_MS`     | integer | `30000`               | no      | Silence before a Suspect node is declared Dead. |
+
+### Deriving env from CLI flags (flags-2-env)
+
+CLI flags can be mapped to the `FIDUCIA_*`/`PORT` env vars above through the pinned
+[`ORESoftware/flags-2-env`](https://github.com/ORESoftware/flags-2-env) parser
+(schema in [`.cli-flags.toml`](.cli-flags.toml), audited in CI by
+`.github/workflows/cli-flags.yml`):
 
 ```bash
-cargo run     # listens on :8095 (override PORT)
-# env: FIDUCIA_SHARD_COUNT, FIDUCIA_TARGET_NODES
-curl localhost:8095/v1/status
+git submodule update --init --recursive
+make -C vendor/flags-2-env all           # or use the prebuilt vendor/flags-2-env/build/flags2env
+scripts/with-flags2env.sh --port=8095 --cluster-id=fiducia-local -- cargo run
 ```
+
+## Run locally
+
+The control plane fails closed, so set the trusted-hop secret even for a
+single-node dev run. `FIDUCIA_BRAIN_PEERS` unset ⇒ single-member mode (always
+leader, no replication, no `/raft` port):
+
+```bash
+FIDUCIA_INTERNAL_SECRET=dev-secret cargo run   # listens on :8095 (override PORT)
+curl -H 'x-fiducia-internal-auth: dev-secret' localhost:8095/v1/status
+curl localhost:8095/healthz                    # health probes stay open
+```
+
+## Security
+
+Trust boundaries and the hardening applied to this crate:
+
+- **`/v1` control plane fails closed.** `FIDUCIA_INTERNAL_SECRET` is **required**;
+  the process refuses to bind `/v1` if it is unset ([`main.rs`](src/main.rs)
+  `internal_auth::init_and_log()`, [`internal_auth.rs`](src/internal_auth.rs)).
+  Every `/v1` request must carry a matching `x-fiducia-internal-auth` header,
+  compared in **constant time**. Only `/healthz` and `/readyz` are open.
+- **`/raft` peer plane.** Guarded by a `FIDUCIA_BRAIN_RAFT_SECRET` bearer token,
+  now compared in **constant time** (`subtle::ConstantTimeEq`) so the secret
+  can't be recovered byte-by-byte via response timing. Leaving it unset disables
+  peer auth for local/single-box use; that insecure mode is now logged **loudly**
+  (`WARN`) when the peer plane binds. Set it for any multi-host deployment, and
+  keep `/raft` (default `:9095`) reachable only by peer brains.
+- **Request hardening.** All routers wrap a shared stack ([`main.rs`](src/main.rs)):
+  request-body cap (256 KiB), 30s request timeout (slow-loris protection), and a
+  catch-panic layer that turns a handler panic into a 500 instead of dropping the
+  connection.
+- **No `unsafe`.** The crate contains no `unsafe` blocks. Reachable `unwrap()`s are
+  limited to `Mutex` lock poisoning (contained by the catch-panic layer) and test
+  code; request bodies deserialize into small fixed structs.
+- **Dependencies.** `cargo audit` is **clean** (0 advisories across 201
+  dependencies at the last scan). No accepted/ignored advisories.
 
 ## Related
 

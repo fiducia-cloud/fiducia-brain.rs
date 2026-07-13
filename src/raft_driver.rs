@@ -24,6 +24,7 @@ use axum::{extract::State, routing::post, Json, Router};
 use tokio::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::cluster::{apply_command, Command, ControlPlane};
 use crate::membership::Membership;
@@ -191,6 +192,13 @@ impl RaftControlPlane {
             placement,
             plan,
         })
+    }
+
+    /// Whether the peer Raft plane will enforce the bearer secret. `false` means
+    /// `FIDUCIA_BRAIN_RAFT_SECRET` is unset — an insecure, dev/single-box mode the
+    /// caller must surface loudly before exposing `/raft` cross-cluster.
+    pub fn raft_auth_enabled(&self) -> bool {
+        self.raft_secret.is_some()
     }
 
     /// Spawn the background tick loop and outbox sender. Call once.
@@ -458,10 +466,12 @@ fn authorize(cp: &RaftControlPlane, headers: &HeaderMap) -> Result<(), StatusCod
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    if presented == Some(secret.as_str()) {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
+    // Constant-time compare so the bearer secret can't be recovered a byte at a
+    // time via response timing. `ct_eq` on byte slices does not short-circuit on
+    // the first differing byte.
+    match presented {
+        Some(token) if bool::from(token.as_bytes().ct_eq(secret.as_bytes())) => Ok(()),
+        _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
 

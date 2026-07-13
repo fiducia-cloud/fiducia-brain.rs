@@ -1,0 +1,63 @@
+# flags-2-env flag schema for the fiducia-brain service: maps command-line flags
+# to the FIDUCIA_*/PORT env vars the binary reads. Consumed by
+# scripts/with-flags2env.sh and audited in CI (cli-flags.yml).
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-brain.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[flags.brain-id]
+env = "FIDUCIA_BRAIN_ID"
+aliases = ["brain-id"]
+type = "string"
+help = "This brain member's addressable id (host:port URL)."
+
+[flags.brain-peers]
+env = "FIDUCIA_BRAIN_PEERS"
+aliases = ["brain-peers"]
+type = "string"
+help = "Comma-separated brain member addresses (replicated control plane)."
+
+[flags.brain-peer-port]
+env = "FIDUCIA_BRAIN_PEER_PORT"
+aliases = ["brain-peer-port"]
+type = "integer"
+help = "Port for the peer-facing Raft plane (/raft)."
+
+[flags.brain-raft-secret]
+env = "FIDUCIA_BRAIN_RAFT_SECRET"
+aliases = ["brain-raft-secret"]
+type = "string"
+help = "Shared bearer secret for brain-to-brain Raft RPC (secret)."
+
+[flags.cluster-id]
+env = "FIDUCIA_CLUSTER_ID"
+aliases = ["cluster-id"]
+type = "string"
+help = "Stable identifier for this cluster."
+
+[flags.data-dir]
+env = "FIDUCIA_DATA_DIR"
+aliases = ["data-dir"]
+type = "string"
+help = "Durable home for the brain's Raft WAL and snapshots."
+
+[flags.internal-secret]
+env = "FIDUCIA_INTERNAL_SECRET"
+aliases = ["internal-secret"]
+type = "string"
+help = "Shared trusted-hop secret guarding the /v1 control plane (secret)."
+
+[flags.target-nodes]
+env = "FIDUCIA_TARGET_NODES"
+aliases = ["target-nodes"]
+type = "string"
+help = "Desired data-plane node count for the scale plan."
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+type = "integer"
+help = "Control-plane listen port (default 8095)."

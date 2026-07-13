@@ -234,6 +234,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(9095);
+            // The peer plane is reachable cross-cluster. Enforcing the bearer
+            // secret is opt-in (unset ⇒ auth off for dev/single-box); make that
+            // insecure mode impossible to miss in the logs.
+            if rcp.raft_auth_enabled() {
+                tracing::info!(
+                    "brain-Raft peer plane: enforcing FIDUCIA_BRAIN_RAFT_SECRET on /raft"
+                );
+            } else {
+                tracing::warn!(
+                    "brain-Raft peer plane: FIDUCIA_BRAIN_RAFT_SECRET is UNSET — /raft peer \
+                     authentication is DISABLED (any host that can reach :{peer_port} can drive \
+                     consensus). Set FIDUCIA_BRAIN_RAFT_SECRET for any multi-host deployment."
+                );
+            }
             let peer_app = harden(
                 Router::new()
                     .route("/healthz", get(health))
