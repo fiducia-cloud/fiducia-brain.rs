@@ -79,6 +79,26 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Fail closed at the API boundary: a member whose control plane is unavailable
+/// (sticky, after a Raft durability failure) must not acknowledge mutations —
+/// not even leader-local soft state like heartbeats or drain intent. Without
+/// this check a failed member would keep answering `ok: true` to heartbeats and
+/// `DELETE /v1/nodes/{id}` while never acting on them.
+fn unavailable(s: &BrainState) -> Option<(StatusCode, Json<Value>)> {
+    if s.control_plane.is_available() {
+        None
+    } else {
+        Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": "unavailable",
+                "detail": "control plane is unavailable until restart",
+            })),
+        ))
+    }
+}
+
 pub fn router(state: BrainState) -> Router {
     Router::new()
         .route("/status", get(status))
@@ -194,6 +214,7 @@ async fn status(State(s): State<BrainState>) -> Json<Value> {
             "configured_remote_peers": s.config.brain_peers,
             "configured_members": s.config.brain_peers.len() + 1,
             "ha_configured": s.config.brain_peers.len() + 1 >= rf,
+            "available": s.control_plane.is_available(),
             // Brain's own control plane: which member is driving reconciliation.
             "placement_generation": s.placement.generation(),
             "is_leader": s.control_plane.is_leader(),

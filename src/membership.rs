@@ -323,7 +323,10 @@ mod tests {
         // Pod is gone per k8s: declare Dead immediately, without waiting out
         // dead_after (here the node has been silent for only 1ms).
         let m = Membership::with_oracle(
-            MembershipConfig { suspect_after_ms: 1_000, dead_after_ms: 60_000 },
+            MembershipConfig {
+                suspect_after_ms: 1_000,
+                dead_after_ms: 60_000,
+            },
             Arc::new(FixedOracle(PodLiveness::Gone)),
         );
         m.heartbeat(&"a".to_string(), 0, report("gcp", &[0]));
@@ -336,11 +339,17 @@ mod tests {
         // Pod is Running per k8s but heartbeats stopped (network blip): we must
         // NOT declare it Dead and trigger re-replication — hold it at Suspect.
         let m = Membership::with_oracle(
-            MembershipConfig { suspect_after_ms: 1_000, dead_after_ms: 5_000 },
+            MembershipConfig {
+                suspect_after_ms: 1_000,
+                dead_after_ms: 5_000,
+            },
             Arc::new(FixedOracle(PodLiveness::Running)),
         );
         m.heartbeat(&"a".to_string(), 0, report("gcp", &[0]));
-        assert!(m.sweep(1_000_000).is_empty(), "running pod is never declared dead on silence");
+        assert!(
+            m.sweep(1_000_000).is_empty(),
+            "running pod is never declared dead on silence"
+        );
         assert_eq!(m.snapshot()[0].health, NodeHealth::Suspect);
     }
 
@@ -364,7 +373,10 @@ mod tests {
         m.heartbeat(
             &"a".to_string(),
             1_000,
-            HeartbeatReport { seq: 5, ..report("gcp", &[0, 1]) },
+            HeartbeatReport {
+                seq: 5,
+                ..report("gcp", &[0, 1])
+            },
         );
         assert_eq!(m.snapshot()[0].leading_shards, vec![0, 1]);
 
@@ -373,7 +385,10 @@ mod tests {
         m.heartbeat(
             &"a".to_string(),
             2_000,
-            HeartbeatReport { seq: 3, ..report("gcp", &[]) },
+            HeartbeatReport {
+                seq: 3,
+                ..report("gcp", &[])
+            },
         );
         assert_eq!(
             m.snapshot()[0].leading_shards,
@@ -385,7 +400,10 @@ mod tests {
         m.heartbeat(
             &"a".to_string(),
             2_500,
-            HeartbeatReport { seq: 5, ..report("gcp", &[]) },
+            HeartbeatReport {
+                seq: 5,
+                ..report("gcp", &[])
+            },
         );
         assert_eq!(
             m.snapshot()[0].leading_shards,
@@ -397,7 +415,10 @@ mod tests {
         m.heartbeat(
             &"a".to_string(),
             3_000,
-            HeartbeatReport { seq: 6, ..report("gcp", &[7]) },
+            HeartbeatReport {
+                seq: 6,
+                ..report("gcp", &[7])
+            },
         );
         assert_eq!(
             m.snapshot()[0].leading_shards,

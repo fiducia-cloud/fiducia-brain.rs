@@ -9,9 +9,10 @@ placement, leader affinity, failover, scale, and rebalance. The control logic is
 placement math ([`src/plan.rs`](src/plan.rs): keep healthy replicas, drop
 dead/draining ones, fill to RF on the least-loaded node in a fresh failure
 domain), leadership affinity/failover, and the reconciliation loop + HTTP API are
-all live and unit-tested. What remains is replicating the brain's *own* state
-(membership + placement) in its **own Raft group** so the control plane itself
-survives losing a brain node (the HA note at the bottom).
+all live and unit-tested. Placement and scale intent are replicated in the
+brain's **own Raft group**, so the durable control plane survives losing a
+brain node; liveness membership remains leader-local soft state rebuilt from
+heartbeats.
 
 ## What the brain does
 
@@ -123,9 +124,9 @@ replicas per node · even **leaders** per node (the real write hotspot).
 | `src/scheduler.rs` | reconciliation loop (sweep failures → recompute placement)|
 | `src/model.rs`     | shared types                                              |
 
-> HA note: the brain's own state (membership + placement) should run on a
-> durable control-plane backend or a small replicated brain cluster, so the
-> control plane survives losing a brain node.
+> HA note: replicated mode durably stores placement and scale intent in a small
+> brain Raft cluster. Membership heartbeats are intentionally soft state and
+> are rebuilt at the elected leader.
 
 ## Configuration (env surface)
 
@@ -135,7 +136,7 @@ Everything is configured through environment variables. Secrets are marked; see
 | Variable | Type | Default | Secret? | Meaning |
 |----------|------|---------|:-------:|---------|
 | `FIDUCIA_INTERNAL_SECRET`   | string  | *(required)*          | **yes** | Trusted-hop secret for the `/v1` control plane. **Startup fails closed if unset** ([`internal_auth.rs`](src/internal_auth.rs)). |
-| `FIDUCIA_BRAIN_RAFT_SECRET` | string  | *(unset ⇒ auth off)*  | **yes** | Bearer secret for brain↔brain `/raft` RPC. Unset disables peer auth (dev/single-box only); a loud `WARN` is logged when the peer plane binds without it. |
+| `FIDUCIA_BRAIN_RAFT_SECRET` | string  | *(required in replicated mode)* | **yes** | Bearer secret for brain↔brain `/raft` RPC. When `FIDUCIA_BRAIN_PEERS` is non-empty, startup fails before binding if this is unset or blank. Single-member mode exposes no `/raft` plane and does not require it. |
 | `PORT`                      | integer | `8095`                | no      | Control-plane (`/v1`, health) listen port. |
 | `FIDUCIA_CLUSTER_ID`        | string  | `fiducia-local`       | no      | Stable identifier for this cluster. |
 | `FIDUCIA_SHARD_COUNT`       | integer | `16`                  | no      | Number of shards; **fixed at cluster creation** (defines `key → shard`). |
@@ -152,16 +153,20 @@ Everything is configured through environment variables. Secrets are marked; see
 
 ### Deriving env from CLI flags (flags-2-env)
 
-CLI flags can be mapped to the `FIDUCIA_*`/`PORT` env vars above through the pinned
+Non-secret settings can be mapped to the `FIDUCIA_*`/`PORT` env vars above through the pinned
 [`ORESoftware/flags-2-env`](https://github.com/ORESoftware/flags-2-env) parser
 (schema in [`.cli-flags.toml`](.cli-flags.toml), audited in CI by
 `.github/workflows/cli-flags.yml`):
 
 ```bash
 git submodule update --init --recursive
-make -C vendor/flags-2-env all           # or use the prebuilt vendor/flags-2-env/build/flags2env
+make -B -C vendor/flags-2-env all
 scripts/with-flags2env.sh --port=8095 --cluster-id=fiducia-local -- cargo run
 ```
+
+`FIDUCIA_INTERNAL_SECRET` and `FIDUCIA_BRAIN_RAFT_SECRET` are deliberately
+excluded from the CLI schema. Inject them through the environment or a secret
+store so they cannot leak through shell history or process listings.
 
 ## Run locally
 
@@ -186,10 +191,17 @@ Trust boundaries and the hardening applied to this crate:
   compared in **constant time**. Only `/healthz` and `/readyz` are open.
 - **`/raft` peer plane.** Guarded by a `FIDUCIA_BRAIN_RAFT_SECRET` bearer token,
   now compared in **constant time** (`subtle::ConstantTimeEq`) so the secret
-  can't be recovered byte-by-byte via response timing. Leaving it unset disables
-  peer auth for local/single-box use; that insecure mode is now logged **loudly**
-  (`WARN`) when the peer plane binds. Set it for any multi-host deployment, and
-  keep `/raft` (default `:9095`) reachable only by peer brains.
+  can't be recovered byte-by-byte via response timing. Replicated mode has no
+  unauthenticated fallback: an unset or whitespace-only secret aborts startup
+  before the cross-cluster peer plane binds. Keep `/raft` (default `:9095`)
+  reachable only by peer brains.
+- **Durability fails closed.** A WAL or snapshot persistence failure blocks the
+  current batch before it is applied, routed, acknowledged, or compacted. A
+  persistence or Raft outbox handoff failure makes the replicated member
+  unavailable before it acknowledges further work. `/readyz` then returns `503`
+  while `/healthz` remains live for diagnosis. Recovery accepts a torn tail only
+  when it is wholly uncommitted; it refuses to canonicalize a log that would
+  lose an entry named by the durable `commit_index`.
 - **Request hardening.** All routers wrap a shared stack ([`main.rs`](src/main.rs)):
   request-body cap (256 KiB), 30s request timeout (slow-loris protection), and a
   catch-panic layer that turns a handler panic into a 500 instead of dropping the

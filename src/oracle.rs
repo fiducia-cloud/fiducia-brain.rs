@@ -121,7 +121,11 @@ impl LivenessOracle for KubeOracle {
             Some(at) if at.elapsed() <= STALE_AFTER => {
                 // Present ⇒ its computed status; absent ⇒ Unknown (NOT Gone — could
                 // be a brand-new pod the cache hasn't seen yet, or a label change).
-                cache.pods.get(node_id).copied().unwrap_or(PodLiveness::Unknown)
+                cache
+                    .pods
+                    .get(node_id)
+                    .copied()
+                    .unwrap_or(PodLiveness::Unknown)
             }
             _ => PodLiveness::Unknown,
         }
@@ -138,9 +142,9 @@ fn pod_liveness(pod: &Value) -> PodLiveness {
         return PodLiveness::Gone;
     }
     if let Some(statuses) = pod["status"]["containerStatuses"].as_array() {
-        let crash_looping = statuses.iter().any(|c| {
-            c["state"]["waiting"]["reason"].as_str() == Some("CrashLoopBackOff")
-        });
+        let crash_looping = statuses
+            .iter()
+            .any(|c| c["state"]["waiting"]["reason"].as_str() == Some("CrashLoopBackOff"));
         if crash_looping {
             return PodLiveness::Gone;
         }
@@ -240,7 +244,11 @@ mod tests {
             "metadata": { "deletionTimestamp": "2026-06-28T00:00:00Z" },
             "status": { "phase": "Running" }
         });
-        assert_eq!(pod_liveness(&terminating), PodLiveness::Gone, "terminating is gone");
+        assert_eq!(
+            pod_liveness(&terminating),
+            PodLiveness::Gone,
+            "terminating is gone"
+        );
 
         let crashloop = json!({
             "status": {
@@ -250,10 +258,18 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(pod_liveness(&crashloop), PodLiveness::Gone, "crashloop is gone");
+        assert_eq!(
+            pod_liveness(&crashloop),
+            PodLiveness::Gone,
+            "crashloop is gone"
+        );
 
         let pending = json!({ "status": { "phase": "Pending" } });
-        assert_eq!(pod_liveness(&pending), PodLiveness::Unknown, "transitional is unknown");
+        assert_eq!(
+            pod_liveness(&pending),
+            PodLiveness::Unknown,
+            "transitional is unknown"
+        );
     }
 
     #[test]
