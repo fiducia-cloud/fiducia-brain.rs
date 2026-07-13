@@ -262,14 +262,17 @@ async fn heartbeat(
     if let Some(resp) = unavailable(&s) {
         return resp.into_response();
     }
-    let report = report.map(|Json(r)| r).unwrap_or_default();
+    let mut report = report.map(|Json(r)| r).unwrap_or_default();
+    sanitize_report(&mut report, s.config.shard_count);
     // Liveness is leader-local soft state, so it must land on the leader. A
     // follower forwards there (the sidecar heartbeats any member); only if no
     // leader is known yet — mid-election — do we accept best-effort locally.
     if !s.control_plane.is_leader() {
         if let Some(leader) = s.control_plane.leader_addr() {
             let url = format!("{}/v1/nodes/{}/heartbeat", leader.trim_end_matches('/'), id);
-            return forwarded(s.http.post(url).json(&report)).await.into_response();
+            return forwarded(s.http.post(url).json(&report))
+                .await
+                .into_response();
         }
     }
     let health = s.membership.heartbeat(&id, now_ms(), report);
@@ -365,7 +368,9 @@ async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>)
     match s.control_plane.leader_addr() {
         Some(leader) => {
             let url = format!("{}/v1/scale", leader.trim_end_matches('/'));
-            forwarded(s.http.post(url).json(&plan)).await.into_response()
+            forwarded(s.http.post(url).json(&plan))
+                .await
+                .into_response()
         }
         None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
             .into_response(),
