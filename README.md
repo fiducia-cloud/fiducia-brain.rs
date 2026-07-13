@@ -163,7 +163,7 @@ Non-secret settings can be mapped to the `FIDUCIA_*`/`PORT` env vars above throu
 ```bash
 git submodule update --init --recursive
 make -B -C vendor/flags-2-env all
-scripts/with-flags2env.sh --port=8095 --cluster-id=fiducia-local -- cargo run
+scripts/with-flags2env.sh --port=8095 --cluster-id=fiducia-local -- cargo run --locked
 ```
 
 `FIDUCIA_INTERNAL_SECRET` and `FIDUCIA_BRAIN_RAFT_SECRET` are deliberately
@@ -177,7 +177,7 @@ single-node dev run. `FIDUCIA_BRAIN_PEERS` unset ⇒ single-member mode (always
 leader, no replication, no `/raft` port):
 
 ```bash
-FIDUCIA_INTERNAL_SECRET=dev-secret cargo run   # listens on :8095 (override PORT)
+FIDUCIA_INTERNAL_SECRET=dev-secret cargo run --locked   # listens on :8095 (override PORT)
 curl -H 'x-fiducia-internal-auth: dev-secret' localhost:8095/v1/status
 curl localhost:8095/healthz                    # health probes stay open
 ```
