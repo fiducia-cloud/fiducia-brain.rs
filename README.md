@@ -234,5 +234,5 @@ Trust boundaries and the hardening applied to this crate:
 ## Related
 
 - [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane (runs on each node; hosts shard leaders/followers).
-- [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the website webserver.
-- [`fiducia-ui.web`](https://github.com/fiducia-cloud/fiducia-ui.web) — the website frontend.
+- [`fiducia-customer.rs`](https://github.com/fiducia-cloud/fiducia-customer.rs) — the website webserver.
+- [`fiducia-marketing.web`](https://github.com/fiducia-cloud/fiducia-marketing.web) — the website frontend.
