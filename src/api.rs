@@ -360,6 +360,25 @@ async fn set_policy(
         return Json(json!({ "ok": false, "error": "namespace_required" })).into_response();
     }
 
+    // Policies steer the LEADER's reconcile loop (it is the only member that
+    // computes placements), so a policy posted to a follower must land on the
+    // leader — previously it was applied to the follower's local map only and
+    // silently never took effect. Same forwarding contract as /v1/scale.
+    if !s.control_plane.is_leader() {
+        match s.control_plane.leader_addr() {
+            Some(leader) => {
+                let url = format!("{}/v1/policies", leader.trim_end_matches('/'));
+                return forwarded(s.http.post(url).json(&update))
+                    .await
+                    .into_response();
+            }
+            None => {
+                return Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
+                    .into_response()
+            }
+        }
+    }
+
     let policy = PlacementPolicy {
         shard_id: s.config.shard_for(&namespace),
         namespace,
@@ -597,6 +616,68 @@ mod tests {
             s.placement.policies_snapshot().is_empty(),
             "a failed-closed member must not accept placement policies"
         );
+    }
+
+    #[tokio::test]
+    async fn a_policy_posted_to_a_follower_lands_on_the_leader() {
+        // A real leader serving /v1 on an ephemeral port...
+        let leader = leader_state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leader_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(leader.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().nest("/v1", app))
+                .await
+                .unwrap();
+        });
+
+        // ...and a follower that knows the leader's address.
+        let follower = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: false,
+            leader_addr: Some(leader_url),
+        }));
+
+        let resp = set_policy(
+            State(follower.clone()),
+            Json(PlacementPolicyUpdate {
+                namespace: "tenant-a".to_string(),
+                home_region: Some("us-east-1".to_string()),
+                preferred_cloud_provider: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let policies = leader.placement.policies_snapshot();
+        assert_eq!(policies.len(), 1, "policy applied on the leader");
+        assert_eq!(policies[0].namespace, "tenant-a");
+        assert_eq!(policies[0].home_region.as_deref(), Some("us-east-1"));
+        assert!(
+            follower.placement.policies_snapshot().is_empty(),
+            "the follower does not keep a divergent local policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_posted_to_a_follower_without_a_leader_reports_not_leader() {
+        let follower = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: false,
+            leader_addr: None,
+        }));
+        let resp = set_policy(
+            State(follower.clone()),
+            Json(PlacementPolicyUpdate {
+                namespace: "tenant-a".to_string(),
+                home_region: None,
+                preferred_cloud_provider: None,
+            }),
+        )
+        .await;
+        // Mid-election: refuse rather than apply somewhere it will never be read.
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(follower.placement.policies_snapshot().is_empty());
     }
 
     #[tokio::test]

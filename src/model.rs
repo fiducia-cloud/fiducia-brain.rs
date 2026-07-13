@@ -125,8 +125,9 @@ pub struct PlacementPolicy {
     pub preferred_cloud_provider: Option<String>,
 }
 
-/// Body accepted by `POST /v1/policies`.
-#[derive(Debug, Clone, Deserialize)]
+/// Body accepted by `POST /v1/policies`. `Serialize` too, so a follower can
+/// forward it verbatim to the leader.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementPolicyUpdate {
     pub namespace: String,
     #[serde(default)]
