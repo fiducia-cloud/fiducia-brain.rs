@@ -7,11 +7,10 @@
 //! could forge heartbeats, drain nodes, or rescale the cluster.
 //!
 //! This middleware closes that gap with the same cluster secret the node uses for
-//! its `/v1` and `/raft` planes. When `FIDUCIA_INTERNAL_SECRET` is set, every
-//! `/v1` request must carry a matching [`INTERNAL_AUTH_HEADER`] (constant-time);
+//! its `/v1` and `/raft` planes. Every `/v1` request must carry a matching
+//! [`INTERNAL_AUTH_HEADER`] (constant-time);
 //! the node sidecar, the load balancer, admin, and the brain's own follower→leader
-//! forwarding attach it. Unset ⇒ the guard is a no-op, so dev / single-member and
-//! the in-process tests are byte-identical.
+//! forwarding attach it. Missing configuration is a startup error.
 //!
 //! The brain's peer plane (`/raft`, on a separate port) keeps its own bearer
 //! secret (`FIDUCIA_BRAIN_RAFT_SECRET`); this guards only the control plane.
@@ -42,16 +41,17 @@ fn configured() -> &'static Option<String> {
     })
 }
 
-/// Log the resulting posture once at startup.
-pub fn init_and_log() {
+/// Validate the trusted-hop secret before binding the control-plane port.
+pub fn init_and_log() -> Result<(), std::io::Error> {
     if configured().is_some() {
-        tracing::info!("internal-auth: enforcing FIDUCIA_INTERNAL_SECRET on the brain /v1 control plane");
-    } else {
-        tracing::warn!(
-            "internal-auth: FIDUCIA_INTERNAL_SECRET is unset — the brain /v1 control plane accepts \
-             traffic from ANY caller. Set it (shared with the node sidecar, LB, and admin) so only \
-             trusted hops can heartbeat / drain / rescale, or ensure :PORT is unreachable externally."
+        tracing::info!(
+            "internal-auth: enforcing FIDUCIA_INTERNAL_SECRET on the brain /v1 control plane"
         );
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "FIDUCIA_INTERNAL_SECRET must be configured for the brain control plane",
+        ))
     }
 }
 
@@ -64,7 +64,7 @@ pub fn attach(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     }
 }
 
-/// Axum middleware guarding the `/v1` control plane. A no-op when no secret is set.
+/// Axum middleware guarding the `/v1` control plane.
 pub async fn guard(request: Request, next: Next) -> Response {
     let provided = request
         .headers()
@@ -86,7 +86,7 @@ pub async fn guard(request: Request, next: Next) -> Response {
 /// Pure authorization decision (testable without env/process state).
 pub fn authorized(expected: Option<&str>, provided: Option<&str>) -> bool {
     match expected {
-        None => true,
+        None => false,
         Some(secret) => provided
             .map(|p| constant_time_eq(p.as_bytes(), secret.as_bytes()))
             .unwrap_or(false),
@@ -111,9 +111,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disabled_guard_allows_everything() {
-        assert!(authorized(None, None));
-        assert!(authorized(None, Some("whatever")));
+    fn missing_configuration_fails_closed() {
+        assert!(!authorized(None, None));
+        assert!(!authorized(None, Some("whatever")));
     }
 
     #[test]
