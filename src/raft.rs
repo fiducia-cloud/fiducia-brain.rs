@@ -188,6 +188,7 @@ pub struct Ready {
 }
 
 /// The fixed-membership single-group Raft state machine.
+#[derive(Clone)]
 pub struct Raft {
     id: NodeId,
     peers: Vec<NodeId>, // other members (excludes self)
@@ -255,7 +256,9 @@ impl Raft {
             role: Role::Follower,
             // The snapshot already represents the state machine up to base_index, so
             // commit/apply resume from there and compacted entries are never re-run.
-            commit_index: restored.commit_index.max(restored.base_index),
+            // RaftStore validates this relationship during recovery. Do not
+            // silently clamp it here: that could hide loss of committed state.
+            commit_index: restored.commit_index,
             last_applied: restored.base_index,
             leader_id: None,
             pending_restore: false,
