@@ -79,6 +79,30 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Validate node-reported shard data at the trust boundary. Heartbeats are the
+/// one input the brain takes from the data plane, and the scheduler *adopts*
+/// reported hosting/leading on a cold start, so a compromised or buggy node
+/// must not be able to smuggle in shard state the cluster cannot have:
+///
+///   * shard ids at or beyond `shard_count` do not exist — dropped;
+///   * duplicate ids would otherwise be adopted verbatim into a placement
+///     (`replicas: [a, a, b]` — RF met on paper with only two real replicas) —
+///     deduplicated, keeping first occurrence order;
+///   * a node cannot *lead* a shard it does not report *hosting* — such
+///     leading claims are dropped rather than allowed to steer leader
+///     stickiness/adoption toward the claimant.
+fn sanitize_report(report: &mut HeartbeatReport, shard_count: u32) {
+    let mut seen = HashSet::new();
+    report
+        .hosted_shards
+        .retain(|shard| *shard < shard_count && seen.insert(*shard));
+    let hosted: HashSet<u32> = report.hosted_shards.iter().copied().collect();
+    let mut seen = HashSet::new();
+    report
+        .leading_shards
+        .retain(|shard| hosted.contains(shard) && seen.insert(*shard));
+}
+
 /// Fail closed at the API boundary: a member whose control plane is unavailable
 /// (sticky, after a Raft durability failure) must not acknowledge mutations —
 /// not even leader-local soft state like heartbeats or drain intent. Without
@@ -262,7 +286,8 @@ async fn heartbeat(
     if let Some(resp) = unavailable(&s) {
         return resp.into_response();
     }
-    let report = report.map(|Json(r)| r).unwrap_or_default();
+    let mut report = report.map(|Json(r)| r).unwrap_or_default();
+    sanitize_report(&mut report, s.config.shard_count);
     // Liveness is leader-local soft state, so it must land on the leader. A
     // follower forwards there (the sidecar heartbeats any member); only if no
     // leader is known yet — mid-election — do we accept best-effort locally.
@@ -467,6 +492,61 @@ mod tests {
             )),
             ..s
         }
+    }
+
+    #[test]
+    fn sanitize_report_drops_out_of_range_duplicate_and_unhosted_shards() {
+        let mut report = HeartbeatReport {
+            hosted_shards: vec![0, 1, 1, 3, 99, u32::MAX],
+            leading_shards: vec![1, 1, 2, 99],
+            ..HeartbeatReport::default()
+        };
+        sanitize_report(&mut report, 4);
+        assert_eq!(
+            report.hosted_shards,
+            vec![0, 1, 3],
+            "out-of-range and duplicate hosted shards dropped"
+        );
+        assert_eq!(
+            report.leading_shards,
+            vec![1],
+            "leading claims limited to hosted, in-range, deduplicated shards"
+        );
+    }
+
+    #[test]
+    fn sanitize_report_keeps_a_well_formed_report_unchanged() {
+        let mut report = HeartbeatReport {
+            hosted_shards: vec![2, 0, 3],
+            leading_shards: vec![0, 3],
+            ..HeartbeatReport::default()
+        };
+        sanitize_report(&mut report, 4);
+        assert_eq!(report.hosted_shards, vec![2, 0, 3]);
+        assert_eq!(report.leading_shards, vec![0, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_with_forged_shard_state_is_recorded_sanitized() {
+        let s = leader_state();
+        let resp = heartbeat(
+            State(s.clone()),
+            Path("liar".to_string()),
+            Some(Json(HeartbeatReport {
+                hosted_shards: vec![0, 0, 500],
+                leading_shards: vec![0, 500, 3],
+                ..HeartbeatReport::default()
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let node = s.membership.snapshot().remove(0);
+        assert_eq!(node.hosted_shards, vec![0]);
+        assert_eq!(
+            node.leading_shards,
+            vec![0],
+            "cannot claim to lead shards it does not host or that do not exist"
+        );
     }
 
     #[tokio::test]
