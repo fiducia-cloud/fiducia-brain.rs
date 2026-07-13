@@ -389,3 +389,147 @@ fn non_empty_or_unknown(value: &str) -> String {
         value.to_ascii_lowercase()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::LocalControlPlane;
+    use crate::membership::MembershipConfig;
+
+    /// A control plane in an arbitrary (possibly failed-closed) state.
+    struct FakeControlPlane {
+        available: bool,
+        leader: bool,
+        leader_addr: Option<String>,
+    }
+
+    impl ControlPlane for FakeControlPlane {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+        fn is_leader(&self) -> bool {
+            self.available && self.leader
+        }
+        fn leader_addr(&self) -> Option<String> {
+            self.leader_addr.clone()
+        }
+        fn propose(&self, _command: Command) -> bool {
+            false
+        }
+    }
+
+    fn state_with(cp: Arc<dyn ControlPlane>) -> BrainState {
+        BrainState {
+            config: ClusterConfig {
+                cluster_id: "test".to_string(),
+                shard_count: 4,
+                replication_factor: SUPPORTED_REPLICATION_FACTOR,
+                local_cluster: None,
+                cloud_provider: None,
+                region: None,
+                brain_peers: Vec::new(),
+            },
+            membership: Arc::new(Membership::new(MembershipConfig::default())),
+            placement: Arc::new(Placement::new(4)),
+            plan: Arc::new(Mutex::new(ScalePlan {
+                target_nodes: 3,
+                replication_factor: 3,
+            })),
+            control_plane: cp,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn unavailable_state() -> BrainState {
+        state_with(Arc::new(FakeControlPlane {
+            available: false,
+            leader: false,
+            leader_addr: None,
+        }))
+    }
+
+    fn leader_state() -> BrainState {
+        let s = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: true,
+            leader_addr: None,
+        }));
+        // A leader that really applies: reuse the local (always-leader) plane.
+        BrainState {
+            control_plane: Arc::new(LocalControlPlane::new(
+                s.membership.clone(),
+                s.placement.clone(),
+                s.plan.clone(),
+            )),
+            ..s
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_member_refuses_all_mutations_with_503() {
+        let s = unavailable_state();
+
+        let resp = heartbeat(
+            State(s.clone()),
+            Path("node-a".to_string()),
+            Some(Json(HeartbeatReport::default())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            s.membership.snapshot().is_empty(),
+            "a failed-closed member must not record heartbeats"
+        );
+
+        let resp = remove_node(State(s.clone()), Path("node-a".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = set_scale(
+            State(s.clone()),
+            Json(ScalePlan {
+                target_nodes: 9,
+                replication_factor: 3,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            s.plan.lock().unwrap().target_nodes,
+            3,
+            "a failed-closed member must not accept a scale plan"
+        );
+
+        let resp = set_policy(
+            State(s.clone()),
+            Json(PlacementPolicyUpdate {
+                namespace: "tenant-a".to_string(),
+                home_region: Some("us-east-1".to_string()),
+                preferred_cloud_provider: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            s.placement.policies_snapshot().is_empty(),
+            "a failed-closed member must not accept placement policies"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_available_leader_still_accepts_heartbeats_and_drain() {
+        let s = leader_state();
+
+        let resp = heartbeat(
+            State(s.clone()),
+            Path("node-a".to_string()),
+            Some(Json(HeartbeatReport::default())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(s.membership.snapshot().len(), 1);
+
+        let resp = remove_node(State(s.clone()), Path("node-a".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(s.membership.snapshot()[0].health, NodeHealth::Draining);
+    }
+}
