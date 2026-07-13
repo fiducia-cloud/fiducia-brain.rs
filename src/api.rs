@@ -324,10 +324,13 @@ async fn list_policies(State(s): State<BrainState>) -> Json<Value> {
 async fn set_policy(
     State(s): State<BrainState>,
     Json(update): Json<PlacementPolicyUpdate>,
-) -> Json<Value> {
+) -> Response {
+    if let Some(resp) = unavailable(&s) {
+        return resp.into_response();
+    }
     let namespace = update.namespace.trim().to_string();
     if namespace.is_empty() {
-        return Json(json!({ "ok": false, "error": "namespace_required" }));
+        return Json(json!({ "ok": false, "error": "namespace_required" })).into_response();
     }
 
     let policy = PlacementPolicy {
