@@ -345,7 +345,10 @@ async fn set_policy(
 /// `POST /v1/scale` — set the desired scale plan; the reconciler picks it up on
 /// its next tick. `replication_factor` is fixed at RF=3 for the multi-cloud
 /// baseline.
-async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Json<Value> {
+async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Response {
+    if let Some(resp) = unavailable(&s) {
+        return resp.into_response();
+    }
     // RF is fixed at the multi-cloud baseline; target can't drop below it.
     plan.replication_factor = SUPPORTED_REPLICATION_FACTOR;
     plan.target_nodes = plan.target_nodes.max(SUPPORTED_REPLICATION_FACTOR);
@@ -354,14 +357,15 @@ async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>)
     // leader may accept a write — a follower transparently forwards there; if no
     // leader is known (mid-election) we report not_leader.
     if s.control_plane.propose(Command::SetScalePlan(plan.clone())) {
-        return Json(json!({ "ok": true, "plan": plan }));
+        return Json(json!({ "ok": true, "plan": plan })).into_response();
     }
     match s.control_plane.leader_addr() {
         Some(leader) => {
             let url = format!("{}/v1/scale", leader.trim_end_matches('/'));
-            forwarded(s.http.post(url).json(&plan)).await
+            forwarded(s.http.post(url).json(&plan)).await.into_response()
         }
-        None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null })),
+        None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
+            .into_response(),
     }
 }
 
