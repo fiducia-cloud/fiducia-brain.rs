@@ -309,7 +309,7 @@ impl Raft {
     }
 
     fn quorum(&self) -> usize {
-        (self.peers.len() + 1) / 2 + 1
+        self.peers.len().div_ceil(2) + 1
     }
 
     fn last_index(&self) -> u64 {
@@ -705,7 +705,10 @@ impl Raft {
     /// Drop entries with index ≥ `index`. Never touches committed entries (Raft's
     /// rules guarantee a conflict can only appear above `commit_index`).
     fn truncate_from(&mut self, index: u64) {
-        debug_assert!(index > self.commit_index, "would truncate a committed entry");
+        debug_assert!(
+            index > self.commit_index,
+            "would truncate a committed entry"
+        );
         if let Some(slot) = self.log_slot(index) {
             self.log.truncate(slot);
             self.dirty = true;
@@ -719,7 +722,11 @@ impl Raft {
     }
 
     fn send_append(&mut self, peer: &NodeId) {
-        let next = self.next_index.get(peer).copied().unwrap_or(self.last_index() + 1);
+        let next = self
+            .next_index
+            .get(peer)
+            .copied()
+            .unwrap_or(self.last_index() + 1);
         // The follower needs an entry we have already compacted away → ship the
         // snapshot instead of log entries it can no longer receive.
         if next <= self.base_index {
@@ -919,7 +926,13 @@ mod tests {
                 let peers = ids.iter().filter(|p| *p != id).cloned().collect();
                 nodes.insert(
                     id.clone(),
-                    Raft::new(id.clone(), peers, cfg(), (i as u64) + 1, Persisted::default()),
+                    Raft::new(
+                        id.clone(),
+                        peers,
+                        cfg(),
+                        (i as u64) + 1,
+                        Persisted::default(),
+                    ),
                 );
                 applied.insert(id.clone(), Vec::new());
             }
@@ -1136,7 +1149,11 @@ mod tests {
 
         c.node(&leader).compact(commit, b"snap".to_vec());
         assert_eq!(c.node(&leader).base_index(), commit);
-        assert_eq!(c.node(&leader).log_len(), 0, "entries up to the snapshot are gone");
+        assert_eq!(
+            c.node(&leader).log_len(),
+            0,
+            "entries up to the snapshot are gone"
+        );
 
         // The leader keeps committing on top of a compacted log.
         let idx = c.node(&leader).propose(plan(99)).unwrap();
