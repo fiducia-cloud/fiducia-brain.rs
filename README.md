@@ -86,7 +86,9 @@ Plus `/healthz`, `/readyz`.
   preserves RF=3 even if a caller submits another replication factor.
 - **Leader placement is policy-driven.** `/v1/policies` can pin a namespace's
   home region/provider so the scheduler prefers a nearby leader while preserving
-  the three-cloud replica spread.
+  the three-cloud replica spread. Policy writes received by a follower are
+  forwarded to the elected leader; during an election they fail closed instead
+  of creating follower-local intent that reconciliation would ignore.
 
 **Central configuration** = the brain's replicated state: the immutable
 `ClusterConfig` + the mutable `shard → {replicas, preferred_leader}` placement

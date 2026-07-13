@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -77,6 +77,50 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Validate node-reported shard data at the trust boundary. Heartbeats are the
+/// one input the brain takes from the data plane, and the scheduler *adopts*
+/// reported hosting/leading on a cold start, so a compromised or buggy node
+/// must not be able to smuggle in shard state the cluster cannot have:
+///
+///   * shard ids at or beyond `shard_count` do not exist — dropped;
+///   * duplicate ids would otherwise be adopted verbatim into a placement
+///     (`replicas: [a, a, b]` — RF met on paper with only two real replicas) —
+///     deduplicated, keeping first occurrence order;
+///   * a node cannot *lead* a shard it does not report *hosting* — such
+///     leading claims are dropped rather than allowed to steer leader
+///     stickiness/adoption toward the claimant.
+fn sanitize_report(report: &mut HeartbeatReport, shard_count: u32) {
+    let mut seen = HashSet::new();
+    report
+        .hosted_shards
+        .retain(|shard| *shard < shard_count && seen.insert(*shard));
+    let hosted: HashSet<u32> = report.hosted_shards.iter().copied().collect();
+    let mut seen = HashSet::new();
+    report
+        .leading_shards
+        .retain(|shard| hosted.contains(shard) && seen.insert(*shard));
+}
+
+/// Fail closed at the API boundary: a member whose control plane is unavailable
+/// (sticky, after a Raft durability failure) must not acknowledge mutations —
+/// not even leader-local soft state like heartbeats or drain intent. Without
+/// this check a failed member would keep answering `ok: true` to heartbeats and
+/// `DELETE /v1/nodes/{id}` while never acting on them.
+fn unavailable(s: &BrainState) -> Option<(StatusCode, Json<Value>)> {
+    if s.control_plane.is_available() {
+        None
+    } else {
+        Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok": false,
+                "error": "unavailable",
+                "detail": "control plane is unavailable until restart",
+            })),
+        ))
+    }
 }
 
 pub fn router(state: BrainState) -> Router {
@@ -238,33 +282,42 @@ async fn heartbeat(
     State(s): State<BrainState>,
     Path(id): Path<String>,
     report: Option<Json<HeartbeatReport>>,
-) -> Json<Value> {
-    let report = report.map(|Json(r)| r).unwrap_or_default();
+) -> Response {
+    if let Some(resp) = unavailable(&s) {
+        return resp.into_response();
+    }
+    let mut report = report.map(|Json(r)| r).unwrap_or_default();
+    sanitize_report(&mut report, s.config.shard_count);
     // Liveness is leader-local soft state, so it must land on the leader. A
     // follower forwards there (the sidecar heartbeats any member); only if no
     // leader is known yet — mid-election — do we accept best-effort locally.
     if !s.control_plane.is_leader() {
         if let Some(leader) = s.control_plane.leader_addr() {
             let url = format!("{}/v1/nodes/{}/heartbeat", leader.trim_end_matches('/'), id);
-            return forwarded(s.http.post(url).json(&report)).await;
+            return forwarded(s.http.post(url).json(&report))
+                .await
+                .into_response();
         }
     }
     let health = s.membership.heartbeat(&id, now_ms(), report);
-    Json(json!({ "ok": true, "node_id": id, "health": health }))
+    Json(json!({ "ok": true, "node_id": id, "health": health })).into_response()
 }
 
 /// `DELETE /v1/nodes/{id}` — begin draining a node. The reconciler evacuates its
 /// replicas/leadership onto healthy nodes; the operator removes it once empty.
-async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Json<Value> {
+async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Response {
+    if let Some(resp) = unavailable(&s) {
+        return resp.into_response();
+    }
     // Draining is leader-local intent; forward from a follower to the leader.
     if !s.control_plane.is_leader() {
         if let Some(leader) = s.control_plane.leader_addr() {
             let url = format!("{}/v1/nodes/{}", leader.trim_end_matches('/'), id);
-            return forwarded(s.http.delete(url)).await;
+            return forwarded(s.http.delete(url)).await.into_response();
         }
     }
     let known = s.membership.drain(&id);
-    Json(json!({ "draining": known, "node_id": id }))
+    Json(json!({ "draining": known, "node_id": id })).into_response()
 }
 
 /// `GET /v1/placement` — full shard map for nodes to reconcile against. The
@@ -298,10 +351,32 @@ async fn list_policies(State(s): State<BrainState>) -> Json<Value> {
 async fn set_policy(
     State(s): State<BrainState>,
     Json(update): Json<PlacementPolicyUpdate>,
-) -> Json<Value> {
+) -> Response {
+    if let Some(resp) = unavailable(&s) {
+        return resp.into_response();
+    }
     let namespace = update.namespace.trim().to_string();
     if namespace.is_empty() {
-        return Json(json!({ "ok": false, "error": "namespace_required" }));
+        return Json(json!({ "ok": false, "error": "namespace_required" })).into_response();
+    }
+
+    // Policies steer the LEADER's reconcile loop (it is the only member that
+    // computes placements), so a policy posted to a follower must land on the
+    // leader — previously it was applied to the follower's local map only and
+    // silently never took effect. Same forwarding contract as /v1/scale.
+    if !s.control_plane.is_leader() {
+        match s.control_plane.leader_addr() {
+            Some(leader) => {
+                let url = format!("{}/v1/policies", leader.trim_end_matches('/'));
+                return forwarded(s.http.post(url).json(&update))
+                    .await
+                    .into_response();
+            }
+            None => {
+                return Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
+                    .into_response()
+            }
+        }
     }
 
     let policy = PlacementPolicy {
@@ -313,13 +388,16 @@ async fn set_policy(
             .filter(|p| !p.trim().is_empty()),
     };
     s.placement.set_policy(policy.clone());
-    Json(json!({ "ok": true, "policy": policy }))
+    Json(json!({ "ok": true, "policy": policy })).into_response()
 }
 
 /// `POST /v1/scale` — set the desired scale plan; the reconciler picks it up on
 /// its next tick. `replication_factor` is fixed at RF=3 for the multi-cloud
 /// baseline.
-async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Json<Value> {
+async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Response {
+    if let Some(resp) = unavailable(&s) {
+        return resp.into_response();
+    }
     // RF is fixed at the multi-cloud baseline; target can't drop below it.
     plan.replication_factor = SUPPORTED_REPLICATION_FACTOR;
     plan.target_nodes = plan.target_nodes.max(SUPPORTED_REPLICATION_FACTOR);
@@ -328,14 +406,17 @@ async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>)
     // leader may accept a write — a follower transparently forwards there; if no
     // leader is known (mid-election) we report not_leader.
     if s.control_plane.propose(Command::SetScalePlan(plan.clone())) {
-        return Json(json!({ "ok": true, "plan": plan }));
+        return Json(json!({ "ok": true, "plan": plan })).into_response();
     }
     match s.control_plane.leader_addr() {
         Some(leader) => {
             let url = format!("{}/v1/scale", leader.trim_end_matches('/'));
-            forwarded(s.http.post(url).json(&plan)).await
+            forwarded(s.http.post(url).json(&plan))
+                .await
+                .into_response()
         }
-        None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null })),
+        None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
+            .into_response(),
     }
 }
 
@@ -354,5 +435,266 @@ fn non_empty_or_unknown(value: &str) -> String {
         "unknown".to_string()
     } else {
         value.to_ascii_lowercase()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::LocalControlPlane;
+    use crate::membership::MembershipConfig;
+
+    /// A control plane in an arbitrary (possibly failed-closed) state.
+    struct FakeControlPlane {
+        available: bool,
+        leader: bool,
+        leader_addr: Option<String>,
+    }
+
+    impl ControlPlane for FakeControlPlane {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+        fn is_leader(&self) -> bool {
+            self.available && self.leader
+        }
+        fn leader_addr(&self) -> Option<String> {
+            self.leader_addr.clone()
+        }
+        fn propose(&self, _command: Command) -> bool {
+            false
+        }
+    }
+
+    fn state_with(cp: Arc<dyn ControlPlane>) -> BrainState {
+        BrainState {
+            config: ClusterConfig {
+                cluster_id: "test".to_string(),
+                shard_count: 4,
+                replication_factor: SUPPORTED_REPLICATION_FACTOR,
+                local_cluster: None,
+                cloud_provider: None,
+                region: None,
+                brain_peers: Vec::new(),
+            },
+            membership: Arc::new(Membership::new(MembershipConfig::default())),
+            placement: Arc::new(Placement::new(4)),
+            plan: Arc::new(Mutex::new(ScalePlan {
+                target_nodes: 3,
+                replication_factor: 3,
+            })),
+            control_plane: cp,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn unavailable_state() -> BrainState {
+        state_with(Arc::new(FakeControlPlane {
+            available: false,
+            leader: false,
+            leader_addr: None,
+        }))
+    }
+
+    fn leader_state() -> BrainState {
+        let s = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: true,
+            leader_addr: None,
+        }));
+        // A leader that really applies: reuse the local (always-leader) plane.
+        BrainState {
+            control_plane: Arc::new(LocalControlPlane::new(
+                s.membership.clone(),
+                s.placement.clone(),
+                s.plan.clone(),
+            )),
+            ..s
+        }
+    }
+
+    #[test]
+    fn sanitize_report_drops_out_of_range_duplicate_and_unhosted_shards() {
+        let mut report = HeartbeatReport {
+            hosted_shards: vec![0, 1, 1, 3, 99, u32::MAX],
+            leading_shards: vec![1, 1, 2, 99],
+            ..HeartbeatReport::default()
+        };
+        sanitize_report(&mut report, 4);
+        assert_eq!(
+            report.hosted_shards,
+            vec![0, 1, 3],
+            "out-of-range and duplicate hosted shards dropped"
+        );
+        assert_eq!(
+            report.leading_shards,
+            vec![1],
+            "leading claims limited to hosted, in-range, deduplicated shards"
+        );
+    }
+
+    #[test]
+    fn sanitize_report_keeps_a_well_formed_report_unchanged() {
+        let mut report = HeartbeatReport {
+            hosted_shards: vec![2, 0, 3],
+            leading_shards: vec![0, 3],
+            ..HeartbeatReport::default()
+        };
+        sanitize_report(&mut report, 4);
+        assert_eq!(report.hosted_shards, vec![2, 0, 3]);
+        assert_eq!(report.leading_shards, vec![0, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_with_forged_shard_state_is_recorded_sanitized() {
+        let s = leader_state();
+        let resp = heartbeat(
+            State(s.clone()),
+            Path("liar".to_string()),
+            Some(Json(HeartbeatReport {
+                hosted_shards: vec![0, 0, 500],
+                leading_shards: vec![0, 500, 3],
+                ..HeartbeatReport::default()
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let node = s.membership.snapshot().remove(0);
+        assert_eq!(node.hosted_shards, vec![0]);
+        assert_eq!(
+            node.leading_shards,
+            vec![0],
+            "cannot claim to lead shards it does not host or that do not exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_member_refuses_all_mutations_with_503() {
+        let s = unavailable_state();
+
+        let resp = heartbeat(
+            State(s.clone()),
+            Path("node-a".to_string()),
+            Some(Json(HeartbeatReport::default())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            s.membership.snapshot().is_empty(),
+            "a failed-closed member must not record heartbeats"
+        );
+
+        let resp = remove_node(State(s.clone()), Path("node-a".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = set_scale(
+            State(s.clone()),
+            Json(ScalePlan {
+                target_nodes: 9,
+                replication_factor: 3,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            s.plan.lock().unwrap().target_nodes,
+            3,
+            "a failed-closed member must not accept a scale plan"
+        );
+
+        let resp = set_policy(
+            State(s.clone()),
+            Json(PlacementPolicyUpdate {
+                namespace: "tenant-a".to_string(),
+                home_region: Some("us-east-1".to_string()),
+                preferred_cloud_provider: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            s.placement.policies_snapshot().is_empty(),
+            "a failed-closed member must not accept placement policies"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_posted_to_a_follower_lands_on_the_leader() {
+        // A real leader serving /v1 on an ephemeral port...
+        let leader = leader_state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let leader_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(leader.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new().nest("/v1", app))
+                .await
+                .unwrap();
+        });
+
+        // ...and a follower that knows the leader's address.
+        let follower = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: false,
+            leader_addr: Some(leader_url),
+        }));
+
+        let resp = set_policy(
+            State(follower.clone()),
+            Json(PlacementPolicyUpdate {
+                namespace: "tenant-a".to_string(),
+                home_region: Some("us-east-1".to_string()),
+                preferred_cloud_provider: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let policies = leader.placement.policies_snapshot();
+        assert_eq!(policies.len(), 1, "policy applied on the leader");
+        assert_eq!(policies[0].namespace, "tenant-a");
+        assert_eq!(policies[0].home_region.as_deref(), Some("us-east-1"));
+        assert!(
+            follower.placement.policies_snapshot().is_empty(),
+            "the follower does not keep a divergent local policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_posted_to_a_follower_without_a_leader_reports_not_leader() {
+        let follower = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: false,
+            leader_addr: None,
+        }));
+        let resp = set_policy(
+            State(follower.clone()),
+            Json(PlacementPolicyUpdate {
+                namespace: "tenant-a".to_string(),
+                home_region: None,
+                preferred_cloud_provider: None,
+            }),
+        )
+        .await;
+        // Mid-election: refuse rather than apply somewhere it will never be read.
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(follower.placement.policies_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_available_leader_still_accepts_heartbeats_and_drain() {
+        let s = leader_state();
+
+        let resp = heartbeat(
+            State(s.clone()),
+            Path("node-a".to_string()),
+            Some(Json(HeartbeatReport::default())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(s.membership.snapshot().len(), 1);
+
+        let resp = remove_node(State(s.clone()), Path("node-a".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(s.membership.snapshot()[0].health, NodeHealth::Draining);
     }
 }
