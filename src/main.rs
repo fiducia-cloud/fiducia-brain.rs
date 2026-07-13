@@ -202,13 +202,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Control plane (:PORT, 8095): health + /v1 — the sidecar heartbeat, the LB's
     // placement/membership reads, and admin. A NetworkPolicy locks this to
     // in-namespace (see fiducia-infra).
-    // Log whether the control-plane trust boundary is enforced.
-    internal_auth::init_and_log();
+    // Refuse to bind the control plane unless its trusted-hop boundary is enforced.
+    internal_auth::init_and_log()?;
 
-    // `/v1` is cluster-internal: when FIDUCIA_INTERNAL_SECRET is set it requires
-    // the trusted-hop header (attached by the node sidecar, LB, admin, and the
-    // brain's own follower→leader forwarding). Health probes stay open for k8s.
-    // The guard is a no-op when the secret is unset (dev / single-member).
+    // `/v1` is cluster-internal and requires the trusted-hop header (attached by
+    // the node sidecar, LB, admin, and the brain's own follower→leader forwarding).
+    // Health probes stay open for k8s.
     let control_app = harden(
         Router::new()
             .route("/healthz", get(health))
