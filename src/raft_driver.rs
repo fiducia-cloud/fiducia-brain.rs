@@ -24,6 +24,7 @@ use axum::{extract::State, routing::post, Json, Router};
 use tokio::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::cluster::{apply_command, Command, ControlPlane};
 use crate::membership::Membership;
