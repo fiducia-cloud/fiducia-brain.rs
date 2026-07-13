@@ -79,6 +79,30 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Validate node-reported shard data at the trust boundary. Heartbeats are the
+/// one input the brain takes from the data plane, and the scheduler *adopts*
+/// reported hosting/leading on a cold start, so a compromised or buggy node
+/// must not be able to smuggle in shard state the cluster cannot have:
+///
+///   * shard ids at or beyond `shard_count` do not exist — dropped;
+///   * duplicate ids would otherwise be adopted verbatim into a placement
+///     (`replicas: [a, a, b]` — RF met on paper with only two real replicas) —
+///     deduplicated, keeping first occurrence order;
+///   * a node cannot *lead* a shard it does not report *hosting* — such
+///     leading claims are dropped rather than allowed to steer leader
+///     stickiness/adoption toward the claimant.
+fn sanitize_report(report: &mut HeartbeatReport, shard_count: u32) {
+    let mut seen = HashSet::new();
+    report
+        .hosted_shards
+        .retain(|shard| *shard < shard_count && seen.insert(*shard));
+    let hosted: HashSet<u32> = report.hosted_shards.iter().copied().collect();
+    let mut seen = HashSet::new();
+    report
+        .leading_shards
+        .retain(|shard| hosted.contains(shard) && seen.insert(*shard));
+}
+
 /// Fail closed at the API boundary: a member whose control plane is unavailable
 /// (sticky, after a Raft durability failure) must not acknowledge mutations —
 /// not even leader-local soft state like heartbeats or drain intent. Without
