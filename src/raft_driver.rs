@@ -194,6 +194,13 @@ impl RaftControlPlane {
         })
     }
 
+    /// Whether the peer Raft plane will enforce the bearer secret. `false` means
+    /// `FIDUCIA_BRAIN_RAFT_SECRET` is unset — an insecure, dev/single-box mode the
+    /// caller must surface loudly before exposing `/raft` cross-cluster.
+    pub fn raft_auth_enabled(&self) -> bool {
+        self.raft_secret.is_some()
+    }
+
     /// Spawn the background tick loop and outbox sender. Call once.
     pub fn spawn(self: &Arc<Self>) {
         // Tick loop: advance logical time; leaders heartbeat, others count down.
