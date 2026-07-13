@@ -342,7 +342,7 @@ async fn set_policy(
             .filter(|p| !p.trim().is_empty()),
     };
     s.placement.set_policy(policy.clone());
-    Json(json!({ "ok": true, "policy": policy }))
+    Json(json!({ "ok": true, "policy": policy })).into_response()
 }
 
 /// `POST /v1/scale` — set the desired scale plan; the reconciler picks it up on
