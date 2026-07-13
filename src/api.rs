@@ -494,6 +494,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sanitize_report_drops_out_of_range_duplicate_and_unhosted_shards() {
+        let mut report = HeartbeatReport {
+            hosted_shards: vec![0, 1, 1, 3, 99, u32::MAX],
+            leading_shards: vec![1, 1, 2, 99],
+            ..HeartbeatReport::default()
+        };
+        sanitize_report(&mut report, 4);
+        assert_eq!(
+            report.hosted_shards,
+            vec![0, 1, 3],
+            "out-of-range and duplicate hosted shards dropped"
+        );
+        assert_eq!(
+            report.leading_shards,
+            vec![1],
+            "leading claims limited to hosted, in-range, deduplicated shards"
+        );
+    }
+
+    #[test]
+    fn sanitize_report_keeps_a_well_formed_report_unchanged() {
+        let mut report = HeartbeatReport {
+            hosted_shards: vec![2, 0, 3],
+            leading_shards: vec![0, 3],
+            ..HeartbeatReport::default()
+        };
+        sanitize_report(&mut report, 4);
+        assert_eq!(report.hosted_shards, vec![2, 0, 3]);
+        assert_eq!(report.leading_shards, vec![0, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_with_forged_shard_state_is_recorded_sanitized() {
+        let s = leader_state();
+        let resp = heartbeat(
+            State(s.clone()),
+            Path("liar".to_string()),
+            Some(Json(HeartbeatReport {
+                hosted_shards: vec![0, 0, 500],
+                leading_shards: vec![0, 500, 3],
+                ..HeartbeatReport::default()
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let node = s.membership.snapshot().remove(0);
+        assert_eq!(node.hosted_shards, vec![0]);
+        assert_eq!(
+            node.leading_shards,
+            vec![0],
+            "cannot claim to lead shards it does not host or that do not exist"
+        );
+    }
+
     #[tokio::test]
     async fn an_unavailable_member_refuses_all_mutations_with_503() {
         let s = unavailable_state();
