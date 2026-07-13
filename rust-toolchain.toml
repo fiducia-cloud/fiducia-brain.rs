@@ -1,4 +1,4 @@
 # Pins the Rust toolchain channel and components used across this repo.
 [toolchain]
-channel = "stable"
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]

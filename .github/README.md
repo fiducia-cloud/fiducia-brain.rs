@@ -1,4 +1,5 @@
 # .github
 
-GitHub-hosted automation for the repo: Dependabot dependency updates
-(`dependabot.yml`) and the CI/CD workflows under `workflows/`.
+GitHub-hosted automation for the repo: Dependabot updates for Cargo, GitHub
+Actions, and Docker inputs (`dependabot.yml`), plus the CI/CD workflows under
+`workflows/`.
