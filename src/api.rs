@@ -628,6 +628,7 @@ mod tests {
         let resp = heartbeat(
             State(s.clone()),
             Path("node-a".to_string()),
+            HeaderMap::new(),
             Some(Json(HeartbeatReport::default())),
         )
         .await;
@@ -637,11 +638,17 @@ mod tests {
             "a failed-closed member must not record heartbeats"
         );
 
-        let resp = remove_node(State(s.clone()), Path("node-a".to_string())).await;
+        let resp = remove_node(
+            State(s.clone()),
+            Path("node-a".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let resp = set_scale(
             State(s.clone()),
+            HeaderMap::new(),
             Json(ScalePlan {
                 target_nodes: 9,
                 replication_factor: 3,
