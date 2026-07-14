@@ -415,13 +415,11 @@ async fn set_policy(
     // computes placements), so a policy posted to a follower must land on the
     // leader — previously it was applied to the follower's local map only and
     // silently never took effect. Same forwarding contract as /v1/scale.
-    if !s.control_plane.is_leader() {
+    if !s.control_plane.is_leader() && may_forward(&headers) {
         match s.control_plane.leader_addr() {
             Some(leader) => {
-                let url = format!("{}/v1/policies", leader.trim_end_matches('/'));
-                return forwarded(s.http.post(url).json(&update))
-                    .await
-                    .into_response();
+                let url = leader_v1(&leader, "/policies");
+                return forwarded(s.http.post(url).json(&update)).await;
             }
             None => {
                 return Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
