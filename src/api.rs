@@ -687,7 +687,9 @@ mod tests {
         let leader_url = format!("http://{}", listener.local_addr().unwrap());
         let app = router(leader.clone());
         tokio::spawn(async move {
-            axum::serve(listener, axum::Router::new().nest("/v1", app))
+            // Followers forward to the leader's PEER plane, where main.rs mounts
+            // the /v1 router under /forward — mirror that contract here.
+            axum::serve(listener, axum::Router::new().nest("/forward/v1", app))
                 .await
                 .unwrap();
         });
