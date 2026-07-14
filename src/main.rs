@@ -227,7 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `/v1` is cluster-internal and requires the trusted-hop header (attached by
     // the node sidecar, LB, admin, and the brain's own follower→leader forwarding).
-    // Health probes stay open for k8s.
+    // Health probes stay open for k8s. Built once: the same guarded router also
+    // serves as the follower→leader forwarding target on the peer plane.
+    let guarded_v1 = api::router(state).layer(middleware::from_fn(internal_auth::guard));
     let ready_cp = control_plane.clone();
     let control_app = harden(
         Router::new()
@@ -239,10 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     async move { ready(cp.is_available()).await }
                 }),
             )
-            .nest(
-                "/v1",
-                api::router(state).layer(middleware::from_fn(internal_auth::guard)),
-            ),
+            .nest("/v1", guarded_v1.clone()),
     );
 
     let shape = plan.lock().unwrap().clone();
