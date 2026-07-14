@@ -311,6 +311,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Brain members address each other by URL (Raft RPCs and follower→leader /v1
+/// forwarding both dial it). Operators commonly write peers as bare authorities
+/// (`brain.vultr.fiducia.cloud:9095`), which reqwest refuses — default the
+/// scheme to http and strip a trailing slash so equality checks are stable.
+fn normalize_member_url(addr: &str) -> String {
+    let addr = addr.trim().trim_end_matches('/');
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
 }
