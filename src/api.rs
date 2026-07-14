@@ -401,6 +401,7 @@ async fn list_policies(State(s): State<BrainState>) -> Json<Value> {
 /// that owns a namespace.
 async fn set_policy(
     State(s): State<BrainState>,
+    headers: HeaderMap,
     Json(update): Json<PlacementPolicyUpdate>,
 ) -> Response {
     if let Some(resp) = unavailable(&s) {
