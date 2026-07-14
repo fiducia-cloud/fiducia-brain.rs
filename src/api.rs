@@ -664,6 +664,7 @@ mod tests {
 
         let resp = set_policy(
             State(s.clone()),
+            HeaderMap::new(),
             Json(PlacementPolicyUpdate {
                 namespace: "tenant-a".to_string(),
                 home_region: Some("us-east-1".to_string()),
