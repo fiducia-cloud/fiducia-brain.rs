@@ -272,7 +272,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             async move { ready(cp.is_available()).await }
                         }),
                     )
-                    .merge(raft_driver::raft_router(rcp)),
+                    .merge(raft_driver::raft_router(rcp))
+                    // Follower→leader /v1 forwarding target. The in-namespace
+                    // :8095 control plane is unreachable from a remote cluster,
+                    // so members forward writes/reads to the leader here — the
+                    // SAME internal-auth-guarded /v1 router as :8095, mirroring
+                    // the node API's cross-cluster posture (NodePort +
+                    // trusted-hop secret).
+                    .nest("/forward/v1", guarded_v1.clone()),
             );
             let peer_addr = SocketAddr::from(([0, 0, 0, 0], peer_port));
             let peer_listener = tokio::net::TcpListener::bind(peer_addr).await?;
