@@ -458,13 +458,11 @@ async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>)
         return Json(json!({ "ok": true, "plan": plan })).into_response();
     }
     match s.control_plane.leader_addr() {
-        Some(leader) => {
-            let url = format!("{}/v1/scale", leader.trim_end_matches('/'));
-            forwarded(s.http.post(url).json(&plan))
-                .await
-                .into_response()
+        Some(leader) if may_forward(&headers) => {
+            let url = leader_v1(&leader, "/scale");
+            forwarded(s.http.post(url).json(&plan)).await
         }
-        None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
+        _ => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
             .into_response(),
     }
 }
