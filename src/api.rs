@@ -308,8 +308,19 @@ async fn route_key(State(s): State<BrainState>, Query(q): Query<RouteQuery>) -> 
 }
 
 /// `GET /v1/nodes` — membership view.
-async fn list_nodes(State(s): State<BrainState>) -> Json<Value> {
-    Json(json!({ "nodes": s.membership.snapshot() }))
+///
+/// Membership is leader-local soft state (rebuilt from heartbeats), so a
+/// follower's local view is empty or stale. Forward the read to the leader so
+/// every cluster's LB sees the whole fleet; answer locally only when no leader
+/// is known (mid-election — a degraded view beats no view) or when this request
+/// already made its one forward hop.
+async fn list_nodes(State(s): State<BrainState>, headers: HeaderMap) -> Response {
+    if !s.control_plane.is_leader() && may_forward(&headers) {
+        if let Some(leader) = s.control_plane.leader_addr() {
+            return forwarded(s.http.get(leader_v1(&leader, "/nodes"))).await;
+        }
+    }
+    Json(json!({ "nodes": s.membership.snapshot() })).into_response()
 }
 
 /// `POST /v1/nodes/{id}/heartbeat` — a data-plane node checks in with its
@@ -317,6 +328,7 @@ async fn list_nodes(State(s): State<BrainState>) -> Json<Value> {
 async fn heartbeat(
     State(s): State<BrainState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     report: Option<Json<HeartbeatReport>>,
 ) -> Response {
     if let Some(resp) = unavailable(&s) {
@@ -325,14 +337,13 @@ async fn heartbeat(
     let mut report = report.map(|Json(r)| r).unwrap_or_default();
     sanitize_report(&mut report, s.config.shard_count);
     // Liveness is leader-local soft state, so it must land on the leader. A
-    // follower forwards there (the sidecar heartbeats any member); only if no
-    // leader is known yet — mid-election — do we accept best-effort locally.
-    if !s.control_plane.is_leader() {
+    // follower forwards there (the sidecar heartbeats any member); if no leader
+    // is known yet — mid-election — or the request already hopped once, we
+    // accept best-effort locally.
+    if !s.control_plane.is_leader() && may_forward(&headers) {
         if let Some(leader) = s.control_plane.leader_addr() {
-            let url = format!("{}/v1/nodes/{}/heartbeat", leader.trim_end_matches('/'), id);
-            return forwarded(s.http.post(url).json(&report))
-                .await
-                .into_response();
+            let url = leader_v1(&leader, &format!("/nodes/{id}/heartbeat"));
+            return forwarded(s.http.post(url).json(&report)).await;
         }
     }
     let health = s.membership.heartbeat(&id, now_ms(), report);
