@@ -343,6 +343,27 @@ async fn ready(available: bool) -> (StatusCode, Json<Value>) {
 }
 
 #[cfg(test)]
+mod member_url_tests {
+    use super::normalize_member_url;
+
+    #[test]
+    fn schemeless_authorities_get_http_and_urls_pass_through() {
+        assert_eq!(
+            normalize_member_url("brain.vultr.fiducia.cloud:9095"),
+            "http://brain.vultr.fiducia.cloud:9095"
+        );
+        assert_eq!(
+            normalize_member_url("http://172.18.0.2:30095/"),
+            "http://172.18.0.2:30095"
+        );
+        assert_eq!(
+            normalize_member_url(" https://brain.civo.fiducia.cloud:9095 "),
+            "https://brain.civo.fiducia.cloud:9095"
+        );
+    }
+}
+
+#[cfg(test)]
 mod interface_contract_tests {
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 
