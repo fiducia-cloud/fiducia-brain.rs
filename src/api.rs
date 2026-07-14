@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -368,7 +368,9 @@ async fn set_policy(
         match s.control_plane.leader_addr() {
             Some(leader) => {
                 let url = format!("{}/v1/policies", leader.trim_end_matches('/'));
-                return forwarded(s.http.post(url).json(&update)).await.into_response();
+                return forwarded(s.http.post(url).json(&update))
+                    .await
+                    .into_response();
             }
             None => {
                 return Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))

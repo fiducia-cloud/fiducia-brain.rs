@@ -2,9 +2,14 @@
 
 GitHub Actions pipelines for fiducia-brain:
 
-- `ci.yml` — build, test, and lint (rustfmt/clippy) on push and pull request.
-- `docker.yml` — build and push the service container image on push to `main`.
-- `deploy-test.yml` — secret-gated deploy to the TEST environment; a no-op when
-  the `KUBE_CONFIG_TEST` secret is absent (validation only).
+- `ci.yml` — blocking formatting, clippy, all-target tests, CLI flag-contract,
+  and dependency-audit gates on Rust 1.95.0. Sibling interface and routing
+  sources are checked out at the immutable revisions documented in the root
+  README.
+- `docker.yml` — build and push the non-root service container image on push to
+  `main`, using those same immutable sibling revisions.
+- `deploy-test.yml` — fail-closed deploy to the TEST environment;
+  `KUBE_CONFIG_TEST` is mandatory, and missing, invalid, or empty credentials,
+  a missing target, or an incomplete rollout fail the job.
 - `cli-flags.yml` — audits `.cli-flags.toml` with the pinned `flags2env`
   submodule whenever the CLI flag schema, scripts, or submodule change.

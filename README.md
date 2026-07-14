@@ -86,7 +86,9 @@ Plus `/healthz`, `/readyz`.
   preserves RF=3 even if a caller submits another replication factor.
 - **Leader placement is policy-driven.** `/v1/policies` can pin a namespace's
   home region/provider so the scheduler prefers a nearby leader while preserving
-  the three-cloud replica spread.
+  the three-cloud replica spread. Policy writes received by a follower are
+  forwarded to the elected leader; during an election they fail closed instead
+  of creating follower-local intent that reconciliation would ignore.
 
 **Central configuration** = the brain's replicated state: the immutable
 `ClusterConfig` + the mutable `shard → {replicas, preferred_leader}` placement
@@ -161,7 +163,7 @@ Non-secret settings can be mapped to the `FIDUCIA_*`/`PORT` env vars above throu
 ```bash
 git submodule update --init --recursive
 make -B -C vendor/flags-2-env all
-scripts/with-flags2env.sh --port=8095 --cluster-id=fiducia-local -- cargo run
+scripts/with-flags2env.sh --port=8095 --cluster-id=fiducia-local -- cargo run --locked
 ```
 
 `FIDUCIA_INTERNAL_SECRET` and `FIDUCIA_BRAIN_RAFT_SECRET` are deliberately
@@ -175,10 +177,27 @@ single-node dev run. `FIDUCIA_BRAIN_PEERS` unset ⇒ single-member mode (always
 leader, no replication, no `/raft` port):
 
 ```bash
-FIDUCIA_INTERNAL_SECRET=dev-secret cargo run   # listens on :8095 (override PORT)
+FIDUCIA_INTERNAL_SECRET=dev-secret cargo run --locked   # listens on :8095 (override PORT)
 curl -H 'x-fiducia-internal-auth: dev-secret' localhost:8095/v1/status
 curl localhost:8095/healthz                    # health probes stay open
 ```
+
+## Reproducible build inputs
+
+CI and the container build use Rust 1.95.0, the committed `Cargo.lock`, and
+immutable sibling revisions for the local path dependencies:
+
+- `fiducia-interfaces` at
+  `487e470c45ab5851e8f6f3b1dc048fe067fbf408`
+- `fiducia-routing.rs` at
+  `6106b4f79a5559699a64c931dbcb472f42274266`
+
+When either shared contract changes, update the checkout refs in
+`.github/workflows/ci.yml`, the build arguments in `.github/workflows/docker.yml`,
+and the defaults in `Dockerfile` together. Cargo formatting, clippy, tests, and
+release builds run with the lockfile enforced; dependency-audit failures block
+CI. Docker build and runtime bases are pinned by multi-platform manifest digest,
+and the final image runs as the distroless non-root uid/gid `65532:65532`.
 
 ## Security
 
@@ -215,5 +234,5 @@ Trust boundaries and the hardening applied to this crate:
 ## Related
 
 - [`fiducia-node.rs`](https://github.com/fiducia-cloud/fiducia-node.rs) — data plane (runs on each node; hosts shard leaders/followers).
-- [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs) — the website webserver.
-- [`fiducia-ui.web`](https://github.com/fiducia-cloud/fiducia-ui.web) — the website frontend.
+- [`fiducia-customer.rs`](https://github.com/fiducia-cloud/fiducia-customer.rs) — the website webserver.
+- [`fiducia-marketing.web`](https://github.com/fiducia-cloud/fiducia-marketing.web) — the website frontend.
