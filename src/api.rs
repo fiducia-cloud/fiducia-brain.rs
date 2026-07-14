@@ -788,13 +788,19 @@ mod tests {
         let resp = heartbeat(
             State(s.clone()),
             Path("node-a".to_string()),
+            HeaderMap::new(),
             Some(Json(HeartbeatReport::default())),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(s.membership.snapshot().len(), 1);
 
-        let resp = remove_node(State(s.clone()), Path("node-a".to_string())).await;
+        let resp = remove_node(
+            State(s.clone()),
+            Path("node-a".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(s.membership.snapshot()[0].health, NodeHealth::Draining);
     }
