@@ -603,6 +603,7 @@ mod tests {
         let resp = heartbeat(
             State(s.clone()),
             Path("liar".to_string()),
+            HeaderMap::new(),
             Some(Json(HeartbeatReport {
                 hosted_shards: vec![0, 0, 500],
                 leading_shards: vec![0, 500, 3],
