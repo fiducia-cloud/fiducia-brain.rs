@@ -50,25 +50,61 @@ pub struct BrainState {
     pub http: reqwest::Client,
 }
 
-/// Forward a request to the leader and relay its JSON response. Used when a
-/// non-leader receives a write or a heartbeat (liveness + durable state live on
-/// the leader). Keeps the data-plane sidecar dumb: it heartbeats any member and
-/// the brain routes internally.
-async fn forwarded(req: reqwest::RequestBuilder) -> Json<Value> {
+/// Marks a request as already forwarded once by a member. A handler must never
+/// re-forward a request carrying it: two members with transiently stale leader
+/// views (each believing the other leads) would otherwise ping-pong the request
+/// until timeouts stack up. Seeing the marker means "answer with your local
+/// truth instead".
+const FORWARDED_HEADER: &str = "x-fiducia-brain-forwarded";
+
+/// True when this request may still be forwarded to the leader (i.e. it has not
+/// already made a forward hop).
+fn may_forward(headers: &HeaderMap) -> bool {
+    !headers.contains_key(FORWARDED_HEADER)
+}
+
+/// URL for forwarding a `/v1` request to the leader. Members address each other
+/// by their **peer-plane** URL (`FIDUCIA_BRAIN_ID` must be the URL other members
+/// dial — the only cross-cluster-routable brain address), and `main.rs` mounts
+/// the same internal-auth-guarded `/v1` router at `/forward/v1` on that plane.
+/// The in-namespace `:8095` control plane is NOT reachable from a remote
+/// cluster, so `{leader}/v1/...` would have nowhere to land.
+fn leader_v1(leader: &str, path: &str) -> String {
+    format!("{}/forward/v1{}", leader.trim_end_matches('/'), path)
+}
+
+/// Forward a request to the leader and relay its response — status code
+/// included, so a failed forward is visible to the caller (a sidecar heartbeat
+/// must not read a swallowed error as "registered"). Used when a non-leader
+/// receives a write or a heartbeat (liveness + durable state live on the
+/// leader). Keeps the data-plane sidecar dumb: it heartbeats any member and the
+/// brain routes internally.
+async fn forwarded(req: reqwest::RequestBuilder) -> Response {
     // The leader's /v1 enforces the trusted-hop secret when configured, so a
     // follower forwarding a heartbeat/scale/drain must present it too.
-    let req = crate::internal_auth::attach(req);
+    let req = crate::internal_auth::attach(req).header(FORWARDED_HEADER, "1");
     match req.send().await {
-        Ok(resp) => Json(
-            resp.json::<Value>()
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = resp
+                .json::<Value>()
                 .await
-                .unwrap_or_else(|_| json!({ "ok": true, "forwarded": true })),
-        ),
-        Err(err) => Json(json!({
-            "ok": false,
-            "error": "leader_forward_failed",
-            "detail": err.to_string(),
-        })),
+                .unwrap_or_else(|_| json!({ "ok": status.is_success(), "forwarded": true }));
+            (status, Json(body)).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "forward to brain leader failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "ok": false,
+                    "error": "leader_forward_failed",
+                    "detail": err.to_string(),
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
