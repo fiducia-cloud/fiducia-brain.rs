@@ -138,13 +138,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The replicated peer plane is cross-cluster reachable. It has no
         // unauthenticated mode: abort before opening state or binding ports.
         let raft_secret = raft_driver::RaftSecret::from_env()?;
-        let id = std::env::var("FIDUCIA_BRAIN_ID")
-            .unwrap_or_else(|_| format!("http://localhost:{port}"));
+        // A member's id doubles as the address other members dial it at: it is
+        // the `leader_id` gossiped in Raft messages, and a follower forwards
+        // /v1 writes to `{leader_id}/forward/v1/...` on the peer plane. It MUST
+        // therefore be this member's dialable peer-plane URL. A display name
+        // (e.g. `fiducia-brain-0.civo`) leaves followers with a leader address
+        // they cannot reach, silently blackholing every forwarded
+        // heartbeat/scale/drain — the leader then only ever learns about nodes
+        // whose sidecars happen to heartbeat it directly.
+        let id = normalize_member_url(
+            &std::env::var("FIDUCIA_BRAIN_ID").unwrap_or_else(|_| format!("localhost:{port}")),
+        );
         // Peers must EXCLUDE self. Operators commonly list every member
         // (including this one) in FIDUCIA_BRAIN_PEERS, so filter our own id out
         // — otherwise quorum is inflated (a 3-member group would wrongly need
         // all 3, losing fault tolerance) and the member would RPC itself.
-        let peers: Vec<String> = peers.into_iter().filter(|p| p != &id).collect();
+        // Normalized like the id, so the self-compare can't miss on a scheme
+        // mismatch and every peer is dialable.
+        let peers: Vec<String> = peers
+            .into_iter()
+            .map(|p| normalize_member_url(&p))
+            .filter(|p| p != &id)
+            .collect();
         let data_dir =
             std::env::var("FIDUCIA_DATA_DIR").unwrap_or_else(|_| "/tmp/fiducia-brain".to_string());
         // Fail closed: if we can't open our durable Raft home, we must not run.
@@ -212,7 +227,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `/v1` is cluster-internal and requires the trusted-hop header (attached by
     // the node sidecar, LB, admin, and the brain's own follower→leader forwarding).
-    // Health probes stay open for k8s.
+    // Health probes stay open for k8s. Built once: the same guarded router also
+    // serves as the follower→leader forwarding target on the peer plane.
+    let guarded_v1 = api::router(state).layer(middleware::from_fn(internal_auth::guard));
     let ready_cp = control_plane.clone();
     let control_app = harden(
         Router::new()
@@ -224,10 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     async move { ready(cp.is_available()).await }
                 }),
             )
-            .nest(
-                "/v1",
-                api::router(state).layer(middleware::from_fn(internal_auth::guard)),
-            ),
+            .nest("/v1", guarded_v1.clone()),
     );
 
     let shape = plan.lock().unwrap().clone();
@@ -258,7 +272,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             async move { ready(cp.is_available()).await }
                         }),
                     )
-                    .merge(raft_driver::raft_router(rcp)),
+                    .merge(raft_driver::raft_router(rcp))
+                    // Follower→leader /v1 forwarding target. The in-namespace
+                    // :8095 control plane is unreachable from a remote cluster,
+                    // so members forward writes/reads to the leader here — the
+                    // SAME internal-auth-guarded /v1 router as :8095, mirroring
+                    // the node API's cross-cluster posture (NodePort +
+                    // trusted-hop secret).
+                    .nest("/forward/v1", guarded_v1.clone()),
             );
             let peer_addr = SocketAddr::from(([0, 0, 0, 0], peer_port));
             let peer_listener = tokio::net::TcpListener::bind(peer_addr).await?;
@@ -290,6 +311,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Brain members address each other by URL (Raft RPCs and follower→leader /v1
+/// forwarding both dial it). Operators commonly write peers as bare authorities
+/// (`brain.vultr.fiducia.cloud:9095`), which reqwest refuses — default the
+/// scheme to http and strip a trailing slash so equality checks are stable.
+fn normalize_member_url(addr: &str) -> String {
+    let addr = addr.trim().trim_end_matches('/');
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
 }
@@ -305,6 +339,27 @@ async fn ready(available: bool) -> (StatusCode, Json<Value>) {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "unavailable", "service": SERVICE })),
         )
+    }
+}
+
+#[cfg(test)]
+mod member_url_tests {
+    use super::normalize_member_url;
+
+    #[test]
+    fn schemeless_authorities_get_http_and_urls_pass_through() {
+        assert_eq!(
+            normalize_member_url("brain.vultr.fiducia.cloud:9095"),
+            "http://brain.vultr.fiducia.cloud:9095"
+        );
+        assert_eq!(
+            normalize_member_url("http://172.18.0.2:30095/"),
+            "http://172.18.0.2:30095"
+        );
+        assert_eq!(
+            normalize_member_url(" https://brain.civo.fiducia.cloud:9095 "),
+            "https://brain.civo.fiducia.cloud:9095"
+        );
     }
 }
 

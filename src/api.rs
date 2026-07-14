@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -50,25 +50,61 @@ pub struct BrainState {
     pub http: reqwest::Client,
 }
 
-/// Forward a request to the leader and relay its JSON response. Used when a
-/// non-leader receives a write or a heartbeat (liveness + durable state live on
-/// the leader). Keeps the data-plane sidecar dumb: it heartbeats any member and
-/// the brain routes internally.
-async fn forwarded(req: reqwest::RequestBuilder) -> Json<Value> {
+/// Marks a request as already forwarded once by a member. A handler must never
+/// re-forward a request carrying it: two members with transiently stale leader
+/// views (each believing the other leads) would otherwise ping-pong the request
+/// until timeouts stack up. Seeing the marker means "answer with your local
+/// truth instead".
+const FORWARDED_HEADER: &str = "x-fiducia-brain-forwarded";
+
+/// True when this request may still be forwarded to the leader (i.e. it has not
+/// already made a forward hop).
+fn may_forward(headers: &HeaderMap) -> bool {
+    !headers.contains_key(FORWARDED_HEADER)
+}
+
+/// URL for forwarding a `/v1` request to the leader. Members address each other
+/// by their **peer-plane** URL (`FIDUCIA_BRAIN_ID` must be the URL other members
+/// dial — the only cross-cluster-routable brain address), and `main.rs` mounts
+/// the same internal-auth-guarded `/v1` router at `/forward/v1` on that plane.
+/// The in-namespace `:8095` control plane is NOT reachable from a remote
+/// cluster, so `{leader}/v1/...` would have nowhere to land.
+fn leader_v1(leader: &str, path: &str) -> String {
+    format!("{}/forward/v1{}", leader.trim_end_matches('/'), path)
+}
+
+/// Forward a request to the leader and relay its response — status code
+/// included, so a failed forward is visible to the caller (a sidecar heartbeat
+/// must not read a swallowed error as "registered"). Used when a non-leader
+/// receives a write or a heartbeat (liveness + durable state live on the
+/// leader). Keeps the data-plane sidecar dumb: it heartbeats any member and the
+/// brain routes internally.
+async fn forwarded(req: reqwest::RequestBuilder) -> Response {
     // The leader's /v1 enforces the trusted-hop secret when configured, so a
     // follower forwarding a heartbeat/scale/drain must present it too.
-    let req = crate::internal_auth::attach(req);
+    let req = crate::internal_auth::attach(req).header(FORWARDED_HEADER, "1");
     match req.send().await {
-        Ok(resp) => Json(
-            resp.json::<Value>()
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = resp
+                .json::<Value>()
                 .await
-                .unwrap_or_else(|_| json!({ "ok": true, "forwarded": true })),
-        ),
-        Err(err) => Json(json!({
-            "ok": false,
-            "error": "leader_forward_failed",
-            "detail": err.to_string(),
-        })),
+                .unwrap_or_else(|_| json!({ "ok": status.is_success(), "forwarded": true }));
+            (status, Json(body)).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "forward to brain leader failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "ok": false,
+                    "error": "leader_forward_failed",
+                    "detail": err.to_string(),
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -272,8 +308,19 @@ async fn route_key(State(s): State<BrainState>, Query(q): Query<RouteQuery>) -> 
 }
 
 /// `GET /v1/nodes` — membership view.
-async fn list_nodes(State(s): State<BrainState>) -> Json<Value> {
-    Json(json!({ "nodes": s.membership.snapshot() }))
+///
+/// Membership is leader-local soft state (rebuilt from heartbeats), so a
+/// follower's local view is empty or stale. Forward the read to the leader so
+/// every cluster's LB sees the whole fleet; answer locally only when no leader
+/// is known (mid-election — a degraded view beats no view) or when this request
+/// already made its one forward hop.
+async fn list_nodes(State(s): State<BrainState>, headers: HeaderMap) -> Response {
+    if !s.control_plane.is_leader() && may_forward(&headers) {
+        if let Some(leader) = s.control_plane.leader_addr() {
+            return forwarded(s.http.get(leader_v1(&leader, "/nodes"))).await;
+        }
+    }
+    Json(json!({ "nodes": s.membership.snapshot() })).into_response()
 }
 
 /// `POST /v1/nodes/{id}/heartbeat` — a data-plane node checks in with its
@@ -281,6 +328,7 @@ async fn list_nodes(State(s): State<BrainState>) -> Json<Value> {
 async fn heartbeat(
     State(s): State<BrainState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     report: Option<Json<HeartbeatReport>>,
 ) -> Response {
     if let Some(resp) = unavailable(&s) {
@@ -289,14 +337,13 @@ async fn heartbeat(
     let mut report = report.map(|Json(r)| r).unwrap_or_default();
     sanitize_report(&mut report, s.config.shard_count);
     // Liveness is leader-local soft state, so it must land on the leader. A
-    // follower forwards there (the sidecar heartbeats any member); only if no
-    // leader is known yet — mid-election — do we accept best-effort locally.
-    if !s.control_plane.is_leader() {
+    // follower forwards there (the sidecar heartbeats any member); if no leader
+    // is known yet — mid-election — or the request already hopped once, we
+    // accept best-effort locally.
+    if !s.control_plane.is_leader() && may_forward(&headers) {
         if let Some(leader) = s.control_plane.leader_addr() {
-            let url = format!("{}/v1/nodes/{}/heartbeat", leader.trim_end_matches('/'), id);
-            return forwarded(s.http.post(url).json(&report))
-                .await
-                .into_response();
+            let url = leader_v1(&leader, &format!("/nodes/{id}/heartbeat"));
+            return forwarded(s.http.post(url).json(&report)).await;
         }
     }
     let health = s.membership.heartbeat(&id, now_ms(), report);
@@ -305,15 +352,19 @@ async fn heartbeat(
 
 /// `DELETE /v1/nodes/{id}` — begin draining a node. The reconciler evacuates its
 /// replicas/leadership onto healthy nodes; the operator removes it once empty.
-async fn remove_node(State(s): State<BrainState>, Path(id): Path<String>) -> Response {
+async fn remove_node(
+    State(s): State<BrainState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     if let Some(resp) = unavailable(&s) {
         return resp.into_response();
     }
     // Draining is leader-local intent; forward from a follower to the leader.
-    if !s.control_plane.is_leader() {
+    if !s.control_plane.is_leader() && may_forward(&headers) {
         if let Some(leader) = s.control_plane.leader_addr() {
-            let url = format!("{}/v1/nodes/{}", leader.trim_end_matches('/'), id);
-            return forwarded(s.http.delete(url)).await.into_response();
+            let url = leader_v1(&leader, &format!("/nodes/{id}"));
+            return forwarded(s.http.delete(url)).await;
         }
     }
     let known = s.membership.drain(&id);
@@ -350,6 +401,7 @@ async fn list_policies(State(s): State<BrainState>) -> Json<Value> {
 /// that owns a namespace.
 async fn set_policy(
     State(s): State<BrainState>,
+    headers: HeaderMap,
     Json(update): Json<PlacementPolicyUpdate>,
 ) -> Response {
     if let Some(resp) = unavailable(&s) {
@@ -364,13 +416,11 @@ async fn set_policy(
     // computes placements), so a policy posted to a follower must land on the
     // leader — previously it was applied to the follower's local map only and
     // silently never took effect. Same forwarding contract as /v1/scale.
-    if !s.control_plane.is_leader() {
+    if !s.control_plane.is_leader() && may_forward(&headers) {
         match s.control_plane.leader_addr() {
             Some(leader) => {
-                let url = format!("{}/v1/policies", leader.trim_end_matches('/'));
-                return forwarded(s.http.post(url).json(&update))
-                    .await
-                    .into_response();
+                let url = leader_v1(&leader, "/policies");
+                return forwarded(s.http.post(url).json(&update)).await;
             }
             None => {
                 return Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
@@ -394,7 +444,11 @@ async fn set_policy(
 /// `POST /v1/scale` — set the desired scale plan; the reconciler picks it up on
 /// its next tick. `replication_factor` is fixed at RF=3 for the multi-cloud
 /// baseline.
-async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Response {
+async fn set_scale(
+    State(s): State<BrainState>,
+    headers: HeaderMap,
+    Json(mut plan): Json<ScalePlan>,
+) -> Response {
     if let Some(resp) = unavailable(&s) {
         return resp.into_response();
     }
@@ -409,13 +463,11 @@ async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>)
         return Json(json!({ "ok": true, "plan": plan })).into_response();
     }
     match s.control_plane.leader_addr() {
-        Some(leader) => {
-            let url = format!("{}/v1/scale", leader.trim_end_matches('/'));
-            forwarded(s.http.post(url).json(&plan))
-                .await
-                .into_response()
+        Some(leader) if may_forward(&headers) => {
+            let url = leader_v1(&leader, "/scale");
+            forwarded(s.http.post(url).json(&plan)).await
         }
-        None => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
+        _ => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
             .into_response(),
     }
 }
@@ -551,6 +603,7 @@ mod tests {
         let resp = heartbeat(
             State(s.clone()),
             Path("liar".to_string()),
+            HeaderMap::new(),
             Some(Json(HeartbeatReport {
                 hosted_shards: vec![0, 0, 500],
                 leading_shards: vec![0, 500, 3],
@@ -575,6 +628,7 @@ mod tests {
         let resp = heartbeat(
             State(s.clone()),
             Path("node-a".to_string()),
+            HeaderMap::new(),
             Some(Json(HeartbeatReport::default())),
         )
         .await;
@@ -584,11 +638,17 @@ mod tests {
             "a failed-closed member must not record heartbeats"
         );
 
-        let resp = remove_node(State(s.clone()), Path("node-a".to_string())).await;
+        let resp = remove_node(
+            State(s.clone()),
+            Path("node-a".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let resp = set_scale(
             State(s.clone()),
+            HeaderMap::new(),
             Json(ScalePlan {
                 target_nodes: 9,
                 replication_factor: 3,
@@ -604,6 +664,7 @@ mod tests {
 
         let resp = set_policy(
             State(s.clone()),
+            HeaderMap::new(),
             Json(PlacementPolicyUpdate {
                 namespace: "tenant-a".to_string(),
                 home_region: Some("us-east-1".to_string()),
@@ -626,7 +687,9 @@ mod tests {
         let leader_url = format!("http://{}", listener.local_addr().unwrap());
         let app = router(leader.clone());
         tokio::spawn(async move {
-            axum::serve(listener, axum::Router::new().nest("/v1", app))
+            // Followers forward to the leader's PEER plane, where main.rs mounts
+            // the /v1 router under /forward — mirror that contract here.
+            axum::serve(listener, axum::Router::new().nest("/forward/v1", app))
                 .await
                 .unwrap();
         });
@@ -640,6 +703,7 @@ mod tests {
 
         let resp = set_policy(
             State(follower.clone()),
+            HeaderMap::new(),
             Json(PlacementPolicyUpdate {
                 namespace: "tenant-a".to_string(),
                 home_region: Some("us-east-1".to_string()),
@@ -668,6 +732,7 @@ mod tests {
         }));
         let resp = set_policy(
             State(follower.clone()),
+            HeaderMap::new(),
             Json(PlacementPolicyUpdate {
                 namespace: "tenant-a".to_string(),
                 home_region: None,
@@ -681,19 +746,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_already_forwarded_request_is_never_reforwarded() {
+        // Two members with transiently inconsistent leader views could ping-pong
+        // a forward forever; the FORWARDED_HEADER marker caps it at one hop. A
+        // follower seeing the marker answers locally (best-effort) even though it
+        // knows a "leader" — here an unroutable one, so re-forwarding would 502.
+        let follower = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: false,
+            leader_addr: Some("http://192.0.2.1:1".to_string()), // TEST-NET, never routable
+        }));
+        let mut hopped = HeaderMap::new();
+        hopped.insert(FORWARDED_HEADER, "1".parse().unwrap());
+
+        let resp = heartbeat(
+            State(follower.clone()),
+            Path("node-a".to_string()),
+            hopped.clone(),
+            Some(Json(HeartbeatReport::default())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            follower.membership.snapshot().len(),
+            1,
+            "the marked heartbeat is applied locally instead of re-forwarded"
+        );
+
+        let resp = list_nodes(State(follower), hopped).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a marked read answers from the local snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn an_available_leader_still_accepts_heartbeats_and_drain() {
         let s = leader_state();
 
         let resp = heartbeat(
             State(s.clone()),
             Path("node-a".to_string()),
+            HeaderMap::new(),
             Some(Json(HeartbeatReport::default())),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(s.membership.snapshot().len(), 1);
 
-        let resp = remove_node(State(s.clone()), Path("node-a".to_string())).await;
+        let resp = remove_node(
+            State(s.clone()),
+            Path("node-a".to_string()),
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(s.membership.snapshot()[0].health, NodeHealth::Draining);
     }
