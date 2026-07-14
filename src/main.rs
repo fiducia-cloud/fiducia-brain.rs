@@ -138,13 +138,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The replicated peer plane is cross-cluster reachable. It has no
         // unauthenticated mode: abort before opening state or binding ports.
         let raft_secret = raft_driver::RaftSecret::from_env()?;
-        let id = std::env::var("FIDUCIA_BRAIN_ID")
-            .unwrap_or_else(|_| format!("http://localhost:{port}"));
+        // A member's id doubles as the address other members dial it at: it is
+        // the `leader_id` gossiped in Raft messages, and a follower forwards
+        // /v1 writes to `{leader_id}/forward/v1/...` on the peer plane. It MUST
+        // therefore be this member's dialable peer-plane URL. A display name
+        // (e.g. `fiducia-brain-0.civo`) leaves followers with a leader address
+        // they cannot reach, silently blackholing every forwarded
+        // heartbeat/scale/drain — the leader then only ever learns about nodes
+        // whose sidecars happen to heartbeat it directly.
+        let id = normalize_member_url(
+            &std::env::var("FIDUCIA_BRAIN_ID").unwrap_or_else(|_| format!("localhost:{port}")),
+        );
         // Peers must EXCLUDE self. Operators commonly list every member
         // (including this one) in FIDUCIA_BRAIN_PEERS, so filter our own id out
         // — otherwise quorum is inflated (a 3-member group would wrongly need
         // all 3, losing fault tolerance) and the member would RPC itself.
-        let peers: Vec<String> = peers.into_iter().filter(|p| p != &id).collect();
+        // Normalized like the id, so the self-compare can't miss on a scheme
+        // mismatch and every peer is dialable.
+        let peers: Vec<String> = peers
+            .into_iter()
+            .map(|p| normalize_member_url(&p))
+            .filter(|p| p != &id)
+            .collect();
         let data_dir =
             std::env::var("FIDUCIA_DATA_DIR").unwrap_or_else(|_| "/tmp/fiducia-brain".to_string());
         // Fail closed: if we can't open our durable Raft home, we must not run.
