@@ -732,6 +732,7 @@ mod tests {
         }));
         let resp = set_policy(
             State(follower.clone()),
+            HeaderMap::new(),
             Json(PlacementPolicyUpdate {
                 namespace: "tenant-a".to_string(),
                 home_region: None,
@@ -742,6 +743,42 @@ mod tests {
         // Mid-election: refuse rather than apply somewhere it will never be read.
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(follower.placement.policies_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_already_forwarded_request_is_never_reforwarded() {
+        // Two members with transiently inconsistent leader views could ping-pong
+        // a forward forever; the FORWARDED_HEADER marker caps it at one hop. A
+        // follower seeing the marker answers locally (best-effort) even though it
+        // knows a "leader" — here an unroutable one, so re-forwarding would 502.
+        let follower = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: false,
+            leader_addr: Some("http://192.0.2.1:1".to_string()), // TEST-NET, never routable
+        }));
+        let mut hopped = HeaderMap::new();
+        hopped.insert(FORWARDED_HEADER, "1".parse().unwrap());
+
+        let resp = heartbeat(
+            State(follower.clone()),
+            Path("node-a".to_string()),
+            hopped.clone(),
+            Some(Json(HeartbeatReport::default())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            follower.membership.snapshot().len(),
+            1,
+            "the marked heartbeat is applied locally instead of re-forwarded"
+        );
+
+        let resp = list_nodes(State(follower), hopped).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a marked read answers from the local snapshot"
+        );
     }
 
     #[tokio::test]
