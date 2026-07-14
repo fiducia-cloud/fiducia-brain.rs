@@ -444,7 +444,11 @@ async fn set_policy(
 /// `POST /v1/scale` — set the desired scale plan; the reconciler picks it up on
 /// its next tick. `replication_factor` is fixed at RF=3 for the multi-cloud
 /// baseline.
-async fn set_scale(State(s): State<BrainState>, Json(mut plan): Json<ScalePlan>) -> Response {
+async fn set_scale(
+    State(s): State<BrainState>,
+    headers: HeaderMap,
+    Json(mut plan): Json<ScalePlan>,
+) -> Response {
     if let Some(resp) = unavailable(&s) {
         return resp.into_response();
     }
