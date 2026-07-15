@@ -130,6 +130,13 @@ replicas per node · even **leaders** per node (the real write hotspot).
 > brain Raft cluster. Membership heartbeats are intentionally soft state and
 > are rebuilt at the elected leader.
 
+> **Invariant: the brain's Raft has no message-bus dependency.** Brain↔brain
+> RPC is JSON-over-HTTP on the `/raft` peer plane (`FIDUCIA_BRAIN_PEERS`,
+> bearer-authenticated); node heartbeats arrive over HTTP via the sidecar; the
+> liveness oracle talks to the Kubernetes API. NATS delivers application events
+> elsewhere in the platform and is deliberately absent here — a broker outage
+> must never stall control-plane consensus or placement decisions.
+
 ## Configuration (env surface)
 
 Everything is configured through environment variables. Secrets are marked; see
