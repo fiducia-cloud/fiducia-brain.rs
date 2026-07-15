@@ -98,6 +98,7 @@ impl KubeOracle {
         let driver = oracle.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(POLL_INTERVAL);
+            let mut consecutive_failures = 0u64;
             loop {
                 tick.tick().await;
                 if let Some(body) = api.list_node_pods().await {
@@ -105,9 +106,23 @@ impl KubeOracle {
                     let mut cache = driver.cache.write().unwrap();
                     cache.pods = pods;
                     cache.updated_at = Some(Instant::now());
+                    if consecutive_failures > 0 {
+                        tracing::info!(consecutive_failures, "k8s liveness oracle recovered");
+                        consecutive_failures = 0;
+                    }
+                } else {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    // Log immediately and then once per minute. The cache ages
+                    // to Unknown/fail-safe behavior after STALE_AFTER; operators
+                    // still need to know the topology signal disappeared.
+                    if consecutive_failures == 1 || consecutive_failures.is_multiple_of(20) {
+                        tracing::warn!(
+                            consecutive_failures,
+                            stale_after_seconds = STALE_AFTER.as_secs(),
+                            "k8s liveness oracle refresh failed; cached evidence will expire"
+                        );
+                    }
                 }
-                // On failure we simply don't refresh; the cache ages out via
-                // STALE_AFTER and `liveness()` reverts to Unknown (timeouts).
             }
         });
         Some(oracle)

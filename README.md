@@ -34,6 +34,9 @@ follow others. Nodes deliberately do **not** decide *which* machines host
 - **Rebalancing** — keeps replica counts and leadership spread evenly so no
   node becomes a write hotspot; after failover, the brain can restore leader
   affinity when the original, preferred leader is healthy again.
+- **Observable liveness fallback** — Kubernetes oracle refresh failures age to
+  `Unknown` rather than declaring nodes dead; the first failure, sustained
+  failures, and recovery are emitted through shared telemetry.
 
 This mirrors the "placement driver" pattern: TiKV's **PD** and CockroachDB's
 control plane do the same thing for their range/region maps.
