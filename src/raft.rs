@@ -1209,4 +1209,56 @@ mod tests {
         );
         assert!(c.node(&lagger).commit_index() >= commit);
     }
+
+    #[test]
+    fn five_member_group_requires_three_reachable_members_to_commit() {
+        let mut c = Cluster::new(5);
+        let leader = c.elect();
+        let followers: Vec<_> = c.ids().into_iter().filter(|id| *id != leader).collect();
+        for id in followers.iter().skip(1) {
+            c.down.insert(id.clone());
+        }
+
+        let before = c.node(&leader).commit_index();
+        let proposed = c.node(&leader).propose(plan(55)).unwrap();
+        c.pump();
+        assert_eq!(
+            c.node(&leader).commit_index(),
+            before,
+            "leader plus one follower is not a majority of five"
+        );
+
+        c.down.remove(&followers[1]);
+        for _ in 0..4 {
+            c.tick_all();
+            c.pump();
+        }
+        assert!(
+            c.node(&leader).commit_index() >= proposed,
+            "restoring a third member lets the pending entry commit"
+        );
+    }
+
+    #[test]
+    fn healed_old_leader_steps_down_and_catches_up_to_the_new_term() {
+        let mut c = Cluster::new(3);
+        let old_leader = c.elect();
+        c.down.insert(old_leader.clone());
+
+        let new_leader = c.elect();
+        assert_ne!(new_leader, old_leader);
+        c.node(&new_leader).propose(plan(77)).unwrap();
+        c.pump();
+
+        c.down.remove(&old_leader);
+        for _ in 0..8 {
+            c.tick_all();
+            c.pump();
+        }
+
+        assert_eq!(c.leaders().len(), 1, "healing must not leave two leaders");
+        assert!(c.applied[&old_leader]
+            .iter()
+            .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 77)));
+    }
 }
