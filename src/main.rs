@@ -8,9 +8,11 @@
 //! replication factor). Data-plane [`fiducia-node`] processes heartbeat to the
 //! brain and fetch the placement map they should host.
 //!
-//! Failure detection (Healthy→Suspect→Dead), the placement math
-//! ([`plan`]), and the reconciliation loop are implemented; what remains is
-//! replicating the brain's *own* state in its own Raft group (HA), tracked below.
+//! Failure detection (Healthy→Suspect→Dead), the placement math ([`plan`]), and
+//! the reconciliation loop are implemented. The brain's *own* durable state
+//! (placement map + scale plan) is replicated in its own Raft group when
+//! `FIDUCIA_BRAIN_PEERS` is set ([`raft_driver`]); unset, a single-member
+//! control plane keeps the same interface with no replication (local dev).
 
 mod api;
 mod cluster;
@@ -70,8 +72,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // factor. Everything else reads this.
     let cluster = config::ClusterConfig::from_env();
 
-    // Desired cluster shape. Shared (so `POST /v1/scale` can adjust it live); in a
-    // real deployment this is persisted in the brain's own Raft group.
+    // Desired cluster shape. Shared (so `POST /v1/scale` can adjust it live). In
+    // replicated mode the live value is Raft-replicated via `SetScalePlan` and
+    // restored from the WAL snapshot at boot — the env value only seeds a fresh
+    // cluster (and fully drives single-member/local-dev mode).
     let target_nodes = std::env::var("FIDUCIA_TARGET_NODES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -154,7 +158,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // — otherwise quorum is inflated (a 3-member group would wrongly need
         // all 3, losing fault tolerance) and the member would RPC itself.
         // Normalized like the id, so the self-compare can't miss on a scheme
-        // mismatch and every peer is dialable.
+        // or trailing-slash mismatch (which would silently inflate quorum and
+        // cost a whole failure domain of tolerance) and every peer is dialable.
         let peers: Vec<String> = peers
             .into_iter()
             .map(|p| normalize_member_url(&p))
@@ -180,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             membership.clone(),
             placement.clone(),
             plan.clone(),
-        );
+        )?;
         rcp.spawn();
         (rcp.clone(), Some(rcp))
     };
@@ -202,11 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         placement,
         plan: plan.clone(),
         control_plane: control_plane.clone(),
-        // Short-timeout client for forwarding follower writes/heartbeats to the leader.
+        // Short-timeout client for forwarding follower writes/heartbeats to the
+        // leader. Fail fast at startup rather than fall back to an untimed
+        // default client that would let a hung leader stall forwarded requests.
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
             .build()
-            .unwrap_or_default(),
+            .expect("failed to build the leader-forwarding HTTP client"),
     };
 
     // Reusable hardening stack (outermost last): catch handler panics → 500,

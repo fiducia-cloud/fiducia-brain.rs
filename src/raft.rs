@@ -178,13 +178,22 @@ pub struct Ready {
     /// If set (after receiving an InstallSnapshot), the driver must **reset** its
     /// state machine to these snapshot bytes before applying `committed`.
     pub restore: Option<Vec<u8>>,
+    /// The engine's `last_applied` when this batch was handed out — the index the
+    /// state machine reflected *before* applying `committed`. Consecutive `ready`
+    /// calls chain: one call's `applied_upto` is the next call's `applied_from`,
+    /// so the driver can apply racing batches in strict log order.
+    pub applied_from: u64,
     /// The engine's `last_applied` after this batch — the index the state machine
-    /// now reflects. The driver compacts no further than this (a safe snapshot point).
+    /// now reflects. The driver compacts no further than this (a safe snapshot
+    /// point). May exceed `applied_from` by more than `committed.len()`: no-op
+    /// entries (a new leader's term marker) advance the index without carrying a
+    /// command.
     pub applied_upto: u64,
     /// Messages to send to peers (after persisting).
     pub messages: Vec<Addressed>,
-    /// Newly-committed commands to apply to the state machine (after persisting).
-    pub committed: Vec<Command>,
+    /// Newly-committed `(log index, command)` pairs to apply to the state machine
+    /// (after persisting), in index order.
+    pub committed: Vec<(u64, Command)>,
 }
 
 /// The fixed-membership single-group Raft state machine.
@@ -755,12 +764,25 @@ impl Raft {
 
     /// Ship the current snapshot to a follower that has fallen behind the log base.
     fn send_snapshot(&mut self, peer: &NodeId) {
+        // Reaching here implies compaction happened (`next <= base_index`), and
+        // both `compact` and WAL recovery guarantee a snapshot exists beside a
+        // non-zero base. Guard anyway: shipping empty bytes would install a bogus
+        // empty state machine on the follower, while skipping merely retries on a
+        // later tick.
+        let Some(data) = self.snapshot.clone() else {
+            debug_assert!(
+                false,
+                "send_snapshot with no snapshot (base_index={})",
+                self.base_index
+            );
+            return;
+        };
         let req = InstallSnapshotReq {
             term: self.current_term,
             leader_id: self.id.clone(),
             last_included_index: self.base_index,
             last_included_term: self.base_term,
-            data: self.snapshot.clone().unwrap_or_default(),
+            data,
         };
         self.send(peer, RaftMessage::InstallSnapshot(req));
     }
@@ -869,18 +891,20 @@ impl Raft {
         } else {
             None
         };
+        let applied_from = self.last_applied;
         let mut committed = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             if let Some(slot) = self.log_slot(self.last_applied) {
                 if let Some(cmd) = &self.log[slot].command {
-                    committed.push(cmd.clone());
+                    committed.push((self.last_applied, cmd.clone()));
                 }
             }
         }
         Ready {
             persist,
             restore,
+            applied_from,
             applied_upto: self.last_applied,
             messages,
             committed,
@@ -972,7 +996,10 @@ mod tests {
                         // harness, record the bytes (a real driver would reload them).
                         self.snapshots.insert(id.clone(), data);
                     }
-                    self.applied.get_mut(&id).unwrap().extend(ready.committed);
+                    self.applied
+                        .get_mut(&id)
+                        .unwrap()
+                        .extend(ready.committed.into_iter().map(|(_, cmd)| cmd));
                     for m in ready.messages {
                         queue.push((id.clone(), m));
                     }
@@ -1122,7 +1149,7 @@ mod tests {
             ready
                 .committed
                 .iter()
-                .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 42)),
+                .any(|(_, cmd)| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 42)),
             "a restarted member replays its committed log into a fresh state machine"
         );
     }

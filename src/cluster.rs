@@ -1,9 +1,9 @@
 //! Replication & leadership seam — where the brain's **own Raft** plugs in.
 //!
 //! All *durable* brain state — the shard placement map and the operator's scale
-//! plan, plus node-removal decisions — is meant to live in the brain's own Raft
-//! group (a 3-member group, one per cloud) so the control plane survives losing a
-//! brain node and can see membership across all three clusters. This module is the
+//! plan, plus node-removal decisions — lives in the brain's own Raft group (a
+//! 3-member group, one per cloud) so the control plane survives losing a brain
+//! node and can see membership across all three clusters. This module is the
 //! socket that engine drops into; the rest of the brain talks to it, never to a
 //! consensus library directly.
 //!
@@ -19,10 +19,14 @@
 //!     ask `is_leader()` so **only the leader reconciles** (this is what makes
 //!     running more than one brain replica safe instead of split-brain).
 //!
-//! [`LocalControlPlane`] is the single-member implementation in use today: a
-//! degenerate one-node Raft — always leader, applies synchronously in-process.
-//! It is correct on its own, and swapping in the replicated engine extracted from
-//! `fiducia-node` is a drop-in (same trait, same `Command`).
+//! Both implementations are live today, selected at startup by
+//! `FIDUCIA_BRAIN_PEERS` (see `main.rs`):
+//! [`crate::raft_driver::RaftControlPlane`] is the replicated engine — a
+//! purpose-built brain Raft (`crate::raft`; deliberately a *separate*
+//! implementation from `fiducia-node`'s multi-Raft, so the two codebases evolve
+//! independently) with a durable WAL. [`LocalControlPlane`] is the single-member
+//! fallback for local dev / one-box runs: a degenerate one-node Raft — always
+//! leader, applies synchronously in-process. Same trait, same `Command`.
 
 use std::sync::{Arc, Mutex};
 
