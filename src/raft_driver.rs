@@ -982,6 +982,93 @@ mod tests {
         );
     }
 
+    /// A WAL failure during **compaction** must fail the member closed while
+    /// leaving the pre-compaction engine — and everything already durable —
+    /// intact: compaction persists a *candidate* compacted engine before
+    /// installing it in memory, so an aborted compaction can never lose a
+    /// committed entry. A fresh store reopen recovers the full log.
+    #[test]
+    fn wal_failure_during_compaction_fails_closed_without_losing_committed_entries() {
+        let dir = unique_dir("compaction-fail");
+        let (store, restored) = RaftStore::open(&dir).unwrap();
+        let (membership, placement, plan) = handles();
+        let cp = RaftControlPlane::new(
+            "http://brain-0:8095".to_string(),
+            vec![],
+            cfg(),
+            Some(store),
+            restored,
+            Transport::Disabled,
+            test_secret(),
+            membership,
+            placement,
+            plan.clone(),
+        )
+        .expect("driver");
+        elect_self(&cp);
+
+        // Drive committed entries past COMPACT_LOG_THRESHOLD on the engine and
+        // persist them with saves still healthy. (The drain path compacts in
+        // the same drain that crosses the threshold, so going through
+        // `propose` could never leave a durable, uncompacted, over-threshold
+        // log behind — the shape needed to make the *compaction* save the
+        // first one to fail.)
+        let commit_index = {
+            let mut engine = cp.engine.lock().unwrap();
+            for i in 0..COMPACT_LOG_THRESHOLD as u32 {
+                engine
+                    .propose(Command::SetScalePlan(ScalePlan {
+                        target_nodes: 100 + i,
+                        replication_factor: 3,
+                    }))
+                    .expect("leader propose");
+            }
+            let snapshot = engine.persisted_snapshot();
+            cp.store
+                .as_ref()
+                .unwrap()
+                .save(&snapshot)
+                .expect("persist the over-threshold log while saves are healthy");
+            assert!(engine.log_len() >= COMPACT_LOG_THRESHOLD);
+            assert_eq!(engine.base_index(), 0, "nothing compacted yet");
+            snapshot.commit_index
+        };
+        let live_before = cp.engine.lock().unwrap().log_len();
+
+        // Now every save fails — the next one attempted is compaction's.
+        cp.store.as_ref().unwrap().fail_saves_for_test();
+        assert!(
+            cp.maybe_compact(commit_index).is_err(),
+            "failed compaction persist must surface as an error"
+        );
+
+        // Fail closed, with the in-memory pre-compaction engine untouched.
+        assert!(!cp.is_available());
+        assert!(!cp.is_leader());
+        {
+            let engine = cp.engine.lock().unwrap();
+            assert_eq!(engine.log_len(), live_before, "log prefix not dropped");
+            assert_eq!(engine.base_index(), 0, "candidate compaction not installed");
+        }
+        assert!(!cp.propose(Command::SetScalePlan(ScalePlan {
+            target_nodes: 999,
+            replication_factor: 3,
+        })));
+
+        // A fresh reopen of the same directory recovers every committed entry:
+        // the aborted compaction wrote nothing, so nothing was lost.
+        let (_s, reread) = RaftStore::open(&dir).unwrap();
+        assert_eq!(reread.commit_index, commit_index);
+        assert_eq!(reread.base_index, 0);
+        assert_eq!(reread.log.len(), commit_index as usize);
+        assert!(reread.log.iter().any(|e| matches!(
+            &e.command,
+            Some(Command::SetScalePlan(p))
+                if p.target_nodes == 100 + COMPACT_LOG_THRESHOLD as u32 - 1
+        )));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Regression: committed batches must apply to the state machine in log
     /// order even when concurrent drains race to the apply point. A later batch
     /// arriving first must WAIT for its predecessor — applying it early would let

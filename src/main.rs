@@ -368,6 +368,50 @@ mod member_url_tests {
             "https://brain.civo.fiducia.cloud:9095"
         );
     }
+
+    /// Membership identity contract: an already-normal URL is a fixed point
+    /// (normalization is idempotent), and every spelling of the same member —
+    /// schemeless, trailing-slashed, whitespace-padded — converges to one
+    /// canonical id. Raft member ids are compared as strings, so two spellings
+    /// that failed to converge would look like two distinct members.
+    #[test]
+    fn normalization_is_idempotent_and_converges_member_spellings() {
+        // Already-normal URLs pass through byte-for-byte…
+        let canonical = "http://brain.vultr.fiducia.cloud:9095";
+        assert_eq!(normalize_member_url(canonical), canonical);
+        // …so normalizing twice never drifts.
+        for input in [
+            "brain.vultr.fiducia.cloud:9095",
+            "http://172.18.0.2:30095/",
+            " https://brain.civo.fiducia.cloud:9095 ",
+            "10.0.0.7:9095//",
+        ] {
+            let once = normalize_member_url(input);
+            assert_eq!(normalize_member_url(&once), once, "not idempotent: {input}");
+        }
+
+        // Every spelling of one member yields the same canonical id.
+        let spellings = [
+            "brain.vultr.fiducia.cloud:9095",
+            "brain.vultr.fiducia.cloud:9095/",
+            "http://brain.vultr.fiducia.cloud:9095",
+            "http://brain.vultr.fiducia.cloud:9095/",
+            "  http://brain.vultr.fiducia.cloud:9095/  ",
+        ];
+        for spelling in spellings {
+            assert_eq!(
+                normalize_member_url(spelling),
+                canonical,
+                "spelling {spelling:?} must converge to the canonical member id"
+            );
+        }
+
+        // And http/https remain distinct members (the scheme is meaningful).
+        assert_ne!(
+            normalize_member_url("https://brain.vultr.fiducia.cloud:9095"),
+            canonical
+        );
+    }
 }
 
 #[cfg(test)]
