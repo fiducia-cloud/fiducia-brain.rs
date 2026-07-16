@@ -1130,6 +1130,64 @@ mod tests {
         }
     }
 
+    /// The split-brain shape the other election tests don't pin: a leader that
+    /// is partitioned away keeps accepting local proposals (it cannot know
+    /// better), a successor is elected and commits in a higher term, and on
+    /// heal the deposed leader must step down, discard its stale uncommitted
+    /// entry, and converge on the successor's history — the stale write must
+    /// never be applied by ANY member.
+    #[test]
+    fn deposed_leader_write_is_discarded_after_new_term_commits() {
+        let mut c = Cluster::new(3);
+        let old = c.elect();
+        c.node(&old).propose(plan(1)).unwrap();
+        c.pump();
+
+        // Partition the leader away; the surviving majority elects + commits.
+        c.down.insert(old.clone());
+        let new = c.elect();
+        assert_ne!(new, old);
+        c.node(&new).propose(plan(2)).unwrap();
+        c.pump();
+
+        // The danger moment: the isolated old leader still believes it leads
+        // and appends a stale proposal to its own log.
+        c.node(&old)
+            .propose(plan(99))
+            .expect("an isolated leader cannot know it was deposed yet");
+
+        // Heal. The successor's higher-term traffic must depose the old leader
+        // and overwrite its stale suffix.
+        c.down.remove(&old);
+        for _ in 0..10 {
+            c.tick_all();
+            c.pump();
+        }
+
+        assert_eq!(c.leaders(), vec![new.clone()], "exactly one leader survives");
+
+        for id in c.ids() {
+            assert!(
+                c.applied[&id]
+                    .iter()
+                    .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 2)),
+                "{id} must apply the successor's committed write"
+            );
+            assert!(
+                !c.applied[&id]
+                    .iter()
+                    .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 99)),
+                "{id} applied the deposed leader's stale write"
+            );
+        }
+
+        // And the deposed member now refuses proposals, pointing at the leader.
+        match c.node(&old).propose(plan(3)) {
+            Err(hint) => assert_eq!(hint.as_ref(), Some(&new), "leader hint after step-down"),
+            Ok(_) => panic!("a deposed leader must not accept proposals"),
+        }
+    }
+
     #[test]
     fn restart_recovers_committed_state_from_persisted_log() {
         let mut c = Cluster::new(3);
