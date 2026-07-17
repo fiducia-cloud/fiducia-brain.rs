@@ -1164,7 +1164,11 @@ mod tests {
             c.pump();
         }
 
-        assert_eq!(c.leaders(), vec![new.clone()], "exactly one leader survives");
+        assert_eq!(
+            c.leaders(),
+            vec![new.clone()],
+            "exactly one leader survives"
+        );
 
         for id in c.ids() {
             assert!(
