@@ -19,7 +19,7 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use axum::http::{HeaderMap, StatusCode};
@@ -65,10 +65,13 @@ pub enum Transport {
 impl Transport {
     pub fn http(secret: RaftSecret) -> Self {
         Transport::Http {
+            // Fail fast at startup: falling back to `Client::default()` would
+            // silently drop the timeout, letting a hung peer stall RPC tasks
+            // indefinitely.
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(2))
                 .build()
-                .unwrap_or_default(),
+                .expect("failed to build the Raft peer HTTP client"),
             secret,
         }
     }
@@ -108,6 +111,56 @@ impl RaftSecret {
     }
 }
 
+/// POST one Raft RPC to `{base}{path}` and decode the JSON reply.
+///
+/// Raft tolerates lost messages (the engine retries on later ticks), so failures
+/// map to `None` — but they are logged at `warn` first. A silently unreachable
+/// peer plane (wrong `FIDUCIA_BRAIN_RAFT_SECRET`, DNS/TLS breakage, a peer that
+/// answers with non-JSON) previously produced *no* log line at all, which made a
+/// total consensus outage — no elected leader, ever — invisible to operators.
+async fn post_rpc<Req, Resp>(
+    client: &reqwest::Client,
+    secret: &RaftSecret,
+    base: &str,
+    path: &str,
+    rpc: &'static str,
+    req: &Req,
+) -> Option<Resp>
+where
+    Req: Serialize,
+    Resp: serde::de::DeserializeOwned,
+{
+    let url = format!("{base}{path}");
+    let resp = match client
+        .post(&url)
+        .bearer_auth(secret.as_str())
+        .json(req)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!(peer = %url, rpc, error = %err, "raft: peer RPC failed to send");
+            return None;
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        tracing::warn!(
+            peer = %url, rpc, %status,
+            "raft: peer rejected RPC (on 401, check FIDUCIA_BRAIN_RAFT_SECRET on both members)"
+        );
+        return None;
+    }
+    match resp.json::<Resp>().await {
+        Ok(decoded) => Some(decoded),
+        Err(err) => {
+            tracing::warn!(peer = %url, rpc, error = %err, "raft: peer RPC reply failed to decode");
+            None
+        }
+    }
+}
+
 /// Send one Raft *request* to a peer and return its *response* message. Responses
 /// (`*Resp`) are never sent proactively — they ride back as the HTTP reply to the
 /// originating request — so they map to `None` here.
@@ -118,39 +171,19 @@ async fn http_send(
     msg: RaftMessage,
 ) -> Option<RaftMessage> {
     let base = to.trim_end_matches('/');
-    let auth = |req: reqwest::RequestBuilder| req.bearer_auth(secret.as_str());
     match msg {
-        RaftMessage::RequestVote(req) => {
-            let resp: RequestVoteResp = auth(client.post(format!("{base}/raft/vote")).json(&req))
-                .send()
-                .await
-                .ok()?
-                .json()
-                .await
-                .ok()?;
-            Some(RaftMessage::RequestVoteResp(resp))
-        }
+        RaftMessage::RequestVote(req) => post_rpc(client, secret, base, "/raft/vote", "vote", &req)
+            .await
+            .map(RaftMessage::RequestVoteResp),
         RaftMessage::AppendEntries(req) => {
-            let resp: AppendEntriesResp =
-                auth(client.post(format!("{base}/raft/append")).json(&req))
-                    .send()
-                    .await
-                    .ok()?
-                    .json()
-                    .await
-                    .ok()?;
-            Some(RaftMessage::AppendEntriesResp(resp))
+            post_rpc(client, secret, base, "/raft/append", "append", &req)
+                .await
+                .map(RaftMessage::AppendEntriesResp)
         }
         RaftMessage::InstallSnapshot(req) => {
-            let resp: InstallSnapshotResp =
-                auth(client.post(format!("{base}/raft/snapshot")).json(&req))
-                    .send()
-                    .await
-                    .ok()?
-                    .json()
-                    .await
-                    .ok()?;
-            Some(RaftMessage::InstallSnapshotResp(resp))
+            post_rpc(client, secret, base, "/raft/snapshot", "snapshot", &req)
+                .await
+                .map(RaftMessage::InstallSnapshotResp)
         }
         RaftMessage::RequestVoteResp(_)
         | RaftMessage::AppendEntriesResp(_)
@@ -175,10 +208,15 @@ pub struct RaftControlPlane {
     /// Serializes WAL writes so concurrent delivers can't race on the temp file
     /// or persist an older snapshot after a newer one.
     io_lock: Mutex<()>,
-    /// Serializes state-machine mutation (snapshot restore + committed apply) so
-    /// concurrent delivers can't interleave a restore's clear+rebuild with another
-    /// drain's apply and leave the placement map torn.
-    apply_lock: Mutex<()>,
+    /// Highest log index the state machine currently reflects. Committed batches
+    /// are applied in strict index order: concurrent drains each carry a disjoint
+    /// batch handed out in commit order under the engine lock, but they can reach
+    /// the apply point in any order, and applying a stale batch after a newer one
+    /// would clobber newer placement/scale state (the leader's reconcile loop
+    /// re-derives it, but a follower's copy would stay wrong until the next
+    /// restore). Waiters block on `apply_cv` until their predecessor has applied.
+    apply_watermark: Mutex<u64>,
+    apply_cv: Condvar,
     // State-machine handles the committed log is applied to.
     membership: Arc<Membership>,
     placement: Arc<Placement>,
@@ -198,10 +236,24 @@ impl RaftControlPlane {
         membership: Arc<Membership>,
         placement: Arc<Placement>,
         plan: Arc<Mutex<ScalePlan>>,
-    ) -> Arc<Self> {
+    ) -> io::Result<Arc<Self>> {
+        // Recovery: entries at or below `base_index` exist only inside the WAL
+        // snapshot — the log no longer has them. The engine resumes replay from
+        // `base_index`, so the snapshot must be folded into the live state machine
+        // here, or a compacted-and-restarted member would serve an empty placement
+        // map (and regress the scale plan) until the next leader InstallSnapshot.
+        if let Some(snapshot) = &restored.snapshot {
+            restore_state_machine(snapshot, &placement, &plan).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to restore the state machine from the WAL snapshot: {err}"),
+                )
+            })?;
+        }
+        let apply_watermark = restored.base_index;
         let engine = Raft::new(id.clone(), peers, cfg, seed_from(&id), restored);
         let (outbox, rx) = mpsc::unbounded_channel();
-        Arc::new(RaftControlPlane {
+        Ok(Arc::new(RaftControlPlane {
             engine: Mutex::new(engine),
             store,
             transport,
@@ -210,11 +262,12 @@ impl RaftControlPlane {
             outbox,
             outbox_rx: Mutex::new(Some(rx)),
             io_lock: Mutex::new(()),
-            apply_lock: Mutex::new(()),
+            apply_watermark: Mutex::new(apply_watermark),
+            apply_cv: Condvar::new(),
             membership,
             placement,
             plan,
-        })
+        }))
     }
 
     pub fn is_available(&self) -> bool {
@@ -225,6 +278,9 @@ impl RaftControlPlane {
         if self.available.swap(false, Ordering::SeqCst) {
             tracing::error!(%reason, "raft: control plane is unavailable until restart");
         }
+        // Wake any drain waiting for an earlier batch to apply — that batch may
+        // never arrive now; waiters re-check availability and bail.
+        self.apply_cv.notify_all();
     }
 
     /// Spawn the background tick loop and outbox sender. Call once.
@@ -243,7 +299,11 @@ impl RaftControlPlane {
                     engine.tick();
                     engine.ready()
                 };
-                let _ = ticker.drain(ready, None);
+                if ticker.drain(ready, None).is_err() {
+                    // drain() already failed closed (logged, member unavailable
+                    // until restart) — stop ticking instead of spinning on it.
+                    break;
+                }
             }
         });
 
@@ -279,6 +339,8 @@ impl RaftControlPlane {
             engine.step(from, resp);
             engine.ready()
         };
+        // A drain failure has already failed closed (logged + unavailable until
+        // restart); there is no response to route for a background delivery.
         let _ = self.drain(ready, None);
     }
 
@@ -319,24 +381,68 @@ impl RaftControlPlane {
             }
         }
 
-        // Serialize state-machine mutation: a snapshot restore (clear + rebuild)
-        // must not interleave with another concurrent drain's committed apply, or
-        // the placement map is left torn. (Reset to an installed snapshot first,
-        // since an InstallSnapshot jumps us past compacted entries, then apply any
-        // newer committed entries on top.)
-        {
-            let _apply = self.apply_lock.lock().unwrap();
+        // Serialize state-machine mutation IN LOG ORDER (see `apply_watermark`).
+        // A restore (clear + rebuild to an installed snapshot) never waits: the
+        // engine only accepts a snapshot strictly beyond both its base and commit
+        // indices, so a restore always jumps the watermark *forward*, past any
+        // batch that could still be in flight; newer committed entries then apply
+        // on top. A plain batch waits until the watermark reaches its
+        // `applied_from`, so batches apply oldest-first even when concurrent
+        // drains race to this point. Note `applied_upto > applied_from` with an
+        // empty `committed` is real (a new leader's no-op term marker) and must
+        // still advance the watermark, or every later batch would wait forever.
+        if ready.restore.is_some() || ready.applied_upto > ready.applied_from {
+            let mut watermark = self.apply_watermark.lock().unwrap();
             if !self.is_available() {
                 return Err(());
             }
             if let Some(data) = &ready.restore {
-                if let Err(err) = restore_state_machine(data, &self.placement, &self.plan) {
-                    self.fail_closed(format_args!("failed to restore Raft snapshot: {err}"));
+                if ready.applied_upto >= *watermark {
+                    if let Err(err) = restore_state_machine(data, &self.placement, &self.plan) {
+                        self.fail_closed(format_args!("failed to restore Raft snapshot: {err}"));
+                        return Err(());
+                    }
+                    for (_, command) in ready.committed {
+                        apply_command(&self.membership, &self.placement, &self.plan, command);
+                    }
+                    *watermark = ready.applied_upto;
+                } else {
+                    // Unreachable per the engine's stale-snapshot guard; never
+                    // regress the state machine if it somehow happens.
+                    tracing::warn!(
+                        applied_upto = ready.applied_upto,
+                        watermark = *watermark,
+                        "raft: ignored a stale snapshot restore"
+                    );
+                }
+                self.apply_cv.notify_all();
+            } else {
+                // Wait for every earlier batch (watermark reaches applied_from).
+                // The timeout is a liveness backstop: if the predecessor's drain
+                // failed closed, waiters wake, observe unavailability, and bail.
+                while *watermark < ready.applied_from {
+                    if !self.is_available() {
+                        return Err(());
+                    }
+                    (watermark, _) = self
+                        .apply_cv
+                        .wait_timeout(watermark, Duration::from_millis(50))
+                        .unwrap();
+                }
+                if !self.is_available() {
                     return Err(());
                 }
-            }
-            for command in ready.committed {
-                apply_command(&self.membership, &self.placement, &self.plan, command);
+                // Apply only entries the state machine hasn't seen: a restore can
+                // have jumped the watermark past part (or all) of this batch.
+                for (index, command) in ready.committed {
+                    if index > *watermark {
+                        apply_command(&self.membership, &self.placement, &self.plan, command);
+                    }
+                }
+                if ready.applied_upto > *watermark {
+                    *watermark = ready.applied_upto;
+                }
+                self.apply_cv.notify_all();
             }
         }
 
@@ -660,7 +766,8 @@ mod tests {
             membership,
             placement,
             plan.clone(),
-        );
+        )
+        .expect("driver");
 
         elect_self(&cp);
         assert!(cp.is_leader());
@@ -705,7 +812,8 @@ mod tests {
                 membership,
                 placement,
                 plan,
-            );
+            )
+            .expect("driver");
             elect_self(&cp);
             assert!(cp.propose(Command::SetScalePlan(ScalePlan {
                 target_nodes: 11,
@@ -732,7 +840,8 @@ mod tests {
             membership,
             placement,
             plan.clone(),
-        );
+        )
+        .expect("driver");
         // The first drain replays the committed log into the state machine.
         tick(&cp);
         assert_eq!(
@@ -792,7 +901,8 @@ mod tests {
                 membership,
                 placement,
                 plan.clone(),
-            );
+            )
+            .expect("driver");
             cp.spawn();
             let app = raft_router(cp.clone());
             tokio::spawn(async move {
@@ -854,7 +964,8 @@ mod tests {
             membership,
             placement,
             plan.clone(),
-        );
+        )
+        .expect("driver");
         elect_self(&cp);
         cp.store.as_ref().unwrap().fail_saves_for_test();
 
@@ -869,5 +980,242 @@ mod tests {
             3,
             "unpersisted command must not be applied"
         );
+    }
+
+    /// A WAL failure during **compaction** must fail the member closed while
+    /// leaving the pre-compaction engine — and everything already durable —
+    /// intact: compaction persists a *candidate* compacted engine before
+    /// installing it in memory, so an aborted compaction can never lose a
+    /// committed entry. A fresh store reopen recovers the full log.
+    #[test]
+    fn wal_failure_during_compaction_fails_closed_without_losing_committed_entries() {
+        let dir = unique_dir("compaction-fail");
+        let (store, restored) = RaftStore::open(&dir).unwrap();
+        let (membership, placement, plan) = handles();
+        let cp = RaftControlPlane::new(
+            "http://brain-0:8095".to_string(),
+            vec![],
+            cfg(),
+            Some(store),
+            restored,
+            Transport::Disabled,
+            test_secret(),
+            membership,
+            placement,
+            plan.clone(),
+        )
+        .expect("driver");
+        elect_self(&cp);
+
+        // Drive committed entries past COMPACT_LOG_THRESHOLD on the engine and
+        // persist them with saves still healthy. (The drain path compacts in
+        // the same drain that crosses the threshold, so going through
+        // `propose` could never leave a durable, uncompacted, over-threshold
+        // log behind — the shape needed to make the *compaction* save the
+        // first one to fail.)
+        let commit_index = {
+            let mut engine = cp.engine.lock().unwrap();
+            for i in 0..COMPACT_LOG_THRESHOLD as u32 {
+                engine
+                    .propose(Command::SetScalePlan(ScalePlan {
+                        target_nodes: 100 + i,
+                        replication_factor: 3,
+                    }))
+                    .expect("leader propose");
+            }
+            let snapshot = engine.persisted_snapshot();
+            cp.store
+                .as_ref()
+                .unwrap()
+                .save(&snapshot)
+                .expect("persist the over-threshold log while saves are healthy");
+            assert!(engine.log_len() >= COMPACT_LOG_THRESHOLD);
+            assert_eq!(engine.base_index(), 0, "nothing compacted yet");
+            snapshot.commit_index
+        };
+        let live_before = cp.engine.lock().unwrap().log_len();
+
+        // Now every save fails — the next one attempted is compaction's.
+        cp.store.as_ref().unwrap().fail_saves_for_test();
+        assert!(
+            cp.maybe_compact(commit_index).is_err(),
+            "failed compaction persist must surface as an error"
+        );
+
+        // Fail closed, with the in-memory pre-compaction engine untouched.
+        assert!(!cp.is_available());
+        assert!(!cp.is_leader());
+        {
+            let engine = cp.engine.lock().unwrap();
+            assert_eq!(engine.log_len(), live_before, "log prefix not dropped");
+            assert_eq!(engine.base_index(), 0, "candidate compaction not installed");
+        }
+        assert!(!cp.propose(Command::SetScalePlan(ScalePlan {
+            target_nodes: 999,
+            replication_factor: 3,
+        })));
+
+        // A fresh reopen of the same directory recovers every committed entry:
+        // the aborted compaction wrote nothing, so nothing was lost.
+        let (_s, reread) = RaftStore::open(&dir).unwrap();
+        assert_eq!(reread.commit_index, commit_index);
+        assert_eq!(reread.base_index, 0);
+        assert_eq!(reread.log.len(), commit_index as usize);
+        assert!(reread.log.iter().any(|e| matches!(
+            &e.command,
+            Some(Command::SetScalePlan(p))
+                if p.target_nodes == 100 + COMPACT_LOG_THRESHOLD as u32 - 1
+        )));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: committed batches must apply to the state machine in log
+    /// order even when concurrent drains race to the apply point. A later batch
+    /// arriving first must WAIT for its predecessor — applying it early would let
+    /// the older batch clobber newer placement/scale state on a follower.
+    #[test]
+    fn committed_batches_apply_in_log_order_even_when_drains_race() {
+        let (membership, placement, plan) = handles();
+        let cp = RaftControlPlane::new(
+            "http://brain-0:8095".to_string(),
+            vec![],
+            cfg(),
+            None,
+            Persisted::default(),
+            Transport::Disabled,
+            test_secret(),
+            membership,
+            placement,
+            plan.clone(),
+        )
+        .expect("driver");
+
+        let batch = |from: u64, upto: u64, nodes: u32| Ready {
+            persist: None,
+            restore: None,
+            applied_from: from,
+            applied_upto: upto,
+            messages: Vec::new(),
+            committed: vec![(
+                upto,
+                Command::SetScalePlan(ScalePlan {
+                    target_nodes: nodes,
+                    replication_factor: 3,
+                }),
+            )],
+        };
+
+        // Deliver the NEWER batch (entry 3) from another thread first; it must
+        // block until the older work has been applied.
+        let racer = {
+            let cp = cp.clone();
+            std::thread::spawn(move || cp.drain(batch(2, 3, 20), None))
+        };
+        // Give the racer time to reach the apply point and (correctly) wait.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            plan.lock().unwrap().target_nodes,
+            3,
+            "the out-of-order batch must not have applied yet"
+        );
+
+        // Entry 1 carries a command; entry 2 is a leader no-op (empty committed,
+        // but applied_upto still advances — it must move the watermark, or the
+        // racer above would wait forever).
+        cp.drain(batch(0, 1, 10), None).expect("drain batch 1");
+        cp.drain(
+            Ready {
+                persist: None,
+                restore: None,
+                applied_from: 1,
+                applied_upto: 2,
+                messages: Vec::new(),
+                committed: Vec::new(),
+            },
+            None,
+        )
+        .expect("drain the no-op batch");
+        racer.join().unwrap().expect("drain batch 3");
+
+        assert_eq!(
+            plan.lock().unwrap().target_nodes,
+            20,
+            "the newest committed batch must win once all have applied in order"
+        );
+    }
+
+    /// Regression: after compaction, entries at or below `base_index` exist only
+    /// in the WAL snapshot. A restarted member must fold that snapshot back into
+    /// its (fresh, empty) state machine at construction — otherwise it serves an
+    /// empty placement map / default scale plan until the next InstallSnapshot.
+    #[test]
+    fn boot_restores_the_state_machine_from_the_wal_snapshot() {
+        let snapshot = serde_json::to_vec(&StateSnapshot {
+            shards: Vec::new(),
+            plan: ScalePlan {
+                target_nodes: 17,
+                replication_factor: 3,
+            },
+        })
+        .unwrap();
+        let restored = Persisted {
+            current_term: 3,
+            voted_for: None,
+            commit_index: 5,
+            log: Vec::new(),
+            base_index: 5,
+            base_term: 3,
+            snapshot: Some(snapshot),
+        };
+
+        let (membership, placement, plan) = handles();
+        assert_eq!(plan.lock().unwrap().target_nodes, 3, "starts at default");
+        let _cp = RaftControlPlane::new(
+            "http://brain-0:8095".to_string(),
+            vec![],
+            cfg(),
+            None,
+            restored,
+            Transport::Disabled,
+            test_secret(),
+            membership,
+            placement,
+            plan.clone(),
+        )
+        .expect("driver");
+        assert_eq!(
+            plan.lock().unwrap().target_nodes,
+            17,
+            "scale plan folded back from the WAL snapshot at construction"
+        );
+    }
+
+    /// A corrupt WAL snapshot must refuse construction (fail closed) rather than
+    /// come up with a silently-empty state machine.
+    #[test]
+    fn boot_with_a_corrupt_wal_snapshot_fails_closed() {
+        let restored = Persisted {
+            current_term: 3,
+            voted_for: None,
+            commit_index: 5,
+            log: Vec::new(),
+            base_index: 5,
+            base_term: 3,
+            snapshot: Some(b"not json".to_vec()),
+        };
+        let (membership, placement, plan) = handles();
+        assert!(RaftControlPlane::new(
+            "http://brain-0:8095".to_string(),
+            vec![],
+            cfg(),
+            None,
+            restored,
+            Transport::Disabled,
+            test_secret(),
+            membership,
+            placement,
+            plan,
+        )
+        .is_err());
     }
 }

@@ -85,8 +85,8 @@ async fn forwarded(req: reqwest::RequestBuilder) -> Response {
     let req = crate::internal_auth::attach(req).header(FORWARDED_HEADER, "1");
     match req.send().await {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16())
-                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = resp
                 .json::<Value>()
                 .await

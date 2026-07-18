@@ -178,13 +178,22 @@ pub struct Ready {
     /// If set (after receiving an InstallSnapshot), the driver must **reset** its
     /// state machine to these snapshot bytes before applying `committed`.
     pub restore: Option<Vec<u8>>,
+    /// The engine's `last_applied` when this batch was handed out — the index the
+    /// state machine reflected *before* applying `committed`. Consecutive `ready`
+    /// calls chain: one call's `applied_upto` is the next call's `applied_from`,
+    /// so the driver can apply racing batches in strict log order.
+    pub applied_from: u64,
     /// The engine's `last_applied` after this batch — the index the state machine
-    /// now reflects. The driver compacts no further than this (a safe snapshot point).
+    /// now reflects. The driver compacts no further than this (a safe snapshot
+    /// point). May exceed `applied_from` by more than `committed.len()`: no-op
+    /// entries (a new leader's term marker) advance the index without carrying a
+    /// command.
     pub applied_upto: u64,
     /// Messages to send to peers (after persisting).
     pub messages: Vec<Addressed>,
-    /// Newly-committed commands to apply to the state machine (after persisting).
-    pub committed: Vec<Command>,
+    /// Newly-committed `(log index, command)` pairs to apply to the state machine
+    /// (after persisting), in index order.
+    pub committed: Vec<(u64, Command)>,
 }
 
 /// The fixed-membership single-group Raft state machine.
@@ -755,12 +764,25 @@ impl Raft {
 
     /// Ship the current snapshot to a follower that has fallen behind the log base.
     fn send_snapshot(&mut self, peer: &NodeId) {
+        // Reaching here implies compaction happened (`next <= base_index`), and
+        // both `compact` and WAL recovery guarantee a snapshot exists beside a
+        // non-zero base. Guard anyway: shipping empty bytes would install a bogus
+        // empty state machine on the follower, while skipping merely retries on a
+        // later tick.
+        let Some(data) = self.snapshot.clone() else {
+            debug_assert!(
+                false,
+                "send_snapshot with no snapshot (base_index={})",
+                self.base_index
+            );
+            return;
+        };
         let req = InstallSnapshotReq {
             term: self.current_term,
             leader_id: self.id.clone(),
             last_included_index: self.base_index,
             last_included_term: self.base_term,
-            data: self.snapshot.clone().unwrap_or_default(),
+            data,
         };
         self.send(peer, RaftMessage::InstallSnapshot(req));
     }
@@ -869,18 +891,20 @@ impl Raft {
         } else {
             None
         };
+        let applied_from = self.last_applied;
         let mut committed = Vec::new();
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             if let Some(slot) = self.log_slot(self.last_applied) {
                 if let Some(cmd) = &self.log[slot].command {
-                    committed.push(cmd.clone());
+                    committed.push((self.last_applied, cmd.clone()));
                 }
             }
         }
         Ready {
             persist,
             restore,
+            applied_from,
             applied_upto: self.last_applied,
             messages,
             committed,
@@ -972,7 +996,10 @@ mod tests {
                         // harness, record the bytes (a real driver would reload them).
                         self.snapshots.insert(id.clone(), data);
                     }
-                    self.applied.get_mut(&id).unwrap().extend(ready.committed);
+                    self.applied
+                        .get_mut(&id)
+                        .unwrap()
+                        .extend(ready.committed.into_iter().map(|(_, cmd)| cmd));
                     for m in ready.messages {
                         queue.push((id.clone(), m));
                     }
@@ -1103,6 +1130,68 @@ mod tests {
         }
     }
 
+    /// The split-brain shape the other election tests don't pin: a leader that
+    /// is partitioned away keeps accepting local proposals (it cannot know
+    /// better), a successor is elected and commits in a higher term, and on
+    /// heal the deposed leader must step down, discard its stale uncommitted
+    /// entry, and converge on the successor's history — the stale write must
+    /// never be applied by ANY member.
+    #[test]
+    fn deposed_leader_write_is_discarded_after_new_term_commits() {
+        let mut c = Cluster::new(3);
+        let old = c.elect();
+        c.node(&old).propose(plan(1)).unwrap();
+        c.pump();
+
+        // Partition the leader away; the surviving majority elects + commits.
+        c.down.insert(old.clone());
+        let new = c.elect();
+        assert_ne!(new, old);
+        c.node(&new).propose(plan(2)).unwrap();
+        c.pump();
+
+        // The danger moment: the isolated old leader still believes it leads
+        // and appends a stale proposal to its own log.
+        c.node(&old)
+            .propose(plan(99))
+            .expect("an isolated leader cannot know it was deposed yet");
+
+        // Heal. The successor's higher-term traffic must depose the old leader
+        // and overwrite its stale suffix.
+        c.down.remove(&old);
+        for _ in 0..10 {
+            c.tick_all();
+            c.pump();
+        }
+
+        assert_eq!(
+            c.leaders(),
+            vec![new.clone()],
+            "exactly one leader survives"
+        );
+
+        for id in c.ids() {
+            assert!(
+                c.applied[&id]
+                    .iter()
+                    .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 2)),
+                "{id} must apply the successor's committed write"
+            );
+            assert!(
+                !c.applied[&id]
+                    .iter()
+                    .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 99)),
+                "{id} applied the deposed leader's stale write"
+            );
+        }
+
+        // And the deposed member now refuses proposals, pointing at the leader.
+        match c.node(&old).propose(plan(3)) {
+            Err(hint) => assert_eq!(hint.as_ref(), Some(&new), "leader hint after step-down"),
+            Ok(_) => panic!("a deposed leader must not accept proposals"),
+        }
+    }
+
     #[test]
     fn restart_recovers_committed_state_from_persisted_log() {
         let mut c = Cluster::new(3);
@@ -1122,7 +1211,7 @@ mod tests {
             ready
                 .committed
                 .iter()
-                .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 42)),
+                .any(|(_, cmd)| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 42)),
             "a restarted member replays its committed log into a fresh state machine"
         );
     }
@@ -1208,5 +1297,57 @@ mod tests {
             "follower restored the snapshot bytes the leader sent"
         );
         assert!(c.node(&lagger).commit_index() >= commit);
+    }
+
+    #[test]
+    fn five_member_group_requires_three_reachable_members_to_commit() {
+        let mut c = Cluster::new(5);
+        let leader = c.elect();
+        let followers: Vec<_> = c.ids().into_iter().filter(|id| *id != leader).collect();
+        for id in followers.iter().skip(1) {
+            c.down.insert(id.clone());
+        }
+
+        let before = c.node(&leader).commit_index();
+        let proposed = c.node(&leader).propose(plan(55)).unwrap();
+        c.pump();
+        assert_eq!(
+            c.node(&leader).commit_index(),
+            before,
+            "leader plus one follower is not a majority of five"
+        );
+
+        c.down.remove(&followers[1]);
+        for _ in 0..4 {
+            c.tick_all();
+            c.pump();
+        }
+        assert!(
+            c.node(&leader).commit_index() >= proposed,
+            "restoring a third member lets the pending entry commit"
+        );
+    }
+
+    #[test]
+    fn healed_old_leader_steps_down_and_catches_up_to_the_new_term() {
+        let mut c = Cluster::new(3);
+        let old_leader = c.elect();
+        c.down.insert(old_leader.clone());
+
+        let new_leader = c.elect();
+        assert_ne!(new_leader, old_leader);
+        c.node(&new_leader).propose(plan(77)).unwrap();
+        c.pump();
+
+        c.down.remove(&old_leader);
+        for _ in 0..8 {
+            c.tick_all();
+            c.pump();
+        }
+
+        assert_eq!(c.leaders().len(), 1, "healing must not leave two leaders");
+        assert!(c.applied[&old_leader]
+            .iter()
+            .any(|cmd| matches!(cmd, Command::SetScalePlan(p) if p.target_nodes == 77)));
     }
 }

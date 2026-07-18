@@ -7,9 +7,17 @@ GitHub Actions pipelines for fiducia-brain:
   sources are checked out at the immutable revisions documented in the root
   README.
 - `docker.yml` — build and push the non-root service container image on push to
-  `main`, using those same immutable sibling revisions.
-- `deploy-test.yml` — fail-closed deploy to the TEST environment;
-  `KUBE_CONFIG_TEST` is mandatory, and missing, invalid, or empty credentials,
-  a missing target, or an incomplete rollout fail the job.
+  `main`, using those same immutable sibling revisions, a commit-SHA-only tag,
+  maximum provenance, and an SBOM.
 - `cli-flags.yml` — audits `.cli-flags.toml` with the pinned `flags2env`
   submodule whenever the CLI flag schema, scripts, or submodule change.
+
+Cluster deployment is intentionally absent and belongs to `fiducia-monorepo`.
+
+## Security baseline
+
+Every executable workflow uses explicit least-privilege permissions, immutable
+third-party action or container references, non-persisted checkout credentials,
+concurrency control, and a job timeout. The main CI workflow validates this
+directory with the digest-pinned actionlint container. Environment mutation is
+forbidden unless this README documents a repository-specific platform exception.
