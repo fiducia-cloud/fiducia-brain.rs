@@ -360,7 +360,7 @@ async fn ready(available: bool) -> (StatusCode, Json<Value>) {
 
 #[cfg(test)]
 mod member_url_tests {
-    use super::normalize_member_url;
+    use super::{normalize_member_url, resolve_peers};
 
     #[test]
     fn schemeless_authorities_get_http_and_urls_pass_through() {
