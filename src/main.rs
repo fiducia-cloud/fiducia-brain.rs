@@ -421,6 +421,34 @@ mod member_url_tests {
             canonical
         );
     }
+
+    /// Peer resolution must yield exactly the distinct OTHER members, so
+    /// `members = peers.len()+1` and the quorum derived from it are correct.
+    /// Self (in any spelling) and duplicates are dropped; first-occurrence order
+    /// is preserved.
+    #[test]
+    fn resolve_peers_excludes_self_and_dedupes() {
+        let self_id = normalize_member_url("brain.hetzner.fiducia.cloud:9095");
+        let raw = vec![
+            "brain.civo.fiducia.cloud:9095".to_string(),
+            // self, listed as a bare authority + trailing slash — must be dropped
+            "brain.hetzner.fiducia.cloud:9095/".to_string(),
+            // duplicate of the first peer, whitespace-padded — must collapse to one
+            "  http://brain.civo.fiducia.cloud:9095  ".to_string(),
+            "brain.vultr.fiducia.cloud:9095".to_string(),
+        ];
+        let peers = resolve_peers(raw, &self_id);
+        assert_eq!(
+            peers,
+            vec![
+                "http://brain.civo.fiducia.cloud:9095".to_string(),
+                "http://brain.vultr.fiducia.cloud:9095".to_string(),
+            ],
+            "resolve_peers must drop self + duplicates and preserve order"
+        );
+        // A 3-member group (2 peers + self) → quorum 2, fault-tolerant to 1 loss.
+        assert_eq!(peers.len() + 1, 3);
+    }
 }
 
 #[cfg(test)]
