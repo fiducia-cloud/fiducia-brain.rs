@@ -628,6 +628,51 @@ mod tests {
         }
     }
 
+    // Regression (backlog C3): losing contact with EVERY node at once — a
+    // partition, a mass failover, or a wall-clock jump that trips the dead timeout
+    // for all nodes in one sweep — must NOT wipe placement. The nodes stay KNOWN
+    // (as Dead), so the "unknown replica" shrink guard does not fire; without a
+    // degraded-membership floor, `plan_replicas(current, [], rf)` returns empty and
+    // every shard commits `replicas: []` → total fleet unavailability. Hold the
+    // last-known placement until healthy nodes reappear.
+    #[test]
+    fn total_node_loss_does_not_wipe_shard_placement() {
+        let s = scheduler(4, 3);
+        for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner")] {
+            s.membership.heartbeat(&id.to_string(), 0, hb(dom));
+        }
+        s.reconcile();
+        // Every shard is placed at RF before the failure.
+        for shard in 0..4 {
+            assert_eq!(
+                s.placement.get(shard).map(|a| a.replicas.len()),
+                Some(3),
+                "shard {shard} placed at RF before failure"
+            );
+        }
+        let generation_before = s.placement.generation();
+
+        // Every node goes silent and is swept Dead in one tick (still KNOWN).
+        s.membership.sweep(1_000_000);
+        s.reconcile();
+
+        for shard in 0..4 {
+            let a = s
+                .placement
+                .get(shard)
+                .expect("placement retained on total node loss");
+            assert!(
+                !a.replicas.is_empty(),
+                "shard {shard} must NOT be wiped to empty replicas when all nodes are Dead"
+            );
+        }
+        assert_eq!(
+            s.placement.generation(),
+            generation_before,
+            "no placement rewrite may be proposed when there are no healthy nodes to place on"
+        );
+    }
+
     #[test]
     fn scale_up_rebalance_moves_some_replicas_to_a_new_node() {
         let s = scheduler(12, 3);
