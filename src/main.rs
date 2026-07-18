@@ -153,18 +153,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let id = normalize_member_url(
             &std::env::var("FIDUCIA_BRAIN_ID").unwrap_or_else(|_| format!("localhost:{port}")),
         );
-        // Peers must EXCLUDE self. Operators commonly list every member
-        // (including this one) in FIDUCIA_BRAIN_PEERS, so filter our own id out
-        // — otherwise quorum is inflated (a 3-member group would wrongly need
-        // all 3, losing fault tolerance) and the member would RPC itself.
-        // Normalized like the id, so the self-compare can't miss on a scheme
-        // or trailing-slash mismatch (which would silently inflate quorum and
-        // cost a whole failure domain of tolerance) and every peer is dialable.
-        let peers: Vec<String> = peers
-            .into_iter()
-            .map(|p| normalize_member_url(&p))
-            .filter(|p| p != &id)
-            .collect();
+        // Normalize, self-exclude, and de-duplicate the configured peer list
+        // (see `resolve_peers`) so quorum counts exactly the distinct other members.
+        let peers: Vec<String> = resolve_peers(peers, &id);
         let data_dir =
             std::env::var("FIDUCIA_DATA_DIR").unwrap_or_else(|_| "/tmp/fiducia-brain".to_string());
         // Fail closed: if we can't open our durable Raft home, we must not run.
