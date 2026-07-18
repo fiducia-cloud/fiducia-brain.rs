@@ -193,6 +193,22 @@ impl Scheduler {
                 .collect();
             let desired = plan_replicas(&current_replicas, &slots, rf);
 
+            // Degraded-membership floor. The guard above holds a shard whose
+            // replicas aren't all KNOWN yet, but a mass failure — partition, a
+            // wall-clock jump that sweeps every node Dead in one tick (see
+            // `scheduler::now_ms`), or simply losing more nodes than RF — leaves
+            // the failed nodes KNOWN-as-Dead, so that guard passes while
+            // `healthy_ids` has too few (often zero) candidates. `plan_replicas`
+            // then returns fewer replicas than we currently hold (empty, at the
+            // limit), and committing that would take live shards offline. When
+            // healthy candidates are below RF, never shrink a shard's live replica
+            // set below `min(current, rf)`; hold it until healthy nodes reappear.
+            if healthy_ids.len() < rf as usize
+                && desired.len() < current_replicas.len().min(rf as usize)
+            {
+                continue;
+            }
+
             // Maintain load as if this plan is in effect (helps the next shard spread).
             for r in &current_replicas {
                 if let Some(l) = load.get_mut(r) {
@@ -626,6 +642,51 @@ mod tests {
             );
             assert_eq!(a.replicas.len(), 3, "shard {shard} restored to RF");
         }
+    }
+
+    // Regression (backlog C3): losing contact with EVERY node at once — a
+    // partition, a mass failover, or a wall-clock jump that trips the dead timeout
+    // for all nodes in one sweep — must NOT wipe placement. The nodes stay KNOWN
+    // (as Dead), so the "unknown replica" shrink guard does not fire; without a
+    // degraded-membership floor, `plan_replicas(current, [], rf)` returns empty and
+    // every shard commits `replicas: []` → total fleet unavailability. Hold the
+    // last-known placement until healthy nodes reappear.
+    #[test]
+    fn total_node_loss_does_not_wipe_shard_placement() {
+        let s = scheduler(4, 3);
+        for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner")] {
+            s.membership.heartbeat(&id.to_string(), 0, hb(dom));
+        }
+        s.reconcile();
+        // Every shard is placed at RF before the failure.
+        for shard in 0..4 {
+            assert_eq!(
+                s.placement.get(shard).map(|a| a.replicas.len()),
+                Some(3),
+                "shard {shard} placed at RF before failure"
+            );
+        }
+        let generation_before = s.placement.generation();
+
+        // Every node goes silent and is swept Dead in one tick (still KNOWN).
+        s.membership.sweep(1_000_000);
+        s.reconcile();
+
+        for shard in 0..4 {
+            let a = s
+                .placement
+                .get(shard)
+                .expect("placement retained on total node loss");
+            assert!(
+                !a.replicas.is_empty(),
+                "shard {shard} must NOT be wiped to empty replicas when all nodes are Dead"
+            );
+        }
+        assert_eq!(
+            s.placement.generation(),
+            generation_before,
+            "no placement rewrite may be proposed when there are no healthy nodes to place on"
+        );
     }
 
     #[test]
