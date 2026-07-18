@@ -193,6 +193,22 @@ impl Scheduler {
                 .collect();
             let desired = plan_replicas(&current_replicas, &slots, rf);
 
+            // Degraded-membership floor. The guard above holds a shard whose
+            // replicas aren't all KNOWN yet, but a mass failure — partition, a
+            // wall-clock jump that sweeps every node Dead in one tick (see
+            // `scheduler::now_ms`), or simply losing more nodes than RF — leaves
+            // the failed nodes KNOWN-as-Dead, so that guard passes while
+            // `healthy_ids` has too few (often zero) candidates. `plan_replicas`
+            // then returns fewer replicas than we currently hold (empty, at the
+            // limit), and committing that would take live shards offline. When
+            // healthy candidates are below RF, never shrink a shard's live replica
+            // set below `min(current, rf)`; hold it until healthy nodes reappear.
+            if healthy_ids.len() < rf as usize
+                && desired.len() < current_replicas.len().min(rf as usize)
+            {
+                continue;
+            }
+
             // Maintain load as if this plan is in effect (helps the next shard spread).
             for r in &current_replicas {
                 if let Some(l) = load.get_mut(r) {
