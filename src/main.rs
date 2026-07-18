@@ -309,6 +309,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Normalize, self-exclude, and de-duplicate the configured peer list, preserving
+/// first-occurrence order. Operators commonly list every member (including this
+/// one, and sometimes a member twice, or as a scheme/trailing-slash variant) in
+/// `FIDUCIA_BRAIN_PEERS`. Left as-is, each stray entry inflates
+/// `members = peers.len()+1`, so quorum counts a phantom member: commit math
+/// over-counts a single follower's ack, and — because votes are tracked in a set —
+/// a duplicate can push the quorum threshold above the number of *distinct* voters,
+/// so no leader can ever be elected. Normalizing first makes the self-compare and
+/// the dedup robust to scheme/slash mismatches.
+fn resolve_peers(raw: impl IntoIterator<Item = String>, self_id: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter()
+        .map(|p| normalize_member_url(&p))
+        .filter(|p| p != self_id)
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
+}
+
 /// Brain members address each other by URL (Raft RPCs and follower→leader /v1
 /// forwarding both dial it). Operators commonly write peers as bare authorities
 /// (`brain.vultr.fiducia.cloud:9095`), which reqwest refuses — default the
