@@ -153,18 +153,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let id = normalize_member_url(
             &std::env::var("FIDUCIA_BRAIN_ID").unwrap_or_else(|_| format!("localhost:{port}")),
         );
-        // Peers must EXCLUDE self. Operators commonly list every member
-        // (including this one) in FIDUCIA_BRAIN_PEERS, so filter our own id out
-        // — otherwise quorum is inflated (a 3-member group would wrongly need
-        // all 3, losing fault tolerance) and the member would RPC itself.
-        // Normalized like the id, so the self-compare can't miss on a scheme
-        // or trailing-slash mismatch (which would silently inflate quorum and
-        // cost a whole failure domain of tolerance) and every peer is dialable.
-        let peers: Vec<String> = peers
-            .into_iter()
-            .map(|p| normalize_member_url(&p))
-            .filter(|p| p != &id)
-            .collect();
+        // Normalize, self-exclude, and de-duplicate the configured peer list
+        // (see `resolve_peers`) so quorum counts exactly the distinct other members.
+        let peers: Vec<String> = resolve_peers(peers, &id);
         let data_dir =
             std::env::var("FIDUCIA_DATA_DIR").unwrap_or_else(|_| "/tmp/fiducia-brain".to_string());
         // Fail closed: if we can't open our durable Raft home, we must not run.
@@ -318,6 +309,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Normalize, self-exclude, and de-duplicate the configured peer list, preserving
+/// first-occurrence order. Operators commonly list every member (including this
+/// one, and sometimes a member twice, or as a scheme/trailing-slash variant) in
+/// `FIDUCIA_BRAIN_PEERS`. Left as-is, each stray entry inflates
+/// `members = peers.len()+1`, so quorum counts a phantom member: commit math
+/// over-counts a single follower's ack, and — because votes are tracked in a set —
+/// a duplicate can push the quorum threshold above the number of *distinct* voters,
+/// so no leader can ever be elected. Normalizing first makes the self-compare and
+/// the dedup robust to scheme/slash mismatches.
+fn resolve_peers(raw: impl IntoIterator<Item = String>, self_id: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter()
+        .map(|p| normalize_member_url(&p))
+        .filter(|p| p != self_id)
+        .filter(|p| seen.insert(p.clone()))
+        .collect()
+}
+
 /// Brain members address each other by URL (Raft RPCs and follower→leader /v1
 /// forwarding both dial it). Operators commonly write peers as bare authorities
 /// (`brain.vultr.fiducia.cloud:9095`), which reqwest refuses — default the
@@ -351,7 +360,7 @@ async fn ready(available: bool) -> (StatusCode, Json<Value>) {
 
 #[cfg(test)]
 mod member_url_tests {
-    use super::normalize_member_url;
+    use super::{normalize_member_url, resolve_peers};
 
     #[test]
     fn schemeless_authorities_get_http_and_urls_pass_through() {
@@ -411,6 +420,34 @@ mod member_url_tests {
             normalize_member_url("https://brain.vultr.fiducia.cloud:9095"),
             canonical
         );
+    }
+
+    /// Peer resolution must yield exactly the distinct OTHER members, so
+    /// `members = peers.len()+1` and the quorum derived from it are correct.
+    /// Self (in any spelling) and duplicates are dropped; first-occurrence order
+    /// is preserved.
+    #[test]
+    fn resolve_peers_excludes_self_and_dedupes() {
+        let self_id = normalize_member_url("brain.hetzner.fiducia.cloud:9095");
+        let raw = vec![
+            "brain.civo.fiducia.cloud:9095".to_string(),
+            // self, listed as a bare authority + trailing slash — must be dropped
+            "brain.hetzner.fiducia.cloud:9095/".to_string(),
+            // duplicate of the first peer, whitespace-padded — must collapse to one
+            "  http://brain.civo.fiducia.cloud:9095  ".to_string(),
+            "brain.vultr.fiducia.cloud:9095".to_string(),
+        ];
+        let peers = resolve_peers(raw, &self_id);
+        assert_eq!(
+            peers,
+            vec![
+                "http://brain.civo.fiducia.cloud:9095".to_string(),
+                "http://brain.vultr.fiducia.cloud:9095".to_string(),
+            ],
+            "resolve_peers must drop self + duplicates and preserve order"
+        );
+        // A 3-member group (2 peers + self) → quorum 2, fault-tolerant to 1 loss.
+        assert_eq!(peers.len() + 1, 3);
     }
 }
 
