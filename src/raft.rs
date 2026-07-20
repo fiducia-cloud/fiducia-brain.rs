@@ -196,6 +196,17 @@ pub struct Ready {
     pub committed: Vec<(u64, Command)>,
 }
 
+/// Do this request's entries form a contiguous run starting at
+/// `prev_log_index + 1`, none of them ahead of the sender's term? Everything a
+/// real leader sends does; anything else is malformed (or forged) and is rejected
+/// before it can reach the log.
+fn entries_are_contiguous(req: &AppendEntriesReq) -> bool {
+    req.entries.iter().enumerate().all(|(i, entry)| {
+        entry.index == req.prev_log_index.saturating_add(1).saturating_add(i as u64)
+            && entry.term <= req.term
+    })
+}
+
 /// The fixed-membership single-group Raft state machine.
 #[derive(Clone)]
 pub struct Raft {
@@ -225,6 +236,8 @@ pub struct Raft {
 
     // Candidate / pre-candidate vote tally (includes self).
     votes: HashSet<NodeId>,
+    // Leader check-quorum: peers that answered since the last check window.
+    acked_since_check: HashSet<NodeId>,
 
     // Leader replication bookkeeping.
     next_index: HashMap<NodeId, u64>,
@@ -272,6 +285,7 @@ impl Raft {
             leader_id: None,
             pending_restore: false,
             votes: HashSet::new(),
+            acked_since_check: HashSet::new(),
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             election_elapsed: 0,
@@ -325,7 +339,12 @@ impl Raft {
     }
 
     fn last_index(&self) -> u64 {
-        self.log.last().map(|e| e.index).unwrap_or(self.base_index)
+        // Derived from the log's *length*, never from an entry's `index` field: a
+        // peer-supplied entry could otherwise claim any index and make this
+        // disagree with the slab, turning every later `log[slot]` into an
+        // out-of-bounds panic. `handle_append` keeps the two in step by rejecting
+        // non-contiguous batches.
+        self.base_index + self.log.len() as u64
     }
     fn last_term(&self) -> u64 {
         self.log.last().map(|e| e.term).unwrap_or(self.base_term)
@@ -380,6 +399,21 @@ impl Raft {
             if self.heartbeat_elapsed >= self.cfg.heartbeat_ticks {
                 self.heartbeat_elapsed = 0;
                 self.broadcast_append();
+            }
+            // Check-quorum (Raft thesis §6.2): a leader that hasn't heard from a
+            // quorum within one election timeout is on the minority side of a
+            // partition. Step down — the API answers placement/route reads and
+            // gates the reconcile loop on `is_leader()`, so an isolated leader
+            // that never notices would keep handing the LB a deposed member's map.
+            self.election_elapsed += 1;
+            if self.election_elapsed >= self.randomized_election_timeout {
+                let reachable = self.acked_since_check.len() + 1; // + self
+                self.acked_since_check.clear();
+                if reachable < self.quorum() {
+                    self.become_follower(self.current_term, None);
+                } else {
+                    self.reset_election_timer();
+                }
             }
             return;
         }
@@ -467,6 +501,11 @@ impl Raft {
         });
         self.dirty = true;
         self.heartbeat_elapsed = 0;
+        // Start a fresh check-quorum window: the votes that just elected us don't
+        // carry into it, and a stale `election_elapsed` must not trip a step-down
+        // on the very first leader tick.
+        self.acked_since_check.clear();
+        self.reset_election_timer();
         self.broadcast_append();
     }
 
@@ -485,7 +524,17 @@ impl Raft {
     // ── inbound ─────────────────────────────────────────────────────────────
 
     /// Handle one inbound message from `from`.
+    ///
+    /// The sender identity rides in the *request body* (`leader_id` /
+    /// `candidate_id`), so anything holding the peer-plane secret could claim to
+    /// be any address. Only configured members may drive this engine: an
+    /// unrecognized `leader_id` would otherwise be recorded as `leader_id()` and
+    /// become the URL the API forwards control-plane writes to — with the
+    /// internal secret attached.
     pub fn step(&mut self, from: NodeId, msg: RaftMessage) {
+        if !self.peers.contains(&from) {
+            return;
+        }
         match msg {
             RaftMessage::RequestVote(req) => self.handle_request_vote(from, req),
             RaftMessage::RequestVoteResp(resp) => self.handle_vote_resp(from, resp),
@@ -571,6 +620,21 @@ impl Raft {
         // and refresh the election timer (we've heard from a leader).
         self.become_follower(req.term, Some(from.clone()));
 
+        // Reject a malformed batch before touching the log. A real leader always
+        // sends entries contiguous from `prev_log_index`, in its own term or
+        // older; splicing in a batch that isn't would leave the log's indices
+        // disagreeing with its length (and a forged term could later be treated
+        // as this leader's own, committing entries no quorum ever held).
+        if !entries_are_contiguous(&req) {
+            let resp = AppendEntriesResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_index(),
+            };
+            self.send(&from, RaftMessage::AppendEntriesResp(resp));
+            return;
+        }
+
         // Log-consistency check at prev_log_index.
         let success;
         let match_index;
@@ -580,15 +644,28 @@ impl Raft {
             match_index = self.last_index();
         } else if req.prev_log_index > 0 && self.term_at(req.prev_log_index) != req.prev_log_term {
             // Conflict at prev: drop it and everything after, then back up.
-            self.truncate_from(req.prev_log_index);
+            let _ = self.truncate_from(req.prev_log_index);
             success = false;
             match_index = req.prev_log_index - 1;
         } else {
             // Prefix matches: splice in the entries, truncating any conflicts.
+            // The last entry this request actually carries (the match point when
+            // it carries none) bounds how far `leader_commit` may move us.
+            let last_new = req
+                .entries
+                .last()
+                .map(|e| e.index)
+                .unwrap_or(req.prev_log_index);
+            let mut spliced = true;
             for entry in req.entries {
                 if entry.index <= self.last_index() {
                     if self.term_at(entry.index) != entry.term {
-                        self.truncate_from(entry.index);
+                        if !self.truncate_from(entry.index) {
+                            // Would rewrite a committed entry — impossible from a
+                            // real leader, so refuse rather than corrupt the log.
+                            spliced = false;
+                            break;
+                        }
                         self.log.push(entry);
                         self.dirty = true;
                     }
@@ -598,11 +675,16 @@ impl Raft {
                     self.dirty = true;
                 }
             }
-            if req.leader_commit > self.commit_index {
-                self.commit_index = req.leader_commit.min(self.last_index());
+            // Commit only up to the last entry THIS request replicated (Raft
+            // §5.3). Clamping to our own last index instead would let a bare
+            // heartbeat with an inflated `leader_commit` commit a stale-term
+            // suffix the current leader never replicated.
+            let commit = req.leader_commit.min(last_new);
+            if spliced && commit > self.commit_index {
+                self.commit_index = commit;
                 self.dirty = true;
             }
-            success = true;
+            success = spliced;
             match_index = self.last_index();
         }
 
@@ -622,9 +704,12 @@ impl Raft {
         if self.role != Role::Leader || resp.term != self.current_term {
             return;
         }
+        // Any answer in our term proves this peer still reaches us (check-quorum).
+        self.acked_since_check.insert(from.clone());
         if resp.success {
             self.match_index.insert(from.clone(), resp.match_index);
-            self.next_index.insert(from, resp.match_index + 1);
+            // `match_index` is peer-supplied: saturate rather than wrap/panic.
+            self.next_index.insert(from, resp.match_index.saturating_add(1));
             if self.maybe_advance_commit() {
                 // Tell followers the commit point moved so they apply promptly,
                 // instead of waiting for the next heartbeat.
@@ -632,7 +717,7 @@ impl Raft {
             }
         } else {
             // Fast-rewind next_index toward the follower's hint and retry.
-            let backed = resp.match_index + 1;
+            let backed = resp.match_index.saturating_add(1);
             let entry = self.next_index.entry(from.clone()).or_insert(1);
             *entry = backed.max(1).min(*entry);
             self.send_append(&from);
@@ -702,29 +787,32 @@ impl Raft {
         if self.role != Role::Leader || resp.term != self.current_term {
             return;
         }
+        self.acked_since_check.insert(from.clone());
         if resp.success {
             let matched = resp
                 .last_included_index
                 .max(self.match_index.get(&from).copied().unwrap_or(0));
             self.match_index.insert(from.clone(), matched);
-            self.next_index.insert(from, matched + 1);
+            self.next_index.insert(from, matched.saturating_add(1));
             if self.maybe_advance_commit() {
                 self.broadcast_append();
             }
         }
     }
 
-    /// Drop entries with index ≥ `index`. Never touches committed entries (Raft's
-    /// rules guarantee a conflict can only appear above `commit_index`).
-    fn truncate_from(&mut self, index: u64) {
-        debug_assert!(
-            index > self.commit_index,
-            "would truncate a committed entry"
-        );
+    /// Drop entries with index ≥ `index`, reporting whether it was safe to do so.
+    /// Raft's rules guarantee a conflict can only appear above `commit_index`, but
+    /// `index` is derived from peer-supplied fields — refuse at runtime (the caller
+    /// rejects the request) instead of asserting, which would panic the member.
+    fn truncate_from(&mut self, index: u64) -> bool {
+        if index <= self.commit_index {
+            return false;
+        }
         if let Some(slot) = self.log_slot(index) {
             self.log.truncate(slot);
             self.dirty = true;
         }
+        true
     }
 
     fn broadcast_append(&mut self) {
@@ -1326,6 +1414,253 @@ mod tests {
             c.node(&leader).commit_index() >= proposed,
             "restoring a third member lets the pending entry commit"
         );
+    }
+
+    /// A member with one peer, ready to be fed hand-crafted RPCs.
+    fn follower_of(peer: &str) -> Raft {
+        Raft::new(
+            "brain-0".to_string(),
+            vec![peer.to_string()],
+            cfg(),
+            1,
+            Persisted::default(),
+        )
+    }
+
+    fn append(from: &str, prev: u64, prev_term: u64, entries: Vec<LogEntry>, commit: u64) -> RaftMessage {
+        RaftMessage::AppendEntries(AppendEntriesReq {
+            term: 1,
+            leader_id: from.to_string(),
+            prev_log_index: prev,
+            prev_log_term: prev_term,
+            entries,
+            leader_commit: commit,
+        })
+    }
+
+    fn last_resp(r: &mut Raft) -> AppendEntriesResp {
+        match r.ready().messages.pop().map(|a| a.msg) {
+            Some(RaftMessage::AppendEntriesResp(resp)) => resp,
+            other => panic!("expected an AppendEntriesResp, got {other:?}"),
+        }
+    }
+
+    /// Regression (F2): `entry.index` is peer-supplied. An entry claiming an index
+    /// far past the end of the log must be refused — accepting it would make
+    /// `last_index()` disagree with the log slab, and the next `leader_commit`
+    /// would index a slot that does not exist (a panic inside the driver's engine
+    /// mutex, i.e. a dead member, plus a WAL the store then refuses to reopen).
+    #[test]
+    fn an_append_with_a_non_contiguous_entry_index_is_rejected() {
+        let mut r = follower_of("brain-1");
+        r.step(
+            "brain-1".to_string(),
+            append(
+                "brain-1",
+                0,
+                0,
+                vec![LogEntry {
+                    term: 1,
+                    index: 1000,
+                    command: None,
+                }],
+                0,
+            ),
+        );
+        assert!(!last_resp(&mut r).success, "forged index must be rejected");
+        assert_eq!(r.log_len(), 0, "nothing was spliced into the log");
+
+        // The follow-up that used to panic: a heartbeat referencing the phantom
+        // range, and a commit point beyond anything we hold.
+        r.step("brain-1".to_string(), append("brain-1", 500, 1, vec![], 1000));
+        let resp = last_resp(&mut r);
+        assert!(!resp.success);
+        assert_eq!(r.commit_index(), 0, "commit cannot run past the log");
+
+        // A well-formed batch from the same leader still applies normally.
+        r.step(
+            "brain-1".to_string(),
+            append(
+                "brain-1",
+                0,
+                0,
+                vec![LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: Some(plan(4)),
+                }],
+                1,
+            ),
+        );
+        assert!(last_resp(&mut r).success);
+        assert_eq!(r.log_len(), 1);
+        assert_eq!(r.commit_index(), 1);
+    }
+
+    /// Regression (F6): the sender identity comes from the request body, so a
+    /// caller holding the peer-plane secret could name itself. A message from an
+    /// address that is not a configured member must not be able to install itself
+    /// as our leader — that address is where the API forwards writes, with the
+    /// internal secret attached.
+    #[test]
+    fn a_message_from_an_unconfigured_sender_is_ignored() {
+        let mut r = follower_of("brain-1");
+        r.step(
+            "http://attacker.example/".to_string(),
+            RaftMessage::AppendEntries(AppendEntriesReq {
+                term: 9,
+                leader_id: "http://attacker.example/".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        );
+        assert_eq!(r.leader(), None, "an unknown sender never becomes leader");
+        assert_eq!(r.term(), 0, "and cannot push our term forward");
+        assert!(r.ready().messages.is_empty(), "not even a reply");
+    }
+
+    /// Regression (F10): `leader_commit` may only advance us as far as the last
+    /// entry THIS request replicated. A bare heartbeat carrying an inflated
+    /// commit point must not commit a stale-term suffix the leader never sent.
+    #[test]
+    fn leader_commit_is_capped_at_the_last_entry_the_request_carried() {
+        let mut r = follower_of("brain-1");
+        // Two entries from the leader, nothing committed yet.
+        r.step(
+            "brain-1".to_string(),
+            append(
+                "brain-1",
+                0,
+                0,
+                vec![
+                    LogEntry {
+                        term: 1,
+                        index: 1,
+                        command: Some(plan(1)),
+                    },
+                    LogEntry {
+                        term: 1,
+                        index: 2,
+                        command: Some(plan(2)),
+                    },
+                ],
+                0,
+            ),
+        );
+        assert!(last_resp(&mut r).success);
+        assert_eq!(r.commit_index(), 0);
+
+        // Heartbeat matching at index 1 only: commit stops at 1, not at our last index.
+        r.step("brain-1".to_string(), append("brain-1", 1, 1, vec![], 99));
+        assert!(last_resp(&mut r).success);
+        assert_eq!(
+            r.commit_index(),
+            1,
+            "commit is bounded by the last replicated entry, not by our log length"
+        );
+    }
+
+    /// Regression (F14b): `prev_log_index` is peer-supplied, so a crafted request
+    /// can point a conflict at an already-committed entry. That must be refused at
+    /// runtime (it used to trip a `debug_assert!`) with the log left intact.
+    #[test]
+    fn a_crafted_append_cannot_truncate_committed_entries() {
+        let mut r = follower_of("brain-1");
+        r.step(
+            "brain-1".to_string(),
+            append(
+                "brain-1",
+                0,
+                0,
+                vec![
+                    LogEntry {
+                        term: 1,
+                        index: 1,
+                        command: Some(plan(1)),
+                    },
+                    LogEntry {
+                        term: 1,
+                        index: 2,
+                        command: Some(plan(2)),
+                    },
+                ],
+                2,
+            ),
+        );
+        assert!(last_resp(&mut r).success);
+        assert_eq!(r.commit_index(), 2);
+
+        // Claim a different term at a committed index.
+        r.step("brain-1".to_string(), append("brain-1", 1, 7, vec![], 2));
+        let resp = last_resp(&mut r);
+        assert!(!resp.success, "a conflict below the commit point is refused");
+        assert_eq!(r.log_len(), 2, "committed entries survive");
+        assert_eq!(r.commit_index(), 2);
+    }
+
+    /// Regression (F14b): `match_index` is peer-supplied; the leader's `+ 1`
+    /// bookkeeping must saturate rather than wrap (or panic in debug).
+    #[test]
+    fn a_peer_reported_match_index_at_the_u64_ceiling_does_not_overflow() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+        let peer = c.ids().into_iter().find(|i| *i != leader).unwrap();
+        let term = c.node(&leader).term();
+        c.node(&leader).step(
+            peer,
+            RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: true,
+                match_index: u64::MAX,
+            }),
+        );
+        // Still leading, still sane — and the next heartbeat doesn't panic.
+        assert!(c.node(&leader).is_leader());
+        c.node(&leader).tick();
+        c.pump();
+    }
+
+    /// Regression (F4): check-quorum. A leader cut off from its peers must step
+    /// down within an election timeout instead of leading forever — the API
+    /// serves the placement map (the LB's route source) from whoever claims to
+    /// lead, and the reconcile loop is gated on the same flag.
+    #[test]
+    fn an_isolated_leader_steps_down_when_it_loses_quorum() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+        for id in c.ids().into_iter().filter(|i| *i != leader) {
+            c.down.insert(id);
+        }
+
+        // Two full election timeouts: the first window still counts the acks
+        // that carried the election, the second sees silence.
+        for _ in 0..(2 * cfg().election_max_ticks + 2) {
+            c.tick_all();
+            c.pump();
+        }
+        assert!(
+            !c.node(&leader).is_leader(),
+            "a leader without a quorum must step down"
+        );
+        assert!(
+            c.node(&leader).propose(plan(1)).is_err(),
+            "and must refuse writes it could never commit"
+        );
+    }
+
+    /// The other half of check-quorum: a leader that still hears from a majority
+    /// keeps leading across many election timeouts (no spurious step-down).
+    #[test]
+    fn a_leader_with_a_quorum_keeps_leading_across_election_timeouts() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+        for _ in 0..(cfg().election_max_ticks * 3) {
+            c.tick_all();
+            c.pump();
+        }
+        assert_eq!(c.leaders(), vec![leader], "the healthy leader is undisturbed");
     }
 
     #[test]
