@@ -48,6 +48,16 @@ const TICK_MS: u64 = 50;
 /// is rarely reached; it just bounds the log + WAL + restart-replay over a long life.
 const COMPACT_LOG_THRESHOLD: usize = 256;
 
+/// How long [`ControlPlane::propose`] waits for its entry to *commit* before
+/// reporting failure. Long enough to ride out a heartbeat round-trip and a peer
+/// restart, short enough that a caller (an operator's `POST /v1/scale`) gets an
+/// answer rather than hanging on a partitioned leader. Shortened under `cfg(test)`
+/// so the isolated-leader test doesn't sit through the production wait.
+#[cfg(not(test))]
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Peer transport for Raft RPCs. `None` from `send` means "couldn't reach the
 /// peer this time" — Raft tolerates dropped messages and retries on the next tick.
 pub enum Transport {
@@ -217,6 +227,9 @@ pub struct RaftControlPlane {
     /// restore). Waiters block on `apply_cv` until their predecessor has applied.
     apply_watermark: Mutex<u64>,
     apply_cv: Condvar,
+    /// Signalled (on the engine mutex) whenever a drain may have moved the commit
+    /// point, so `propose` wakes as soon as its entry commits instead of polling.
+    commit_cv: Condvar,
     // State-machine handles the committed log is applied to.
     membership: Arc<Membership>,
     placement: Arc<Placement>,
@@ -264,6 +277,7 @@ impl RaftControlPlane {
             io_lock: Mutex::new(()),
             apply_watermark: Mutex::new(apply_watermark),
             apply_cv: Condvar::new(),
+            commit_cv: Condvar::new(),
             membership,
             placement,
             plan,
@@ -469,7 +483,38 @@ impl RaftControlPlane {
             self.fail_closed("Raft outbox closed before message handoff");
             return Err(());
         }
+        // The commit point may have moved (this drain, or the one that produced
+        // the response it answers) — wake any `propose` waiting on it.
+        self.commit_cv.notify_all();
         Ok(reply)
+    }
+
+    /// Block until log `index` is committed in `term`, i.e. a quorum has durably
+    /// accepted it and no later leader can truncate it away. Returns false if the
+    /// wait times out, this member is deposed (its uncommitted entry may then be
+    /// overwritten), or it fails closed.
+    fn await_commit(&self, index: u64, term: u64) -> bool {
+        let deadline = std::time::Instant::now() + COMMIT_TIMEOUT;
+        let mut engine = self.engine.lock().unwrap();
+        loop {
+            if engine.commit_index() >= index && engine.term() == term {
+                return true;
+            }
+            if engine.term() != term || !engine.is_leader() {
+                return false; // deposed before committing — the write is not durable
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() || !self.is_available() {
+                return false;
+            }
+            // Cap each wait so availability/term changes that don't notify are
+            // still noticed promptly.
+            let (guard, _) = self
+                .commit_cv
+                .wait_timeout(engine, remaining.min(Duration::from_millis(20)))
+                .unwrap();
+            engine = guard;
+        }
     }
 
     fn step_inbound(&self, from: NodeId, msg: RaftMessage) -> Option<RaftMessage> {
@@ -582,18 +627,25 @@ impl ControlPlane for RaftControlPlane {
             .flatten()
     }
 
+    /// Returns only once the command is **committed** — a local append plus a
+    /// local fsync is not durability: a partitioned leader can append (and
+    /// persist) entries the next leader truncates away, so acking on local
+    /// persistence alone would 200-OK writes the cluster never accepted.
     fn propose(&self, command: Command) -> bool {
         if !self.is_available() {
             return false;
         }
-        let ready = {
+        let (index, term, ready) = {
             let mut engine = self.engine.lock().unwrap();
             match engine.propose(command) {
-                Ok(_) => engine.ready(),
+                Ok(index) => (index, engine.term(), engine.ready()),
                 Err(_) => return false, // not leader — caller forwards to leader_addr()
             }
         };
-        self.drain(ready, None).is_ok()
+        if self.drain(ready, None).is_err() {
+            return false;
+        }
+        self.await_commit(index, term)
     }
 }
 
@@ -695,6 +747,7 @@ fn seed_from(id: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::membership::MembershipConfig;
+    use crate::raft::Role;
 
     fn cfg() -> RaftConfig {
         RaftConfig {
@@ -741,12 +794,16 @@ mod tests {
     }
 
     fn unique_dir(tag: &str) -> std::path::PathBuf {
+        // Counter as well as clock — the clock alone is too coarse to keep two
+        // tests that start together in separate directories.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "fiducia-driver-{tag}-{:?}",
+            "fiducia-driver-{tag}-{:?}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
         ))
     }
 
@@ -869,7 +926,10 @@ mod tests {
     /// replicate a command over `Transport::Http` + `raft_router` (vote/append) —
     /// exercising the serialize → POST → handler → reply → `deliver` path that the
     /// in-process engine harness in `raft.rs` does not.
-    #[tokio::test]
+    // Multi-threaded on purpose (as in production, where `#[tokio::main]` is):
+    // `propose` blocks its thread until the entry commits, and the commit arrives
+    // on the peer-response tasks — which need a worker of their own to run on.
+    #[tokio::test(flavor = "multi_thread")]
     async fn three_brains_elect_and_replicate_over_http() {
         // Bind three ephemeral ports first so every member knows all peers' URLs.
         let mut listeners = Vec::new();
@@ -1142,6 +1202,148 @@ mod tests {
             20,
             "the newest committed batch must win once all have applied in order"
         );
+    }
+
+    /// Drive a member to leadership with no live transport: tick until it
+    /// campaigns, then hand it its peers' grants directly.
+    fn elect_with_peer_grants(cp: &Arc<RaftControlPlane>, peers: &[String]) {
+        for _ in 0..40 {
+            tick(cp);
+            if cp.is_leader() {
+                return;
+            }
+            let (term, role) = {
+                let engine = cp.engine.lock().unwrap();
+                (engine.term(), engine.role())
+            };
+            let pre_vote = match role {
+                Role::PreCandidate => true,
+                Role::Candidate => false,
+                _ => continue,
+            };
+            for peer in peers {
+                let ready = {
+                    let mut engine = cp.engine.lock().unwrap();
+                    engine.step(
+                        peer.clone(),
+                        RaftMessage::RequestVoteResp(RequestVoteResp {
+                            term,
+                            granted: true,
+                            pre_vote,
+                        }),
+                    );
+                    engine.ready()
+                };
+                let _ = cp.drain(ready, None);
+            }
+            if cp.is_leader() {
+                return;
+            }
+        }
+        panic!("member did not reach leadership");
+    }
+
+    /// Regression (F3): `propose` must return only once the entry has COMMITTED.
+    /// A leader whose peers are unreachable can append and fsync locally forever;
+    /// acking that would 200-OK a `/v1/scale` write the next leader truncates
+    /// away — and the state machine never sees it either.
+    #[test]
+    fn a_leader_without_a_quorum_does_not_acknowledge_an_uncommitted_write() {
+        let peers = vec![
+            "http://brain-1:8095".to_string(),
+            "http://brain-2:8095".to_string(),
+        ];
+        let (membership, placement, plan) = handles();
+        let cp = RaftControlPlane::new(
+            "http://brain-0:8095".to_string(),
+            peers.clone(),
+            cfg(),
+            None,
+            Persisted::default(),
+            Transport::Disabled, // the peers granted votes, then went silent
+            test_secret(),
+            membership,
+            placement,
+            plan.clone(),
+        )
+        .expect("driver");
+        elect_with_peer_grants(&cp, &peers);
+        assert!(cp.is_leader());
+
+        assert!(
+            !cp.propose(Command::SetScalePlan(ScalePlan {
+                target_nodes: 42,
+                replication_factor: 3,
+            })),
+            "an entry no quorum accepted must not be acknowledged"
+        );
+        assert_eq!(
+            plan.lock().unwrap().target_nodes,
+            3,
+            "and it must not have been applied to the state machine"
+        );
+    }
+
+    /// The healthy counterpart: once a peer acks the entry, the same `propose`
+    /// completes — the commit wait is not simply "always fail on a real group".
+    #[test]
+    fn propose_returns_true_as_soon_as_a_quorum_acks_the_entry() {
+        let peers = vec![
+            "http://brain-1:8095".to_string(),
+            "http://brain-2:8095".to_string(),
+        ];
+        let (membership, placement, plan) = handles();
+        let cp = RaftControlPlane::new(
+            "http://brain-0:8095".to_string(),
+            peers.clone(),
+            cfg(),
+            None,
+            Persisted::default(),
+            Transport::Disabled,
+            test_secret(),
+            membership,
+            placement,
+            plan.clone(),
+        )
+        .expect("driver");
+        elect_with_peer_grants(&cp, &peers);
+
+        // A peer acks everything the leader has, from another thread, while
+        // `propose` is blocked waiting for the commit point to move.
+        let acker = {
+            let cp = cp.clone();
+            let peer = peers[0].clone();
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let ready = {
+                        let mut engine = cp.engine.lock().unwrap();
+                        let term = engine.term();
+                        let match_index = engine.base_index() + engine.log_len() as u64;
+                        engine.step(
+                            peer.clone(),
+                            RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                                term,
+                                success: true,
+                                match_index,
+                            }),
+                        );
+                        engine.ready()
+                    };
+                    let _ = cp.drain(ready, None);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        assert!(
+            cp.propose(Command::SetScalePlan(ScalePlan {
+                target_nodes: 8,
+                replication_factor: 3,
+            })),
+            "a quorum-acked entry is acknowledged"
+        );
+        assert_eq!(plan.lock().unwrap().target_nodes, 8, "and applied");
+        acker.join().unwrap();
     }
 
     /// Regression: after compaction, entries at or below `base_index` exist only
