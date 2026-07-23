@@ -21,7 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 subtle = "2"
 
 # Shared OpenTelemetry + tracing setup (one init() for all services).
-fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
+fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.2.1" }
 
 # Shared API payload/error contract (generated from fiducia-interfaces schemas) —
 # the one source of truth for the types every fiducia service speaks.

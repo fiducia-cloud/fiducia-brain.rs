@@ -66,7 +66,7 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    fiducia_telemetry::init(SERVICE);
+    let _telemetry = fiducia_telemetry::init(SERVICE);
 
     // Authoritative cluster configuration: shard_count (fixed) + replication
     // factor. Everything else reads this.
