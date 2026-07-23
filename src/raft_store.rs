@@ -28,7 +28,29 @@ struct Meta {
     current_term: u64,
     voted_for: Option<String>,
     commit_index: u64,
-    /// Snapshot base (0 until the log has been compacted at least once).
+    /// Snapshot base (0 until the log has been compacted at least once). Kept for
+    /// compatibility with logs written before the header existed (format v0); the
+    /// header in the log file itself is authoritative when present.
+    #[serde(default)]
+    base_index: u64,
+    #[serde(default)]
+    base_term: u64,
+}
+
+/// Current log file format. v0 (no header, entries only) is still readable.
+const LOG_FORMAT_VERSION: u64 = 1;
+
+/// First line of the log file: the snapshot base the entries continue from.
+///
+/// The base lives *in the log file* because the two must agree: they used to be
+/// two independent atomic writes (log, then meta), so a crash between them left a
+/// log starting at 257 next to a meta saying `base_index = 0` — a mismatch
+/// [`validate_recovered`] rejects, i.e. an unbootable member. One rename now
+/// carries both. `v` distinguishes a header from a v0 log's first [`LogEntry`],
+/// which has no such field.
+#[derive(Debug, Serialize, Deserialize)]
+struct LogHeader {
+    v: u64,
     #[serde(default)]
     base_index: u64,
     #[serde(default)]
@@ -73,14 +95,23 @@ impl RaftStore {
         };
 
         // Parse every complete JSON line; stop at the first that fails — that's a
-        // record torn by a crash mid-write, and everything after it.
+        // record torn by a crash mid-write, and everything after it. A v1 log
+        // opens with its header; a v0 log (written before the header existed)
+        // starts straight at the first entry and takes its base from meta.
+        let mut header: Option<LogHeader> = None;
         let mut log: Vec<LogEntry> = Vec::new();
         match File::open(&log_path) {
             Ok(file) => {
-                for line in BufReader::new(file).split(b'\n') {
+                for (n, line) in BufReader::new(file).split(b'\n').enumerate() {
                     let line = line?;
                     if line.is_empty() {
                         continue;
+                    }
+                    if n == 0 {
+                        if let Ok(parsed) = serde_json::from_slice::<LogHeader>(&line) {
+                            header = Some(parsed);
+                            continue;
+                        }
                     }
                     match serde_json::from_slice::<LogEntry>(&line) {
                         Ok(entry) => log.push(entry),
@@ -91,6 +122,27 @@ impl RaftStore {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
+        if let Some(header) = &header {
+            if header.v > LOG_FORMAT_VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Raft log format v{} is newer than this binary understands (v{LOG_FORMAT_VERSION})",
+                        header.v
+                    ),
+                ));
+            }
+        }
+        let (base_index, base_term) = match &header {
+            Some(h) => (h.base_index, h.base_term),
+            None => (meta.base_index, meta.base_term),
+        };
+        // A crash between the log and meta writes can leave meta a step behind.
+        // The snapshot beside a non-zero base only ever holds *committed* state
+        // (compaction refuses to fold in anything above `commit_index`), so
+        // recovering `commit_index` as at least `base_index` restores what was
+        // durably true rather than inventing it.
+        let commit_index = meta.commit_index.max(base_index);
 
         let store = RaftStore {
             dir,
@@ -100,17 +152,17 @@ impl RaftStore {
             #[cfg(test)]
             fail_saves: AtomicBool::new(false),
         };
-        validate_recovered(&meta, snapshot.as_deref(), &log)?;
+        validate_recovered(commit_index, base_index, snapshot.as_deref(), &log)?;
         // Canonicalize on disk so the next write starts from clean bytes.
-        store.write_log(&log)?;
+        store.write_log(base_index, base_term, &log)?;
 
         let restored = Persisted {
             current_term: meta.current_term,
             voted_for: meta.voted_for,
-            commit_index: meta.commit_index,
+            commit_index,
             log,
-            base_index: meta.base_index,
-            base_term: meta.base_term,
+            base_index,
+            base_term,
             snapshot,
         };
         Ok((store, restored))
@@ -125,10 +177,12 @@ impl RaftStore {
         }
         // Snapshot first, then log, then meta — so the `base_index`/`commit_index`
         // recorded in meta can never reference a snapshot or entries not yet on disk.
+        // The log's header carries the base alongside the entries it belongs to, so
+        // that pair always lands in a single rename.
         if let Some(snapshot) = &p.snapshot {
             atomic_write(&self.snapshot_path, snapshot, &self.dir)?;
         }
-        self.write_log(&p.log)?;
+        self.write_log(p.base_index, p.base_term, &p.log)?;
         self.write_meta(&Meta {
             current_term: p.current_term,
             voted_for: p.voted_for.clone(),
@@ -148,8 +202,18 @@ impl RaftStore {
         atomic_write(&self.meta_path, &bytes, &self.dir)
     }
 
-    fn write_log(&self, log: &[LogEntry]) -> io::Result<()> {
+    fn write_log(&self, base_index: u64, base_term: u64, log: &[LogEntry]) -> io::Result<()> {
         let mut buf = Vec::new();
+        serde_json::to_writer(
+            &mut buf,
+            &LogHeader {
+                v: LOG_FORMAT_VERSION,
+                base_index,
+                base_term,
+            },
+        )
+        .map_err(invalid)?;
+        buf.push(b'\n');
         for entry in log {
             serde_json::to_writer(&mut buf, entry).map_err(invalid)?;
             buf.push(b'\n');
@@ -161,20 +225,19 @@ impl RaftStore {
 /// Reject inconsistent durable state before canonicalizing a torn log. In
 /// particular, recovery may discard only an uncommitted torn tail; it must
 /// never erase evidence of an entry referenced by the durable commit index.
-fn validate_recovered(meta: &Meta, snapshot: Option<&[u8]>, log: &[LogEntry]) -> io::Result<()> {
-    if meta.base_index > 0 && snapshot.is_none() {
+fn validate_recovered(
+    commit_index: u64,
+    base_index: u64,
+    snapshot: Option<&[u8]>,
+    log: &[LogEntry],
+) -> io::Result<()> {
+    if base_index > 0 && snapshot.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Raft snapshot is missing for non-zero base_index",
         ));
     }
-    if meta.commit_index < meta.base_index {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Raft commit_index precedes snapshot base_index",
-        ));
-    }
-    let mut expected = meta.base_index.saturating_add(1);
+    let mut expected = base_index.saturating_add(1);
     for entry in log {
         if entry.index != expected {
             return Err(io::Error::new(
@@ -187,16 +250,12 @@ fn validate_recovered(meta: &Meta, snapshot: Option<&[u8]>, log: &[LogEntry]) ->
         }
         expected = expected.saturating_add(1);
     }
-    let last_index = log
-        .last()
-        .map(|entry| entry.index)
-        .unwrap_or(meta.base_index);
-    if meta.commit_index > last_index {
+    let last_index = log.last().map(|entry| entry.index).unwrap_or(base_index);
+    if commit_index > last_index {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "Raft commit_index {} exceeds last recoverable index {last_index}; refusing to truncate committed entries",
-                meta.commit_index
+                "Raft commit_index {commit_index} exceeds last recoverable index {last_index}; refusing to truncate committed entries"
             ),
         ));
     }
@@ -236,13 +295,18 @@ mod tests {
     }
 
     fn tmpdir() -> PathBuf {
+        // A per-process counter, not just the clock: the clock's resolution is
+        // coarse enough that two tests starting together shared a directory (and
+        // each other's files).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "fiducia-brain-raft-{}-{:?}",
+            "fiducia-brain-raft-{}-{:?}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
         ));
         fs::create_dir_all(&p).unwrap();
         p
@@ -309,6 +373,80 @@ mod tests {
         assert_eq!(rec.log[0].index, 1);
     }
 
+    /// Regression (F11): the log header makes the snapshot base and the entries it
+    /// belongs to land in ONE rename. A crash after the log write but before the
+    /// meta write used to leave `base_index = 0` beside a log starting at 4 —
+    /// recovery rejected that as non-contiguous and the member was unbootable.
+    #[test]
+    fn a_crash_between_the_log_and_meta_writes_still_recovers() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        // The state as it was before compaction, which is what meta still holds.
+        store
+            .save(&Persisted {
+                current_term: 2,
+                voted_for: None,
+                commit_index: 3,
+                log: vec![entry(1, 2), entry(2, 2), entry(3, 2)],
+                ..Default::default()
+            })
+            .unwrap();
+        // Compaction: snapshot + log (with the new base in its header) reach disk,
+        // then the process dies before meta is rewritten.
+        fs::write(dir.join("snapshot"), b"state@3").unwrap();
+        store.write_log(3, 2, &[entry(4, 2)]).unwrap();
+
+        let (_s, rec) = RaftStore::open(&dir).expect("a half-finished save still boots");
+        assert_eq!(rec.base_index, 3, "base recovered from the log header");
+        assert_eq!(rec.base_term, 2);
+        assert_eq!(
+            rec.commit_index, 3,
+            "commit cannot precede the snapshot base"
+        );
+        assert_eq!(rec.log.len(), 1);
+        assert_eq!(rec.log[0].index, 4);
+        assert_eq!(rec.snapshot.as_deref(), Some(b"state@3".as_slice()));
+    }
+
+    /// A log written by a previous build (v0: entries only, base in meta) must
+    /// still open — and is rewritten in the versioned format on the way through.
+    #[test]
+    fn a_headerless_v0_log_is_read_and_migrated() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store
+            .write_meta(&Meta {
+                current_term: 4,
+                voted_for: Some("brain-c".to_string()),
+                commit_index: 5,
+                base_index: 3,
+                base_term: 2,
+            })
+            .unwrap();
+        fs::write(dir.join("snapshot"), b"state@3").unwrap();
+        // v0 log bytes: no header line, entries continuing from base_index.
+        let mut buf = Vec::new();
+        for e in [entry(4, 4), entry(5, 4)] {
+            serde_json::to_writer(&mut buf, &e).unwrap();
+            buf.push(b'\n');
+        }
+        fs::write(dir.join("log"), &buf).unwrap();
+
+        let (_s, rec) = RaftStore::open(&dir).expect("v0 log still opens");
+        assert_eq!(rec.base_index, 3, "base taken from meta for a v0 log");
+        assert_eq!(rec.base_term, 2);
+        assert_eq!(rec.commit_index, 5);
+        assert_eq!(rec.log.len(), 2);
+        assert_eq!(rec.voted_for.as_deref(), Some("brain-c"));
+
+        // Canonicalization rewrote it with a header, and it round-trips.
+        let migrated = fs::read(dir.join("log")).unwrap();
+        assert!(migrated.starts_with(b"{\"v\":1"), "migrated to v1");
+        let (_s, again) = RaftStore::open(&dir).unwrap();
+        assert_eq!(again.base_index, 3);
+        assert_eq!(again.log.len(), 2);
+    }
+
     #[test]
     fn torn_committed_record_aborts_recovery_without_canonicalizing_log() {
         let dir = tmpdir();
@@ -322,7 +460,7 @@ mod tests {
                 base_term: 0,
             })
             .unwrap();
-        store.write_log(&[entry(1, 2)]).unwrap();
+        store.write_log(0, 0, &[entry(1, 2)]).unwrap();
         let torn = b"{\"term\":2,\"index\":2,\"comm";
         let mut f = fs::OpenOptions::new()
             .append(true)

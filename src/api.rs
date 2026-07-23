@@ -298,13 +298,27 @@ struct RouteQuery {
 /// `GET /v1/route?key=orders/checkout` — resolve a key all the way to its shard
 /// and that shard's placement. `key → shard` is a local hash (no lookup);
 /// `shard → nodes` comes from the central placement map.
-async fn route_key(State(s): State<BrainState>, Query(q): Query<RouteQuery>) -> Json<Value> {
+///
+/// Read from the leader for the same reason as `/v1/placement`: a member that has
+/// been deposed still holds a placement map, and it is the stale one.
+async fn route_key(
+    State(s): State<BrainState>,
+    headers: HeaderMap,
+    Query(q): Query<RouteQuery>,
+) -> Response {
+    if !s.control_plane.is_leader() && may_forward(&headers) {
+        if let Some(leader) = s.control_plane.leader_addr() {
+            let url = leader_v1(&leader, "/route");
+            return forwarded(s.http.get(url).query(&[("key", &q.key)])).await;
+        }
+    }
     let shard = s.config.shard_for(&q.key);
     Json(json!({
         "key": q.key,
         "shard": shard,
         "assignment": s.placement.get(shard),
     }))
+    .into_response()
 }
 
 /// `GET /v1/nodes` — membership view.
@@ -373,12 +387,24 @@ async fn remove_node(
 
 /// `GET /v1/placement` — full shard map for nodes to reconcile against. The
 /// `generation` lets pollers skip re-diffing the map when nothing changed.
-async fn placement(State(s): State<BrainState>) -> Json<Value> {
+///
+/// This is the load balancer's route source, so it must come from the member that
+/// is *currently* leading: a deposed leader (or a follower that missed the last
+/// entries) still serves a complete-looking map, just an out-of-date one, and the
+/// LB would hydrate its shard→leader table from it. Same contract as `/v1/nodes`:
+/// forward to the leader, answer locally only mid-election or after one hop.
+async fn placement(State(s): State<BrainState>, headers: HeaderMap) -> Response {
+    if !s.control_plane.is_leader() && may_forward(&headers) {
+        if let Some(leader) = s.control_plane.leader_addr() {
+            return forwarded(s.http.get(leader_v1(&leader, "/placement"))).await;
+        }
+    }
     Json(json!({
         "generation": s.placement.generation(),
         "shards": s.placement.snapshot(),
         "policies": s.placement.policies_snapshot(),
     }))
+    .into_response()
 }
 
 /// `GET /v1/placement/{shard}` — one shard's assignment (404 if unplaced).
