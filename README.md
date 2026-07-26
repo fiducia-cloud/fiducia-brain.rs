@@ -198,9 +198,9 @@ CI and the container build use Rust 1.95.0, the committed `Cargo.lock`, and
 immutable sibling revisions for the local path dependencies:
 
 - `fiducia-interfaces` at
-  `6e20a3f4df2e52b99a0ad6add83d4528262b5dbc`
+  `2c5c806174e067fbe83ad48b724366323ba390a2`
 - `fiducia-routing.rs` at
-  `6106b4f79a5559699a64c931dbcb472f42274266`
+  `c694bc5c58587bec12989a347e926c0040aacada`
 
 When either shared contract changes, update the checkout refs in
 `.github/workflows/ci.yml`, the build arguments in `.github/workflows/docker.yml`,
