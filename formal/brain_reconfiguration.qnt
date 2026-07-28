@@ -100,7 +100,7 @@ module brain_reconfiguration {
 
   // Faults may occur while a move is in progress. Progress guards below require
   // a Healthy target; otherwise the safe exits are abort or rollback.
-  action change_health(node, health: Health) = all {
+  action change_health(node, health) = all {
     NODES.contains(node),
     HEALTHS.contains(health),
     s' = {
