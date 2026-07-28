@@ -1,15 +1,11 @@
-// Executable model of one fiducia-brain shard placement being enacted by the
-// fiducia-node data plane.
+// One fiducia-brain shard placement enacted by the fiducia-node data plane.
 //
-// The brain publishes a target replica set, but safe execution is deliberately
-// staged one membership change at a time:
+// Safe replacement is staged:
+//   plan -> add learner -> catch up -> promote -> transfer leader -> remove old
 //
-//   plan -> add learner -> catch up -> promote -> transfer leadership -> remove
-//
-// The model also includes the scheduler's two critical hold conditions:
-// incomplete soft membership after a brain failover, and fewer Healthy candidates
-// than the replication factor. Target failure may abort before promotion or roll
-// back the newly promoted voter without ever crossing the quorum floor.
+// The model also includes the scheduler's incomplete-membership and degraded-
+// capacity hold guards. Faults may occur during a move; the target can be aborted
+// before promotion or rolled back afterward without crossing the RF quorum floor.
 module brain_reconfiguration {
   type Health = Healthy | Suspect | Dead | Draining
   type Phase = Stable | Planned | LearnerAdded | CaughtUp | Promoted
@@ -44,8 +40,8 @@ module brain_reconfiguration {
     move_from: int,
     move_to: int,
     voters_before_move: Set[int],
-    plan_started_with_complete_membership: bool,
-    plan_started_with_capacity: bool,
+    known_at_plan: Set[int],
+    healthy_at_plan: Set[int],
     last_event: Event,
   }
 
@@ -54,7 +50,7 @@ module brain_reconfiguration {
   val healthy_nodes =
     NODES.filter(node => s.health.get(node) == Healthy)
 
-  val membership_complete_for_current_placement =
+  val membership_complete =
     s.voters.subseteq(s.known)
 
   action init = {
@@ -68,15 +64,14 @@ module brain_reconfiguration {
       move_from: NO_NODE,
       move_to: NO_NODE,
       voters_before_move: Set(1, 2, 3),
-      plan_started_with_complete_membership: true,
-      plan_started_with_capacity: true,
+      known_at_plan: NODES,
+      healthy_at_plan: NODES,
       last_event: InitEvent,
     }
   }
 
-  // Brain liveness membership is leader-local soft state. A newly elected brain
-  // may temporarily not know a still-live voter; the scheduler must hold rather
-  // than interpret absence as failure and shrink placement.
+  // Membership is leader-local soft state. On brain failover, missing knowledge of
+  // a current voter must cause a hold rather than replica-set shrinkage.
   action lose_membership(node) = all {
     s.phase == Stable,
     s.known.contains(node),
@@ -98,49 +93,48 @@ module brain_reconfiguration {
     },
   }
 
-  // Faults may occur while a move is in progress. Progress guards below require
-  // a Healthy target; otherwise the safe exits are abort or rollback.
-  action change_health(node, health) = all {
+  action change_health(node, new_health) = all {
     NODES.contains(node),
-    HEALTHS.contains(health),
+    HEALTHS.contains(new_health),
     s' = {
       ...s,
-      health: s.health.set(node, health),
+      health: s.health.set(node, new_health),
       last_event: HealthChanged,
     },
   }
 
   action hold_incomplete_membership = all {
     s.phase == Stable,
-    not(membership_complete_for_current_placement),
+    not(membership_complete),
     s' = { ...s, last_event: IncompleteHeld },
   }
 
   action hold_degraded_membership = all {
     s.phase == Stable,
-    membership_complete_for_current_placement,
+    membership_complete,
     healthy_nodes.size() < RF,
     s' = { ...s, last_event: DegradedHeld },
   }
 
-  // A target may be published only from a complete membership view with at least
-  // RF Healthy candidates. Exactly one existing voter is replaced.
-  action plan_move(from, to) = all {
+  // Exactly one voter is selected for replacement from a complete view with at
+  // least RF Healthy candidates. The snapshots make that start condition part of
+  // every later active-move state, even if health subsequently changes.
+  action plan_move(source, target) = all {
     s.phase == Stable,
-    membership_complete_for_current_placement,
+    membership_complete,
     healthy_nodes.size() >= RF,
-    s.voters.contains(from),
-    s.known.contains(to),
-    not(s.voters.contains(to)),
-    s.health.get(to) == Healthy,
+    s.voters.contains(source),
+    s.known.contains(target),
+    not(s.voters.contains(target)),
+    s.health.get(target) == Healthy,
     s' = {
       ...s,
       phase: Planned,
-      move_from: from,
-      move_to: to,
+      move_from: source,
+      move_to: target,
       voters_before_move: s.voters,
-      plan_started_with_complete_membership: true,
-      plan_started_with_capacity: true,
+      known_at_plan: s.known,
+      healthy_at_plan: healthy_nodes,
       last_event: MovePlanned,
     },
   }
@@ -168,8 +162,7 @@ module brain_reconfiguration {
     },
   }
 
-  // Promotion happens before removing the old voter, temporarily creating RF+1
-  // voters. This is the key quorum-preserving ordering property.
+  // Promotion precedes removal, temporarily creating RF+1 voters.
   action promote_learner = all {
     s.phase == CaughtUp,
     s.learners.contains(s.move_to),
@@ -183,8 +176,7 @@ module brain_reconfiguration {
     },
   }
 
-  // Leadership may transfer at any phase to a Healthy existing voter. Removal and
-  // rollback guards ensure the current leader is never deleted from membership.
+  // The current leader is always a voter and must move before its voter is removed.
   action transfer_leader(candidate) = all {
     s.voters.contains(candidate),
     s.health.get(candidate) == Healthy,
@@ -212,8 +204,7 @@ module brain_reconfiguration {
     },
   }
 
-  // Before promotion, aborting removes only a learner. The original voter set is
-  // untouched, regardless of why the target became unsuitable.
+  // Before promotion, aborting removes at most the non-voting learner.
   action abort_unpromoted = all {
     or {
       s.phase == Planned,
@@ -232,7 +223,7 @@ module brain_reconfiguration {
   }
 
   // After promotion, rollback removes the new voter and retains the old one. If
-  // the new voter currently leads, leadership must first move elsewhere.
+  // the new voter leads, leadership must first transfer elsewhere.
   action rollback_promoted = all {
     s.phase == Promoted,
     s.voters.contains(s.move_from),
@@ -254,11 +245,11 @@ module brain_reconfiguration {
   action step = {
     nondet node = NODES.oneOf()
     nondet other = NODES.oneOf()
-    nondet health = HEALTHS.oneOf()
+    nondet new_health = HEALTHS.oneOf()
     any {
       lose_membership(node),
       restore_membership(node),
-      change_health(node, health),
+      change_health(node, new_health),
       hold_incomplete_membership,
       hold_degraded_membership,
       plan_move(node, other),
@@ -277,6 +268,8 @@ module brain_reconfiguration {
     s.known.subseteq(NODES),
     s.voters.subseteq(NODES),
     s.learners.subseteq(NODES),
+    s.known_at_plan.subseteq(NODES),
+    s.healthy_at_plan.subseteq(NODES),
     NODES.contains(s.leader),
     or { s.move_from == NO_NODE, NODES.contains(s.move_from) },
     or { s.move_to == NO_NODE, NODES.contains(s.move_to) },
@@ -332,9 +325,11 @@ module brain_reconfiguration {
 
   val every_active_plan_started_safely =
     s.phase == Stable or and {
-      s.plan_started_with_complete_membership,
-      s.plan_started_with_capacity,
       s.voters_before_move.size() == RF,
+      s.voters_before_move.subseteq(s.known_at_plan),
+      s.healthy_at_plan.size() >= RF,
+      s.known_at_plan.contains(s.move_to),
+      s.healthy_at_plan.contains(s.move_to),
     }
 
   val reconfiguration_safety = and {
@@ -349,8 +344,6 @@ module brain_reconfiguration {
     every_active_plan_started_safely,
   }
 
-  // Reachability witnesses show that both hold guards, the successful path, the
-  // rollback path, and leadership transfer remain executable.
   val incomplete_membership_hold_reached = s.last_event == IncompleteHeld
   val degraded_membership_hold_reached = s.last_event == DegradedHeld
   val completed_move_reached = s.last_event == OldRemoved
