@@ -3,11 +3,10 @@
 // Safe replacement is staged:
 //   plan -> add learner -> catch up -> promote -> transfer leader -> remove old
 //
-// The model also includes the scheduler's incomplete-membership and degraded-
-// capacity hold guards. Faults may occur during a move; the target can be aborted
-// before promotion or rolled back afterward without crossing the RF quorum floor.
+// The scheduler observes only whether a node is Healthy; Suspect, Dead, and
+// Draining are all excluded candidates. Representing that exact predicate as a set
+// avoids multiplying equivalent states while preserving placement behavior.
 module brain_reconfiguration {
-  type Health = Healthy | Suspect | Dead | Draining
   type Phase = Stable | Planned | LearnerAdded | CaughtUp | Promoted
   type Event =
     | InitEvent
@@ -26,13 +25,12 @@ module brain_reconfiguration {
     | PromotedRolledBack
 
   pure val NODES = Set(1, 2, 3, 4)
-  pure val HEALTHS = Set(Healthy, Suspect, Dead, Draining)
   pure val RF = 3
   pure val NO_NODE = 0
 
   type State = {
     known: Set[int],
-    health: int -> Health,
+    healthy: Set[int],
     voters: Set[int],
     learners: Set[int],
     leader: int,
@@ -47,16 +45,13 @@ module brain_reconfiguration {
 
   var s: State
 
-  val healthy_nodes =
-    NODES.filter(node => s.health.get(node) == Healthy)
-
   val membership_complete =
     s.voters.subseteq(s.known)
 
   action init = {
     s' = {
       known: NODES,
-      health: NODES.mapBy(_ => Healthy),
+      healthy: NODES,
       voters: Set(1, 2, 3),
       learners: Set(),
       leader: 1,
@@ -71,7 +66,7 @@ module brain_reconfiguration {
   }
 
   // Membership is leader-local soft state. On brain failover, missing knowledge of
-  // a current voter must cause a hold rather than replica-set shrinkage.
+  // a current voter must hold placement rather than shrink it.
   action lose_membership(node) = all {
     s.phase == Stable,
     s.known.contains(node),
@@ -93,12 +88,20 @@ module brain_reconfiguration {
     },
   }
 
-  action change_health(node, new_health) = all {
+  action mark_healthy(node) = all {
     NODES.contains(node),
-    HEALTHS.contains(new_health),
     s' = {
       ...s,
-      health: s.health.set(node, new_health),
+      healthy: s.healthy.union(Set(node)),
+      last_event: HealthChanged,
+    },
+  }
+
+  action mark_unhealthy(node) = all {
+    NODES.contains(node),
+    s' = {
+      ...s,
+      healthy: s.healthy.exclude(Set(node)),
       last_event: HealthChanged,
     },
   }
@@ -112,21 +115,21 @@ module brain_reconfiguration {
   action hold_degraded_membership = all {
     s.phase == Stable,
     membership_complete,
-    healthy_nodes.size() < RF,
+    s.healthy.size() < RF,
     s' = { ...s, last_event: DegradedHeld },
   }
 
   // Exactly one voter is selected for replacement from a complete view with at
-  // least RF Healthy candidates. The snapshots make that start condition part of
-  // every later active-move state, even if health subsequently changes.
+  // least RF Healthy candidates. Snapshots preserve the start preconditions even
+  // if health changes while the data plane executes the move.
   action plan_move(source, target) = all {
     s.phase == Stable,
     membership_complete,
-    healthy_nodes.size() >= RF,
+    s.healthy.size() >= RF,
     s.voters.contains(source),
     s.known.contains(target),
     not(s.voters.contains(target)),
-    s.health.get(target) == Healthy,
+    s.healthy.contains(target),
     s' = {
       ...s,
       phase: Planned,
@@ -134,7 +137,7 @@ module brain_reconfiguration {
       move_to: target,
       voters_before_move: s.voters,
       known_at_plan: s.known,
-      healthy_at_plan: healthy_nodes,
+      healthy_at_plan: s.healthy,
       last_event: MovePlanned,
     },
   }
@@ -142,7 +145,7 @@ module brain_reconfiguration {
   action add_learner = all {
     s.phase == Planned,
     s.known.contains(s.move_to),
-    s.health.get(s.move_to) == Healthy,
+    s.healthy.contains(s.move_to),
     s' = {
       ...s,
       learners: s.learners.union(Set(s.move_to)),
@@ -154,7 +157,7 @@ module brain_reconfiguration {
   action catch_up_learner = all {
     s.phase == LearnerAdded,
     s.learners.contains(s.move_to),
-    s.health.get(s.move_to) == Healthy,
+    s.healthy.contains(s.move_to),
     s' = {
       ...s,
       phase: CaughtUp,
@@ -166,7 +169,7 @@ module brain_reconfiguration {
   action promote_learner = all {
     s.phase == CaughtUp,
     s.learners.contains(s.move_to),
-    s.health.get(s.move_to) == Healthy,
+    s.healthy.contains(s.move_to),
     s' = {
       ...s,
       voters: s.voters.union(Set(s.move_to)),
@@ -176,10 +179,9 @@ module brain_reconfiguration {
     },
   }
 
-  // The current leader is always a voter and must move before its voter is removed.
   action transfer_leader(candidate) = all {
     s.voters.contains(candidate),
-    s.health.get(candidate) == Healthy,
+    s.healthy.contains(candidate),
     candidate != s.leader,
     s' = {
       ...s,
@@ -192,7 +194,7 @@ module brain_reconfiguration {
     s.phase == Promoted,
     s.voters.contains(s.move_from),
     s.voters.contains(s.move_to),
-    s.health.get(s.move_to) == Healthy,
+    s.healthy.contains(s.move_to),
     s.leader != s.move_from,
     s' = {
       ...s,
@@ -245,11 +247,11 @@ module brain_reconfiguration {
   action step = {
     nondet node = NODES.oneOf()
     nondet other = NODES.oneOf()
-    nondet new_health = HEALTHS.oneOf()
     any {
       lose_membership(node),
       restore_membership(node),
-      change_health(node, new_health),
+      mark_healthy(node),
+      mark_unhealthy(node),
       hold_incomplete_membership,
       hold_degraded_membership,
       plan_move(node, other),
@@ -266,6 +268,7 @@ module brain_reconfiguration {
 
   val identifiers_are_bounded = and {
     s.known.subseteq(NODES),
+    s.healthy.subseteq(NODES),
     s.voters.subseteq(NODES),
     s.learners.subseteq(NODES),
     s.known_at_plan.subseteq(NODES),
