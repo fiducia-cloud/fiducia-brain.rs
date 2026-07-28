@@ -164,16 +164,48 @@ jobs:
           set -e
           exit "$status"
 
-      - name: Exhaustively check reconfiguration state space
+      - name: Capture verifier command surface
         shell: bash
         run: |
+          npx --yes --package="$QUINT_PACKAGE" quint verify --help 2>&1 \
+            | tee .formal-artifacts/reconfiguration/verify-help.log
+
+      - name: Exhaustively check reconfiguration state space
+        shell: bash
+        env:
+          NODE_OPTIONS: '--trace-uncaught'
+          RUST_BACKTRACE: full
+        run: |
+          mkdir -p .formal-artifacts/reconfiguration/tmp
+          export TMPDIR="$PWD/.formal-artifacts/reconfiguration/tmp"
+
           set +e
           npx --yes --package="$QUINT_PACKAGE" quint verify \
             formal/brain_reconfiguration.qnt \
             --backend=tlc \
-            --invariant=reconfiguration_safety 2>&1 \
+            --invariant=reconfiguration_safety \
+            --verbosity=3 2>&1 \
             | tee .formal-artifacts/reconfiguration/tlc.log
           status=${PIPESTATUS[0]}
+
+          # Quint/Apalache may place generated TLA, CFG, JSON, or log files outside
+          # TMPDIR. Retain only small textual diagnostics rather than verifier jars.
+          mkdir -p .formal-artifacts/reconfiguration/quint-diagnostics
+          if [[ -d "$HOME/.quint" ]]; then
+            while IFS= read -r -d '' diagnostic; do
+              relative=${diagnostic#"$HOME/.quint/"}
+              destination=".formal-artifacts/reconfiguration/quint-diagnostics/$relative"
+              mkdir -p "$(dirname "$destination")"
+              cp "$diagnostic" "$destination"
+            done < <(
+              find "$HOME/.quint" -type f \
+                \( -name '*.log' -o -name '*.tla' -o -name '*.cfg' -o -name '*.json' -o -name '*.txt' \) \
+                -size -8M -print0
+            )
+          fi
+
+          find .formal-artifacts/reconfiguration/tmp -maxdepth 6 -type f -print \
+            > .formal-artifacts/reconfiguration/tmp-files.txt || true
           set -e
           exit "$status"
 
