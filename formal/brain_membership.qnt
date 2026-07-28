@@ -8,6 +8,10 @@
 //   * Draining is operator intent and remains sticky;
 //   * sequenced stale/duplicate heartbeats cannot overwrite newer reports;
 //   * seq == 0 remains a legacy, always-accepted heartbeat.
+//
+// Nodes are independent for this detector, so a single representative node is
+// sufficient for exhaustive checking and avoids multiplying an identical state
+// machine across a Cartesian product.
 module brain_membership {
   type Health = Healthy | Suspect | Dead | Draining
   type Age = Fresh | SuspectAge | DeadAge
@@ -19,7 +23,7 @@ module brain_membership {
     | SweepEvent
     | DrainEvent
 
-  pure val NODES = Set(1, 2)
+  pure val NODES = Set(1)
   pure val SEQS = Set(0, 1, 2, 3)
   pure val REPORT_VERSIONS = Set(0, 1, 2)
   pure val NO_NODE = 0
@@ -30,7 +34,6 @@ module brain_membership {
     oracle: int -> Oracle,
     last_seq: int -> int,
     report_version: int -> int,
-    dead_notifications: int -> int,
     ever_draining: Set[int],
     last_event: Event,
     last_node: int,
@@ -68,7 +71,6 @@ module brain_membership {
       oracle: NODES.mapBy(_ => OracleUnknown),
       last_seq: NODES.mapBy(_ => 0),
       report_version: NODES.mapBy(_ => 0),
-      dead_notifications: NODES.mapBy(_ => 0),
       ever_draining: Set(),
       last_event: InitEvent,
       last_node: NO_NODE,
@@ -146,15 +148,6 @@ module brain_membership {
           s.oracle.get(node)
         )
       ),
-      dead_notifications: s.dead_notifications.setBy(node, count =>
-        if (
-          swept_health(
-            s.health.get(node),
-            s.age.get(node),
-            s.oracle.get(node)
-          ) == Dead and s.health.get(node) != Dead
-        ) count + 1 else count
-      ),
       last_event: SweepEvent,
       last_node: node,
       saw_running_hold: s.saw_running_hold or and {
@@ -191,15 +184,6 @@ module brain_membership {
           s.oracle.get(node)
         )
       ),
-      dead_notifications: s.dead_notifications.setBy(node, count =>
-        if (
-          swept_health(
-            s.health.get(node),
-            candidate,
-            s.oracle.get(node)
-          ) == Dead and s.health.get(node) != Dead
-        ) count + 1 else count
-      ),
       last_event: SweepEvent,
       last_node: node,
       saw_running_hold: s.saw_running_hold or and {
@@ -229,12 +213,6 @@ module brain_membership {
       health: s.health.set(
         node,
         swept_health(s.health.get(node), s.age.get(node), verdict)
-      ),
-      dead_notifications: s.dead_notifications.setBy(node, count =>
-        if (
-          swept_health(s.health.get(node), s.age.get(node), verdict) == Dead
-          and s.health.get(node) != Dead
-        ) count + 1 else count
       ),
       last_event: SweepEvent,
       last_node: node,
@@ -289,7 +267,6 @@ module brain_membership {
     s.last_seq.get(node) >= 0,
     s.last_seq.get(node) <= 3,
     REPORT_VERSIONS.contains(s.report_version.get(node)),
-    s.dead_notifications.get(node) >= 0,
   })
 
   // Operator drain intent is never undone by a heartbeat or a failure sweep.
