@@ -1,17 +1,8 @@
-// Executable model of fiducia-brain's hybrid membership/failure detector.
+// Per-node executable model of fiducia-brain's hybrid failure detector.
 //
-// The implementation combines heartbeat age with a Kubernetes-style oracle:
-//   * Healthy -> Suspect -> Dead by elapsed heartbeat age;
-//   * a Gone pod is Dead immediately on the next sweep;
-//   * a Running pod is held at Suspect rather than declared Dead on silence;
-//   * Unknown trusts the timeout verdict;
-//   * Draining is operator intent and remains sticky;
-//   * sequenced stale/duplicate heartbeats cannot overwrite newer reports;
-//   * seq == 0 remains a legacy, always-accepted heartbeat.
-//
-// Nodes are independent for this detector, so a single representative node is
-// sufficient for exhaustive checking and avoids multiplying an identical state
-// machine across a Cartesian product.
+// Membership nodes do not transition jointly, so one scalar machine is sufficient
+// for exhaustive checking. This keeps TLC focused on behavior rather than a
+// Cartesian product of independent copies.
 module brain_membership {
   type Health = Healthy | Suspect | Dead | Draining
   type Age = Fresh | SuspectAge | DeadAge
@@ -19,34 +10,30 @@ module brain_membership {
   type Event =
     | InitEvent
     | HeartbeatAccepted
-    | HeartbeatIgnored
-    | SweepEvent
+    | StaleIgnored
+    | SweepOther
+    | RunningHeld
+    | GoneDead
+    | TimeoutDead
     | DrainEvent
+    | DrainingHeartbeat
+    | Resurrected
 
-  pure val NODES = Set(1)
   pure val SEQS = Set(0, 1, 2, 3)
   pure val REPORT_VERSIONS = Set(0, 1, 2)
-  pure val NO_NODE = 0
 
   type State = {
-    health: int -> Health,
-    age: int -> Age,
-    oracle: int -> Oracle,
-    last_seq: int -> int,
-    report_version: int -> int,
-    ever_draining: Set[int],
+    health: Health,
+    age: Age,
+    oracle: Oracle,
+    last_seq: int,
+    report_version: int,
+    ever_draining: bool,
     last_event: Event,
-    last_node: int,
     ignored_seq_baseline: int,
     ignored_report_baseline: int,
     ignored_health_baseline: Health,
     ignored_age_baseline: Age,
-    saw_stale_ignored: bool,
-    saw_running_hold: bool,
-    saw_gone_dead: bool,
-    saw_timeout_dead: bool,
-    saw_draining_heartbeat: bool,
-    saw_resurrection: bool,
   }
 
   var s: State
@@ -59,6 +46,13 @@ module brain_membership {
     else if (age == SuspectAge) Suspect
     else Healthy
 
+  pure def sweep_event(current: Health, age: Age, oracle: Oracle): Event =
+    if (current == Draining) SweepOther
+    else if (oracle == OracleGone) GoneDead
+    else if (oracle == OracleRunning and age == DeadAge) RunningHeld
+    else if (oracle == OracleUnknown and age == DeadAge) TimeoutDead
+    else SweepOther
+
   pure def next_age(current: Age, candidate: Age): bool = or {
     current == Fresh and candidate == SuspectAge,
     current == SuspectAge and candidate == DeadAge,
@@ -66,259 +60,173 @@ module brain_membership {
 
   action init = {
     s' = {
-      health: NODES.mapBy(_ => Healthy),
-      age: NODES.mapBy(_ => Fresh),
-      oracle: NODES.mapBy(_ => OracleUnknown),
-      last_seq: NODES.mapBy(_ => 0),
-      report_version: NODES.mapBy(_ => 0),
-      ever_draining: Set(),
+      health: Healthy,
+      age: Fresh,
+      oracle: OracleUnknown,
+      last_seq: 0,
+      report_version: 0,
+      ever_draining: false,
       last_event: InitEvent,
-      last_node: NO_NODE,
       ignored_seq_baseline: 0,
       ignored_report_baseline: 0,
       ignored_health_baseline: Healthy,
       ignored_age_baseline: Fresh,
-      saw_stale_ignored: false,
-      saw_running_hold: false,
-      saw_gone_dead: false,
-      saw_timeout_dead: false,
-      saw_draining_heartbeat: false,
-      saw_resurrection: false,
     }
   }
 
-  // A sequenced heartbeat is accepted only when strictly newer. The legacy
-  // unsequenced form (seq == 0) is always accepted but never lowers last_seq.
-  action accept_heartbeat(node, seq, report) = all {
-    NODES.contains(node),
+  // Positive sequences must be strictly newer. Legacy seq == 0 is always
+  // accepted, but cannot lower the accepted sequence floor.
+  action accept_heartbeat(seq, report) = all {
     SEQS.contains(seq),
     REPORT_VERSIONS.contains(report),
-    seq == 0 or seq > s.last_seq.get(node),
+    seq == 0 or seq > s.last_seq,
     s' = {
       ...s,
-      health: s.health.set(
-        node,
-        if (s.health.get(node) == Draining) Draining else Healthy
-      ),
-      age: s.age.set(node, Fresh),
-      last_seq: s.last_seq.set(
-        node,
-        if (seq == 0) s.last_seq.get(node) else seq
-      ),
-      report_version: s.report_version.set(node, report),
-      last_event: HeartbeatAccepted,
-      last_node: node,
-      saw_draining_heartbeat:
-        s.saw_draining_heartbeat or s.health.get(node) == Draining,
-      saw_resurrection:
-        s.saw_resurrection or s.health.get(node) == Dead,
+      health: if (s.health == Draining) Draining else Healthy,
+      age: Fresh,
+      last_seq: if (seq == 0) s.last_seq else seq,
+      report_version: report,
+      last_event:
+        if (s.health == Draining) DrainingHeartbeat
+        else if (s.health == Dead) Resurrected
+        else HeartbeatAccepted,
     },
   }
 
-  // A delayed or duplicated sequenced heartbeat refreshes nothing and cannot
-  // revert the address/shard report represented here by report_version.
-  action ignore_stale_heartbeat(node, seq, report) = all {
-    NODES.contains(node),
+  // Delayed/duplicate sequenced reports refresh nothing and cannot overwrite the
+  // report accepted with a newer sequence.
+  action ignore_stale_heartbeat(seq, report) = all {
     SEQS.contains(seq),
     REPORT_VERSIONS.contains(report),
     seq > 0,
-    seq <= s.last_seq.get(node),
+    seq <= s.last_seq,
     s' = {
       ...s,
-      last_event: HeartbeatIgnored,
-      last_node: node,
-      ignored_seq_baseline: s.last_seq.get(node),
-      ignored_report_baseline: s.report_version.get(node),
-      ignored_health_baseline: s.health.get(node),
-      ignored_age_baseline: s.age.get(node),
-      saw_stale_ignored: true,
+      last_event: StaleIgnored,
+      ignored_seq_baseline: s.last_seq,
+      ignored_report_baseline: s.report_version,
+      ignored_health_baseline: s.health,
+      ignored_age_baseline: s.age,
     },
   }
 
-  // A periodic sweep applies the exact timeout/oracle merge used by membership.rs.
-  action sweep(node) = all {
-    NODES.contains(node),
+  action sweep = {
     s' = {
       ...s,
-      health: s.health.set(
-        node,
-        swept_health(
-          s.health.get(node),
-          s.age.get(node),
-          s.oracle.get(node)
-        )
-      ),
-      last_event: SweepEvent,
-      last_node: node,
-      saw_running_hold: s.saw_running_hold or and {
-        s.oracle.get(node) == OracleRunning,
-        s.age.get(node) == DeadAge,
-        s.health.get(node) != Draining,
-      },
-      saw_gone_dead: s.saw_gone_dead or and {
-        s.oracle.get(node) == OracleGone,
-        s.health.get(node) != Draining,
-      },
-      saw_timeout_dead: s.saw_timeout_dead or and {
-        s.oracle.get(node) == OracleUnknown,
-        s.age.get(node) == DeadAge,
-        s.health.get(node) != Draining,
-      },
+      health: swept_health(s.health, s.age, s.oracle),
+      last_event: sweep_event(s.health, s.age, s.oracle),
+    }
+  }
+
+  // Milliseconds are abstracted to the only two threshold crossings that change
+  // behavior. Crossing and applying the periodic sweep is one atomic model step.
+  action age_and_sweep(candidate) = all {
+    next_age(s.age, candidate),
+    s' = {
+      ...s,
+      age: candidate,
+      health: swept_health(s.health, candidate, s.oracle),
+      last_event: sweep_event(s.health, candidate, s.oracle),
     },
   }
 
-  // Time is abstracted into the only two threshold crossings that affect the
-  // detector. Crossing a threshold and running the periodic sweep is one model
-  // action; arbitrary millisecond values add no behavior but greatly enlarge TLC.
-  action age_and_sweep(node, candidate) = all {
-    NODES.contains(node),
-    next_age(s.age.get(node), candidate),
+  // The membership loop consumes one coherent oracle verdict per sweep.
+  action oracle_and_sweep(verdict) = {
     s' = {
       ...s,
-      age: s.age.set(node, candidate),
-      health: s.health.set(
-        node,
-        swept_health(
-          s.health.get(node),
-          candidate,
-          s.oracle.get(node)
-        )
-      ),
-      last_event: SweepEvent,
-      last_node: node,
-      saw_running_hold: s.saw_running_hold or and {
-        s.oracle.get(node) == OracleRunning,
-        candidate == DeadAge,
-        s.health.get(node) != Draining,
-      },
-      saw_gone_dead: s.saw_gone_dead or and {
-        s.oracle.get(node) == OracleGone,
-        s.health.get(node) != Draining,
-      },
-      saw_timeout_dead: s.saw_timeout_dead or and {
-        s.oracle.get(node) == OracleUnknown,
-        candidate == DeadAge,
-        s.health.get(node) != Draining,
-      },
-    },
+      oracle: verdict,
+      health: swept_health(s.health, s.age, verdict),
+      last_event: sweep_event(s.health, s.age, verdict),
+    }
   }
 
-  // Oracle refresh and sweep are atomic at this abstraction boundary. This models
-  // the membership loop consuming one coherent oracle verdict for the node.
-  action oracle_and_sweep(node, verdict) = all {
-    NODES.contains(node),
+  action drain = {
     s' = {
       ...s,
-      oracle: s.oracle.set(node, verdict),
-      health: s.health.set(
-        node,
-        swept_health(s.health.get(node), s.age.get(node), verdict)
-      ),
-      last_event: SweepEvent,
-      last_node: node,
-      saw_running_hold: s.saw_running_hold or and {
-        verdict == OracleRunning,
-        s.age.get(node) == DeadAge,
-        s.health.get(node) != Draining,
-      },
-      saw_gone_dead: s.saw_gone_dead or and {
-        verdict == OracleGone,
-        s.health.get(node) != Draining,
-      },
-      saw_timeout_dead: s.saw_timeout_dead or and {
-        verdict == OracleUnknown,
-        s.age.get(node) == DeadAge,
-        s.health.get(node) != Draining,
-      },
-    },
-  }
-
-  action drain(node) = all {
-    NODES.contains(node),
-    s' = {
-      ...s,
-      health: s.health.set(node, Draining),
-      ever_draining: s.ever_draining.union(Set(node)),
+      health: Draining,
+      ever_draining: true,
       last_event: DrainEvent,
-      last_node: node,
-    },
+    }
   }
 
   action idle = s' = s
 
   action step = {
-    nondet node = NODES.oneOf()
     nondet seq = SEQS.oneOf()
     nondet report = REPORT_VERSIONS.oneOf()
     nondet age = Set(SuspectAge, DeadAge).oneOf()
     nondet verdict = Set(OracleUnknown, OracleRunning, OracleGone).oneOf()
     any {
-      accept_heartbeat(node, seq, report),
-      ignore_stale_heartbeat(node, seq, report),
-      sweep(node),
-      age_and_sweep(node, age),
-      oracle_and_sweep(node, verdict),
-      drain(node),
+      accept_heartbeat(seq, report),
+      ignore_stale_heartbeat(seq, report),
+      sweep,
+      age_and_sweep(age),
+      oracle_and_sweep(verdict),
+      drain,
       idle,
     }
   }
 
-  val values_are_bounded = NODES.forall(node => and {
-    s.last_seq.get(node) >= 0,
-    s.last_seq.get(node) <= 3,
-    REPORT_VERSIONS.contains(s.report_version.get(node)),
-  })
+  val values_are_bounded = and {
+    s.last_seq >= 0,
+    s.last_seq <= 3,
+    REPORT_VERSIONS.contains(s.report_version),
+  }
 
-  // Operator drain intent is never undone by a heartbeat or a failure sweep.
   val draining_is_sticky =
-    s.ever_draining.forall(node => s.health.get(node) == Draining)
+    not(s.ever_draining) or s.health == Draining
 
-  // The ignored message may contain any old report, but every accepted field from
-  // the newer report is unchanged.
   val stale_heartbeat_preserves_newer_state =
-    s.last_event != HeartbeatIgnored or and {
-      NODES.contains(s.last_node),
-      s.last_seq.get(s.last_node) == s.ignored_seq_baseline,
-      s.report_version.get(s.last_node) == s.ignored_report_baseline,
-      s.health.get(s.last_node) == s.ignored_health_baseline,
-      s.age.get(s.last_node) == s.ignored_age_baseline,
+    s.last_event != StaleIgnored or and {
+      s.last_seq == s.ignored_seq_baseline,
+      s.report_version == s.ignored_report_baseline,
+      s.health == s.ignored_health_baseline,
+      s.age == s.ignored_age_baseline,
     }
 
-  val accepted_heartbeat_has_expected_state =
-    s.last_event != HeartbeatAccepted or and {
-      NODES.contains(s.last_node),
-      s.age.get(s.last_node) == Fresh,
-      or {
-        s.health.get(s.last_node) == Healthy,
-        s.health.get(s.last_node) == Draining,
-      },
-    }
+  val heartbeat_state_is_expected = and {
+    not(s.last_event == HeartbeatAccepted or s.last_event == Resurrected)
+      or and { s.health == Healthy, s.age == Fresh },
+    s.last_event != DrainingHeartbeat
+      or and { s.health == Draining, s.age == Fresh },
+  }
 
-  // After each sweep, the stored verdict is exactly the hybrid detector function.
-  // swept_health is idempotent, so this remains checkable from the resulting state.
-  val sweep_applies_hybrid_verdict =
-    s.last_event != SweepEvent or and {
-      NODES.contains(s.last_node),
-      s.health.get(s.last_node) == swept_health(
-        s.health.get(s.last_node),
-        s.age.get(s.last_node),
-        s.oracle.get(s.last_node)
-      ),
-    }
+  // swept_health is idempotent, so the resulting state can validate the exact
+  // timeout/oracle merge without retaining a second copy of pre-sweep state.
+  val sweep_state_is_expected =
+    not(Set(SweepOther, RunningHeld, GoneDead, TimeoutDead).contains(s.last_event))
+      or s.health == swept_health(s.health, s.age, s.oracle)
+
+  val event_classification_is_exact = and {
+    s.last_event != RunningHeld or and {
+      s.oracle == OracleRunning,
+      s.age == DeadAge,
+      s.health == Suspect,
+    },
+    s.last_event != GoneDead or and {
+      s.oracle == OracleGone,
+      s.health == Dead,
+    },
+    s.last_event != TimeoutDead or and {
+      s.oracle == OracleUnknown,
+      s.age == DeadAge,
+      s.health == Dead,
+    },
+  }
 
   val membership_safety = and {
     values_are_bounded,
     draining_is_sticky,
     stale_heartbeat_preserves_newer_state,
-    accepted_heartbeat_has_expected_state,
-    sweep_applies_hybrid_verdict,
+    heartbeat_state_is_expected,
+    sweep_state_is_expected,
+    event_classification_is_exact,
   }
 
-  // Reachability witnesses prevent the model from becoming safely vacuous.
-  val stale_delivery_reached = s.saw_stale_ignored
-  val running_oracle_hold_reached = s.saw_running_hold
-  val gone_oracle_dead_reached = s.saw_gone_dead
-  val timeout_dead_reached = s.saw_timeout_dead
-  val draining_heartbeat_reached = s.saw_draining_heartbeat
-  val resurrection_reached = s.saw_resurrection
+  val stale_delivery_reached = s.last_event == StaleIgnored
+  val running_oracle_hold_reached = s.last_event == RunningHeld
+  val gone_oracle_dead_reached = s.last_event == GoneDead
+  val timeout_dead_reached = s.last_event == TimeoutDead
+  val draining_heartbeat_reached = s.last_event == DrainingHeartbeat
+  val resurrection_reached = s.last_event == Resurrected
 }
