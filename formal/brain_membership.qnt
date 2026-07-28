@@ -170,7 +170,7 @@ module brain_membership {
   // Time is abstracted into the only two threshold crossings that affect the
   // detector. Crossing a threshold and running the periodic sweep is one model
   // action; arbitrary millisecond values add no behavior but greatly enlarge TLC.
-  action age_and_sweep(node, candidate: Age) = all {
+  action age_and_sweep(node, candidate) = all {
     NODES.contains(node),
     next_age(s.age.get(node), candidate),
     s' = {
@@ -205,7 +205,7 @@ module brain_membership {
 
   // Oracle refresh and sweep are atomic at this abstraction boundary. This models
   // the membership loop consuming one coherent oracle verdict for the node.
-  action oracle_and_sweep(node, verdict: Oracle) = all {
+  action oracle_and_sweep(node, verdict) = all {
     NODES.contains(node),
     s' = {
       ...s,
