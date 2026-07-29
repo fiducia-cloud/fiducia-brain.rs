@@ -1,0 +1,236 @@
+name: formal-methods
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  membership:
+    name: Quint hybrid membership model
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      QUINT_PACKAGE: '@informalsystems/quint@0.32.0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Install Java for TLC
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Typecheck membership model
+        shell: bash
+        run: |
+          mkdir -p .formal-artifacts/membership
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck \
+            formal/brain_membership.qnt 2>&1 \
+            | tee .formal-artifacts/membership/typecheck.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Simulate invariant and recovery witnesses
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_membership.qnt \
+            --max-samples=10000 \
+            --max-steps=35 \
+            --invariant=membership_safety \
+            --witnesses \
+              stale_delivery_reached \
+              running_oracle_hold_reached \
+              gone_oracle_dead_reached \
+              timeout_dead_reached \
+              draining_heartbeat_reached \
+              resurrection_reached 2>&1 \
+            | tee .formal-artifacts/membership/simulation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Exhaustively check membership state space
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint verify \
+            formal/brain_membership.qnt \
+            --backend=tlc \
+            --invariant=membership_safety 2>&1 \
+            | tee .formal-artifacts/membership/tlc.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Generate membership model-based traces
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_membership.qnt \
+            --max-samples=500 \
+            --max-steps=30 \
+            --n-traces=6 \
+            --mbt \
+            --out-itf='.formal-artifacts/membership/trace-{seq}.itf.json' 2>&1 \
+            | tee .formal-artifacts/membership/trace-generation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Upload membership diagnostics and traces
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fiducia-brain-membership-formal
+          path: .formal-artifacts/membership/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  reconfiguration:
+    name: Quint shard reconfiguration model
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      QUINT_PACKAGE: '@informalsystems/quint@0.32.0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Install Java for TLC
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Typecheck reconfiguration model
+        shell: bash
+        run: |
+          mkdir -p .formal-artifacts/reconfiguration
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck \
+            formal/brain_reconfiguration.qnt 2>&1 \
+            | tee .formal-artifacts/reconfiguration/typecheck.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Simulate invariant and staged-move witnesses
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_reconfiguration.qnt \
+            --max-samples=20000 \
+            --max-steps=55 \
+            --invariant=reconfiguration_safety \
+            --witnesses \
+              incomplete_membership_hold_reached \
+              degraded_membership_hold_reached \
+              completed_move_reached \
+              rollback_reached \
+              leader_transfer_reached 2>&1 \
+            | tee .formal-artifacts/reconfiguration/simulation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Capture verifier command surface
+        shell: bash
+        run: |
+          npx --yes --package="$QUINT_PACKAGE" quint verify --help 2>&1 \
+            | tee .formal-artifacts/reconfiguration/verify-help.log
+
+      - name: Exhaustively check reconfiguration state space
+        shell: bash
+        env:
+          NODE_OPTIONS: '--trace-uncaught'
+          RUST_BACKTRACE: full
+        run: |
+          mkdir -p .formal-artifacts/reconfiguration/tmp
+          export TMPDIR="$PWD/.formal-artifacts/reconfiguration/tmp"
+
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint verify \
+            formal/brain_reconfiguration.qnt \
+            --backend=tlc \
+            --invariant=reconfiguration_safety \
+            --verbosity=3 2>&1 \
+            | tee .formal-artifacts/reconfiguration/tlc.log
+          status=${PIPESTATUS[0]}
+
+          # Quint/Apalache may place generated TLA, CFG, JSON, or log files outside
+          # TMPDIR. Retain only small textual diagnostics rather than verifier jars.
+          mkdir -p .formal-artifacts/reconfiguration/quint-diagnostics
+          if [[ -d "$HOME/.quint" ]]; then
+            while IFS= read -r -d '' diagnostic; do
+              relative=${diagnostic#"$HOME/.quint/"}
+              destination=".formal-artifacts/reconfiguration/quint-diagnostics/$relative"
+              mkdir -p "$(dirname "$destination")"
+              cp "$diagnostic" "$destination"
+            done < <(
+              find "$HOME/.quint" -type f \
+                \( -name '*.log' -o -name '*.tla' -o -name '*.cfg' -o -name '*.json' -o -name '*.txt' \) \
+                -size -8M -print0
+            )
+          fi
+
+          find .formal-artifacts/reconfiguration/tmp -maxdepth 6 -type f -print \
+            > .formal-artifacts/reconfiguration/tmp-files.txt || true
+          set -e
+          exit "$status"
+
+      - name: Generate reconfiguration model-based traces
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_reconfiguration.qnt \
+            --max-samples=750 \
+            --max-steps=45 \
+            --n-traces=6 \
+            --mbt \
+            --out-itf='.formal-artifacts/reconfiguration/trace-{seq}.itf.json' 2>&1 \
+            | tee .formal-artifacts/reconfiguration/trace-generation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Upload reconfiguration diagnostics and traces
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fiducia-brain-reconfiguration-formal
+          path: .formal-artifacts/reconfiguration/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

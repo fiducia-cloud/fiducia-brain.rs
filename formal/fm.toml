@@ -1,0 +1,80 @@
+# Provisional multi-model manifest for DEN-572's planned Rust `fmctl`.
+# The current GitHub Actions workflow executes these settings directly.
+schema_version = 1
+project = "fiducia-brain.rs"
+
+[toolchain]
+quint = "0.32.0"
+java = ">=21"
+
+[[models]]
+name = "brain-membership"
+language = "quint"
+spec = "formal/brain_membership.qnt"
+main = "brain_membership"
+init = "init"
+step = "step"
+invariants = ["membership_safety"]
+witnesses = [
+  "stale_delivery_reached",
+  "running_oracle_hold_reached",
+  "gone_oracle_dead_reached",
+  "timeout_dead_reached",
+  "draining_heartbeat_reached",
+  "resurrection_reached",
+]
+
+[models.simulation]
+backend = "typescript"
+max_samples = 10000
+max_steps = 35
+
+[models.verification]
+backend = "tlc"
+exhaustive_finite_model = true
+
+[models.traces]
+format = "itf"
+model_based_testing_metadata = true
+count = 6
+max_steps = 30
+
+[[models]]
+name = "brain-reconfiguration"
+language = "quint"
+spec = "formal/brain_reconfiguration.qnt"
+main = "brain_reconfiguration"
+init = "init"
+step = "step"
+invariants = ["reconfiguration_safety"]
+witnesses = [
+  "incomplete_membership_hold_reached",
+  "degraded_membership_hold_reached",
+  "completed_move_reached",
+  "rollback_reached",
+  "leader_transfer_reached",
+]
+
+[models.simulation]
+backend = "typescript"
+max_samples = 20000
+max_steps = 55
+
+[models.verification]
+backend = "tlc"
+exhaustive_finite_model = true
+
+[models.traces]
+format = "itf"
+model_based_testing_metadata = true
+count = 6
+max_steps = 45
+
+[adapters.rust]
+strategy = "quint-connect"
+target = "src/membership.rs"
+status = "planned"
+
+[outputs]
+formats = ["human", "json", "junit", "sarif", "itf"]
+artifact_directory = ".formal-artifacts"
