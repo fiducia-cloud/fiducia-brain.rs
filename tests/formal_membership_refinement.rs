@@ -2,12 +2,12 @@
 
 // Compile the production membership implementation into this integration-test
 // crate. The reference transition system below is intentionally independent.
+#[path = "../src/membership.rs"]
+mod membership;
 #[path = "../src/model.rs"]
 mod model;
 #[path = "../src/oracle.rs"]
 mod oracle;
-#[path = "../src/membership.rs"]
-mod membership;
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -197,7 +197,10 @@ impl Reference {
     }
 
     fn assert_invariants(&self) {
-        assert!(self.report_version <= 2, "report version left finite domain");
+        assert!(
+            self.report_version <= 2,
+            "report version left finite domain"
+        );
         assert!(self.last_seq <= 3, "sequence left finite domain");
         assert!(
             !self.ever_draining || self.health == Health::Draining,
@@ -291,13 +294,7 @@ struct Coverage {
 }
 
 impl Coverage {
-    fn observe(
-        &mut self,
-        parent: &Reference,
-        action: Action,
-        outcome: Outcome,
-        child: &Reference,
-    ) {
+    fn observe(&mut self, parent: &Reference, action: Action, outcome: Outcome, child: &Reference) {
         match (action, outcome) {
             (
                 Action::Heartbeat {
@@ -346,10 +343,7 @@ impl Coverage {
                 }
             }
             (Action::AdvanceToDead, Outcome::Sweep { newly_dead }) => {
-                if parent.oracle == Verdict::Unknown
-                    && child.health == Health::Dead
-                    && newly_dead
-                {
+                if parent.oracle == Verdict::Unknown && child.health == Health::Dead && newly_dead {
                     self.timeout_dead_once = true;
                 }
                 if parent.oracle == Verdict::Running
@@ -397,7 +391,10 @@ impl Coverage {
         );
         assert!(self.draining_sweep_is_sticky, "coverage: draining sweep");
         assert!(self.resurrection, "coverage: fresh heartbeat resurrection");
-        assert!(self.stale_preserves_report, "coverage: stale report preservation");
+        assert!(
+            self.stale_preserves_report,
+            "coverage: stale report preservation"
+        );
     }
 }
 
@@ -517,11 +514,7 @@ fn execute(
             report_version,
         } => Outcome::Heartbeat(
             membership
-                .heartbeat(
-                    &node_id,
-                    reference.now_ms,
-                    report(seq, report_version),
-                )
+                .heartbeat(&node_id, reference.now_ms, report(seq, report_version))
                 .into(),
         ),
         Action::Sweep => sweep_outcome(membership, reference.now_ms),
