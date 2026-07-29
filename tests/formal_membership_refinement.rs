@@ -353,18 +353,17 @@ impl Coverage {
                     self.running_holds_at_suspect = true;
                 }
             }
-            (Action::OracleAndSweep(Verdict::Running), Outcome::Sweep { newly_dead }) => {
+            (Action::OracleAndSweep(Verdict::Running), Outcome::Sweep { newly_dead })
                 if child.now_ms.saturating_sub(child.last_seen_ms) >= DEAD_AFTER_MS
                     && child.health == Health::Suspect
-                    && !newly_dead
-                {
-                    self.running_holds_at_suspect = true;
-                }
+                    && !newly_dead =>
+            {
+                self.running_holds_at_suspect = true;
             }
-            (Action::OracleAndSweep(Verdict::Gone), Outcome::Sweep { newly_dead }) => {
-                if child.health == Health::Dead && newly_dead {
-                    self.gone_is_immediate = true;
-                }
+            (Action::OracleAndSweep(Verdict::Gone), Outcome::Sweep { newly_dead })
+                if child.health == Health::Dead && newly_dead =>
+            {
+                self.gone_is_immediate = true;
             }
             _ => {}
         }
