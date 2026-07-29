@@ -1,20 +1,19 @@
-# Schema-v1 manifest consumed by the incubating fmctl runner.
+# Secondary schema-v1 manifest for explicit fmctl --manifest execution.
 schema_version = 1
 project = "fiducia-brain.rs"
-model = "brain-membership"
+model = "brain-reconfiguration"
 language = "quint"
-spec = "formal/brain_membership.qnt"
-main = "brain_membership"
+spec = "formal/brain_reconfiguration.qnt"
+main = "brain_reconfiguration"
 init = "init"
 step = "step"
-invariants = ["membership_safety"]
+invariants = ["reconfiguration_safety"]
 witnesses = [
-  "stale_delivery_reached",
-  "running_oracle_hold_reached",
-  "gone_oracle_dead_reached",
-  "timeout_dead_reached",
-  "draining_heartbeat_reached",
-  "resurrection_reached",
+  "incomplete_membership_hold_reached",
+  "degraded_membership_hold_reached",
+  "completed_move_reached",
+  "rollback_reached",
+  "leader_transfer_reached",
 ]
 
 [toolchain]
@@ -31,8 +30,8 @@ artifacts_dir = ".formal-artifacts"
 
 [simulation]
 backend = "typescript"
-max_samples = 10000
-max_steps = 35
+max_samples = 20000
+max_steps = 55
 
 [verification]
 backend = "tlc"
@@ -43,11 +42,10 @@ format = "itf"
 model_based_testing_metadata = true
 backend = "typescript"
 count = 6
-max_steps = 30
-max_samples = 10000
+max_steps = 45
+max_samples = 20000
 
 [adapters.rust]
-strategy = "bounded-independent-reference"
-target = "tests/formal_membership_refinement.rs"
+strategy = "itf-replay-and-scheduler-refinement"
 status = "planned"
 issue = "DEN-569"

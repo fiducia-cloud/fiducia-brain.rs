@@ -71,7 +71,10 @@ proving the underlying replication algorithm and snapshot transport is separate
 
 ## Reproduce locally
 
-Quint and the Java runtime used by CI are pinned in `fm.toml` and the workflow.
+Quint and the Java runtime used by CI are pinned in `fm.toml`,
+`fm-reconfiguration.toml`, and the workflow. The membership manifest is the
+default discovered by `fmctl`; pass
+`--manifest formal/fm-reconfiguration.toml` for the shard model.
 
 ```bash
 QUINT='npx --yes --package=@informalsystems/quint@0.32.0 quint'
@@ -113,8 +116,8 @@ membership model already has an independent bounded Rust refinement harness in
 `tests/formal_membership_refinement.rs`; it compares the production `Membership`
 state after every explored transition. That harness does not yet ingest the ITF
 corpus. ITF replay for membership and an implementation adapter for scheduler
-reconfiguration remain explicit planned work in `fm.toml`, so model checking is
-not overstated as production conformance.
+reconfiguration remain explicit planned work in the corresponding manifests, so
+model checking is not overstated as production conformance.
 
 ## Deliberate limits and next refinements
 
