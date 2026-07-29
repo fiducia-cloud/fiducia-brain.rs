@@ -1,0 +1,79 @@
+name: fix-membership-clippy
+
+on:
+  push:
+    branches:
+      - agent/den-80-brain-formal-model
+    paths:
+      - .github/workflows/fix-membership-clippy.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/den-80-brain-formal-model
+          persist-credentials: true
+      - name: Collapse guarded coverage matches
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('tests/formal_membership_refinement.rs')
+          text = path.read_text()
+          old_running = '''            (Action::OracleAndSweep(Verdict::Running), Outcome::Sweep { newly_dead }) => {
+                          if child.now_ms.saturating_sub(child.last_seen_ms) >= DEAD_AFTER_MS
+                              && child.health == Health::Suspect
+                              && !newly_dead
+                          {
+                              self.running_holds_at_suspect = true;
+                          }
+                      }
+          '''
+          new_running = '''            (
+                          Action::OracleAndSweep(Verdict::Running),
+                          Outcome::Sweep { newly_dead },
+                      ) if child.now_ms.saturating_sub(child.last_seen_ms) >= DEAD_AFTER_MS
+                          && child.health == Health::Suspect
+                          && !newly_dead =>
+                      {
+                          self.running_holds_at_suspect = true;
+                      }
+          '''
+          old_gone = '''            (Action::OracleAndSweep(Verdict::Gone), Outcome::Sweep { newly_dead }) => {
+                          if child.health == Health::Dead && newly_dead {
+                              self.gone_is_immediate = true;
+                          }
+                      }
+          '''
+          new_gone = '''            (
+                          Action::OracleAndSweep(Verdict::Gone),
+                          Outcome::Sweep { newly_dead },
+                      ) if child.health == Health::Dead && newly_dead =>
+                      {
+                          self.gone_is_immediate = true;
+                      }
+          '''
+          if old_running not in text:
+              raise SystemExit('running-oracle match block not found')
+          if old_gone not in text:
+              raise SystemExit('gone-oracle match block not found')
+          path.write_text(text.replace(old_running, new_running).replace(old_gone, new_gone))
+          PY
+          rustfmt --edition 2021 tests/formal_membership_refinement.rs
+      - name: Commit Clippy fix
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tests/formal_membership_refinement.rs
+          git commit -m "style: use guarded membership coverage matches"
+          git push origin HEAD:agent/den-80-brain-formal-model
