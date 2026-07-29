@@ -1,11 +1,12 @@
-# Provisional multi-model manifest for DEN-572's planned Rust `fmctl`.
-# The current GitHub Actions workflow executes these settings directly.
+# Schema-v1 manifest for fmctl-compatible model discovery and execution.
 schema_version = 1
 project = "fiducia-brain.rs"
 
 [toolchain]
 quint = "0.32.0"
-java = ">=21"
+node = "22"
+java = "21"
+rust = "1.95.0"
 
 [[models]]
 name = "brain-membership"
@@ -24,6 +25,16 @@ witnesses = [
   "resurrection_reached",
 ]
 
+[models.bounds]
+nodes = 1
+health_states = 4
+oracle_verdicts = 3
+heartbeat_sequences = 4
+report_variants = 3
+rust_max_depth = 6
+rust_max_states = 10000
+rust_max_transitions = 200000
+
 [models.simulation]
 backend = "typescript"
 max_samples = 10000
@@ -38,6 +49,14 @@ format = "itf"
 model_based_testing_metadata = true
 count = 6
 max_steps = 30
+
+[models.adapters.rust]
+strategy = "bounded-independent-reference"
+target = "tests/formal_membership_refinement.rs"
+status = "implemented"
+max_depth = 6
+max_states = 10000
+max_transitions = 200000
 
 [[models]]
 name = "brain-reconfiguration"
@@ -55,6 +74,12 @@ witnesses = [
   "leader_transfer_reached",
 ]
 
+[models.bounds]
+candidate_nodes = 4
+replication_factor = 3
+shards = 1
+active_replacements = 1
+
 [models.simulation]
 backend = "typescript"
 max_samples = 20000
@@ -70,9 +95,8 @@ model_based_testing_metadata = true
 count = 6
 max_steps = 45
 
-[adapters.rust]
-strategy = "quint-connect"
-target = "src/membership.rs"
+[models.adapters.rust]
+strategy = "itf-replay-and-scheduler-refinement"
 status = "planned"
 
 [outputs]

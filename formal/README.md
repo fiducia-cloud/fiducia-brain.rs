@@ -108,10 +108,13 @@ $QUINT verify formal/brain_reconfiguration.qnt \
   --invariant=reconfiguration_safety
 ```
 
-CI also exports model-based testing traces in Informal Trace Format. The next
-implementation-facing slice will replay those actions against `Membership` and a
-small Rust reconfiguration harness, then retain every discovered counterexample as
-a normal Rust regression test.
+CI also exports model-based testing traces in Informal Trace Format. The
+membership model already has an independent bounded Rust refinement harness in
+`tests/formal_membership_refinement.rs`; it compares the production `Membership`
+state after every explored transition. That harness does not yet ingest the ITF
+corpus. ITF replay for membership and an implementation adapter for scheduler
+reconfiguration remain explicit planned work in `fm.toml`, so model checking is
+not overstated as production conformance.
 
 ## Deliberate limits and next refinements
 
@@ -124,9 +127,9 @@ These models do not yet cover:
 5. partitions between the brain target and data-plane observations;
 6. temporal liveness under fairness assumptions.
 
-The next highest-value models are:
+The next highest-value refinements and models are:
 
-- `fiducia-node` leases, fencing-token monotonicity, and multi-key lock atomicity;
+- ITF replay and production scheduler/placement refinement for these brain models;
 - Raft stale-leader and snapshot/commit safety;
 - effects escrow and idempotency across duplicate delivery and failover;
 - task claim/reclaim and cron-fire ownership.
