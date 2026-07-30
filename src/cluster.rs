@@ -115,7 +115,21 @@ pub fn apply_command(
         Command::AssignShard(assignment) => placement.assign(assignment),
         Command::SetScalePlan(new_plan) => *plan.lock().unwrap() = new_plan,
         Command::ForgetNode(node_id) => {
-            if membership.forget(&node_id) {
+            // A node may report that it has evacuated before the authoritative
+            // placement update which removes its final replica has committed. The
+            // command log is the last safety boundary: never erase membership for a
+            // node that any current assignment still requires. This also makes stale
+            // or duplicated ForgetNode proposals harmless across leader failover.
+            let still_assigned = placement
+                .snapshot()
+                .iter()
+                .any(|assignment| assignment.replicas.iter().any(|id| id == &node_id));
+            if still_assigned {
+                tracing::warn!(
+                    node = %node_id,
+                    "control-plane: refusing to forget node still referenced by placement"
+                );
+            } else if membership.forget(&node_id) {
                 tracing::info!(node = %node_id, "control-plane: forgot drained, evacuated node");
             }
         }
@@ -145,22 +159,34 @@ impl ControlPlane for LocalControlPlane {
 mod tests {
     use super::*;
     use crate::membership::MembershipConfig;
-    use crate::model::ShardId;
+    use crate::model::{HeartbeatReport, ShardId};
 
-    fn local() -> (LocalControlPlane, Arc<Placement>, Arc<Mutex<ScalePlan>>) {
+    fn local() -> (
+        LocalControlPlane,
+        Arc<Membership>,
+        Arc<Placement>,
+        Arc<Mutex<ScalePlan>>,
+    ) {
         let membership = Arc::new(Membership::new(MembershipConfig::default()));
         let placement = Arc::new(Placement::new(4));
         let plan = Arc::new(Mutex::new(ScalePlan {
             target_nodes: 3,
             replication_factor: 3,
         }));
-        let cp = LocalControlPlane::new(membership, placement.clone(), plan.clone());
-        (cp, placement, plan)
+        let cp = LocalControlPlane::new(membership.clone(), placement.clone(), plan.clone());
+        (cp, membership, placement, plan)
+    }
+
+    fn heartbeat() -> HeartbeatReport {
+        HeartbeatReport {
+            address: "10.0.0.1:8090".to_owned(),
+            ..HeartbeatReport::default()
+        }
     }
 
     #[test]
     fn local_control_plane_is_always_leader_and_applies_on_propose() {
-        let (cp, placement, plan) = local();
+        let (cp, _, placement, plan) = local();
         assert!(cp.is_leader());
         assert_eq!(cp.leader_addr(), None);
 
@@ -179,5 +205,55 @@ mod tests {
             replication_factor: 3,
         }));
         assert_eq!(plan.lock().unwrap().target_nodes, 5);
+    }
+
+    #[test]
+    fn forget_node_is_rejected_while_authoritative_placement_references_it() {
+        let (cp, membership, placement, _) = local();
+        let node = "a".to_owned();
+        membership.heartbeat(&node, 0, heartbeat());
+        assert!(membership.drain(&node));
+        placement.assign(ShardAssignment {
+            shard_id: 0,
+            replicas: vec![node.clone(), "b".into(), "c".into()],
+            preferred_leader: Some("b".into()),
+            preferred_region: None,
+            preferred_cloud_provider: None,
+        });
+
+        cp.propose(Command::ForgetNode(node.clone()));
+
+        assert!(
+            membership
+                .snapshot()
+                .iter()
+                .any(|known| known.node_id == node),
+            "a stale ForgetNode must not orphan an authoritative assignment"
+        );
+    }
+
+    #[test]
+    fn forget_node_succeeds_after_last_assignment_is_removed() {
+        let (cp, membership, placement, _) = local();
+        let node = "a".to_owned();
+        membership.heartbeat(&node, 0, heartbeat());
+        assert!(membership.drain(&node));
+        placement.assign(ShardAssignment {
+            shard_id: 0,
+            replicas: vec!["b".into(), "c".into(), "d".into()],
+            preferred_leader: Some("b".into()),
+            preferred_region: None,
+            preferred_cloud_provider: None,
+        });
+
+        cp.propose(Command::ForgetNode(node.clone()));
+
+        assert!(
+            membership
+                .snapshot()
+                .iter()
+                .all(|known| known.node_id != node),
+            "a drained node is forgettable once placement no longer requires it"
+        );
     }
 }
