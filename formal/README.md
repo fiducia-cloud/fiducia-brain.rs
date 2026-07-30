@@ -1,6 +1,6 @@
 # fiducia-brain formal verification
 
-This directory contains executable, finite Quint models for the two control-plane
+This directory contains executable, finite Quint models for the three control-plane
 state machines most likely to turn a transient failure into lost quorum or unsafe
 placement.
 
@@ -69,12 +69,44 @@ Raft joint-consensus/log-catch-up implementation to the explicit `CaughtUp` phas
 proving the underlying replication algorithm and snapshot transport is separate
 `fiducia-node` work.
 
+## 3. Production scheduler and placement reconciliation
+
+[`brain_scheduler.qnt`](brain_scheduler.qnt) models the leader-side desired-state
+reconciler for one RF3 shard over four nodes. Unlike the staged data-plane model,
+this model is replayed against the real `Scheduler`, `Membership`, `Placement`,
+`plan_replicas`, leadership policy, and replicated `apply_command` boundary.
+
+It verifies:
+
+- a follower reconciliation call cannot publish a placement or forget command;
+- a replicated assignment is held while leader-local membership is incomplete;
+- degraded capacity cannot shrink the last authoritative RF3 assignment to two or
+  zero replicas;
+- an empty cold-start placement adopts healthy reported hosting and the observed
+  leader instead of generating needless movement;
+- a restored placement snapshot replaces stale local desired state;
+- a confirmed-dead node is replaced once a full healthy candidate set exists;
+- repeated stable reconciliation is idempotent and does not rotate preferred
+  leadership because of the shard's own load contribution;
+- an evacuated draining node remains known while any assignment still names it;
+- a direct stale `ForgetNode` proposal is rejected at the replicated state-machine
+  boundary;
+- drain finalization becomes legal only after the committed assignment no longer
+  references the node.
+
+Primary invariant: `scheduler_safety`.
+
+`tests/formal_scheduler_refinement.rs` consumes generated ITF traces and compares
+the complete observable production projection after every model action: role,
+known/healthy/draining membership, reported hosting, observed leader, authoritative
+replicas, preferred leader, placement generation, and finalized removals.
+
 ## Reproduce locally
 
 Quint and the Java runtime used by CI are pinned in `fm.toml`,
-`fm-reconfiguration.toml`, and the workflow. The membership manifest is the
-default discovered by `fmctl`; pass
-`--manifest formal/fm-reconfiguration.toml` for the shard model.
+`fm-reconfiguration.toml`, `fm-scheduler.toml`, and the workflows. The membership
+manifest is the default discovered by `fmctl`; pass an explicit manifest for the
+other models.
 
 ```bash
 QUINT='npx --yes --package=@informalsystems/quint@0.32.0 quint'
@@ -109,31 +141,47 @@ $QUINT run formal/brain_reconfiguration.qnt \
 $QUINT verify formal/brain_reconfiguration.qnt \
   --backend=tlc \
   --invariant=reconfiguration_safety
+
+$QUINT typecheck formal/brain_scheduler.qnt
+$QUINT run formal/brain_scheduler.qnt \
+  --max-samples=20000 \
+  --max-steps=35 \
+  --invariant=scheduler_safety \
+  --witnesses \
+    follower_hold_reached \
+    incomplete_membership_hold_reached \
+    degraded_membership_hold_reached \
+    direct_forget_rejected_reached \
+    cold_adoption_reached \
+    dead_replacement_reached \
+    drain_finalization_reached \
+    idempotent_reconcile_reached \
+    snapshot_restore_reached
+$QUINT verify formal/brain_scheduler.qnt \
+  --backend=tlc \
+  --invariant=scheduler_safety
 ```
 
-CI also exports model-based testing traces in Informal Trace Format. The
-membership model has an independent bounded Rust refinement harness in
-`tests/formal_membership_refinement.rs`; it compares the production `Membership`
-state after every explored transition. The formal workflow also replays every
-generated membership ITF trace through that production implementation and fails
-closed if the corpus is absent or any state diverges. A production adapter for
-scheduler reconfiguration remains explicit planned work, so model checking is
-not overstated as conformance for that second model.
+CI exports model-based testing traces in Informal Trace Format. The membership and
+scheduler models both fail closed when their expected corpus is absent and replay
+every generated transition against production Rust. The reconfiguration model
+remains a design-level contract for the staged data-plane learner sequence until a
+`fiducia-node` implementation adapter owns those actual membership operations.
 
 ## Deliberate limits and next refinements
 
 These models do not yet cover:
 
 1. replicated `fiducia-brain` Raft term/vote/log/snapshot behavior;
-2. multiple shards, placement load balancing, or policy affinity;
+2. multiple shards, global load balancing, or all policy-affinity combinations;
 3. real learner log indexes and snapshot installation;
 4. joint-consensus details inside `fiducia-node`;
 5. partitions between the brain target and data-plane observations;
-6. temporal liveness under fairness assumptions.
+6. temporal liveness under explicit fairness assumptions.
 
 The next highest-value refinements and models are:
 
-- production scheduler/placement replay for the reconfiguration model;
-- Raft stale-leader and snapshot/commit safety;
+- Raft stale-leader, log-commit, WAL recovery, and snapshot-install safety;
+- a `fiducia-node` adapter for learner/catch-up/promote/remove traces;
 - effects escrow and idempotency across duplicate delivery and failover;
 - task claim/reclaim and cron-fire ownership.
