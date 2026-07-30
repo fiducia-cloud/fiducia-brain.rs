@@ -50,18 +50,11 @@ module brain_scheduler {
     forgotten: Set[int],
     last_event: Event,
 
-    // A pre-action projection used to state that every hold/rejection is actually
-    // non-mutating rather than merely ending in another superficially safe state.
-    before_role: Role,
-    before_known: Set[int],
-    before_healthy: Set[int],
-    before_draining: Set[int],
-    before_hosted: Set[int],
-    before_observed_leader: int,
-    before_placement: Set[int],
-    before_preferred_leader: int,
-    before_generation: int,
-    before_forgotten: Set[int],
+    // Per-transition accounting makes writes explicit in counterexamples and lets
+    // invariants distinguish a true hold from a safe-looking rewrite.
+    last_generation_delta: int,
+    last_placement_write: bool,
+    last_forget_write: bool,
   }
 
   var s: State
@@ -79,27 +72,34 @@ module brain_scheduler {
       generation: 1,
       forgotten: Set(),
       last_event: InitEvent,
-      before_role: Leader,
-      before_known: ABC,
-      before_healthy: ABC,
-      before_draining: Set(),
-      before_hosted: ABC,
-      before_observed_leader: 1,
-      before_placement: ABC,
-      before_preferred_leader: 1,
-      before_generation: 1,
-      before_forgotten: Set(),
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     }
   }
 
   action become_follower = all {
     s.role == Leader,
-    s' = { ...s, role: Follower, last_event: BecameFollower },
+    s' = {
+      ...s,
+      role: Follower,
+      last_event: BecameFollower,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
   }
 
   action become_leader = all {
     s.role == Follower,
-    s' = { ...s, role: Leader, last_event: BecameLeader },
+    s' = {
+      ...s,
+      role: Leader,
+      last_event: BecameLeader,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
   }
 
   // Leader-local membership can be empty/incomplete after failover even while the
@@ -116,6 +116,9 @@ module brain_scheduler {
       hosted: s.hosted.exclude(Set(1)),
       observed_leader: NO_NODE,
       last_event: SoftMembershipLost,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -129,6 +132,9 @@ module brain_scheduler {
       hosted: s.hosted.union(Set(1)),
       observed_leader: 1,
       last_event: HeartbeatRestored,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -139,6 +145,9 @@ module brain_scheduler {
       known: s.known.union(Set(4)),
       healthy: s.healthy.union(Set(4)),
       last_event: NodeAdded,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -153,6 +162,9 @@ module brain_scheduler {
       healthy: s.healthy.exclude(Set(1)),
       observed_leader: if (s.observed_leader == 1) NO_NODE else s.observed_leader,
       last_event: NodeDied,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -164,7 +176,13 @@ module brain_scheduler {
       ...s,
       healthy: s.healthy.exclude(Set(1)),
       draining: s.draining.union(Set(1)),
+      // Production builds observed_leader from Healthy reports only. The raw
+      // heartbeat may still say A leads, but the scheduler no longer observes it.
+      observed_leader: if (s.observed_leader == 1) NO_NODE else s.observed_leader,
       last_event: DrainStarted,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -176,6 +194,9 @@ module brain_scheduler {
       hosted: s.hosted.exclude(Set(1)),
       observed_leader: if (s.observed_leader == 1) NO_NODE else s.observed_leader,
       last_event: DrainEvacuated,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -198,16 +219,9 @@ module brain_scheduler {
       observed_leader: 2,
       generation: s.generation + 1,
       last_event: ColdStartPrepared,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: false,
     },
   }
 
@@ -224,16 +238,9 @@ module brain_scheduler {
       preferred_leader: 2,
       generation: s.generation + 1,
       last_event: SnapshotRestored,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: false,
     },
   }
 
@@ -242,16 +249,9 @@ module brain_scheduler {
     s' = {
       ...s,
       last_event: FollowerHeld,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -262,16 +262,9 @@ module brain_scheduler {
     s' = {
       ...s,
       last_event: IncompleteHeld,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -287,16 +280,9 @@ module brain_scheduler {
     s' = {
       ...s,
       last_event: DegradedHeld,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -310,16 +296,9 @@ module brain_scheduler {
     s' = {
       ...s,
       last_event: ForgetRejected,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -336,16 +315,9 @@ module brain_scheduler {
       preferred_leader: 2,
       generation: s.generation + 1,
       last_event: ColdAdopted,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: false,
     },
   }
 
@@ -362,16 +334,9 @@ module brain_scheduler {
       preferred_leader: 2,
       generation: s.generation + 1,
       last_event: DeadReplaced,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: false,
     },
   }
 
@@ -394,16 +359,9 @@ module brain_scheduler {
       generation: s.generation + 1,
       forgotten: s.forgotten.union(Set(1)),
       last_event: DrainForgotten,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: true,
     },
   }
 
@@ -417,20 +375,14 @@ module brain_scheduler {
       and { s.placement == ABC, s.preferred_leader == 1, s.observed_leader == 1 },
       and { s.placement == ABC, s.preferred_leader == 2, s.observed_leader == 2 },
       and { s.placement == BCD, s.preferred_leader == 2, s.observed_leader == NO_NODE },
+      and { s.placement == BCD, s.preferred_leader == 2, s.observed_leader == 1 },
     },
     s' = {
       ...s,
       last_event: IdempotentHeld,
-      before_role: s.role,
-      before_known: s.known,
-      before_healthy: s.healthy,
-      before_draining: s.draining,
-      before_hosted: s.hosted,
-      before_observed_leader: s.observed_leader,
-      before_placement: s.placement,
-      before_preferred_leader: s.preferred_leader,
-      before_generation: s.generation,
-      before_forgotten: s.forgotten,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
     },
   }
 
@@ -492,12 +444,13 @@ module brain_scheduler {
     },
   }
 
-  val generation_is_finite_and_positive = and {
+  val transition_accounting_is_bounded = and {
+    or { s.last_generation_delta == 0, s.last_generation_delta == 1 },
     s.generation >= 1,
-    s.generation <= 3,
+    s.generation <= 4,
   }
 
-  val hold_or_rejection_preserves_observable_state =
+  val hold_or_rejection_has_no_write =
     not(or {
       s.last_event == FollowerHeld,
       s.last_event == IncompleteHeld,
@@ -505,40 +458,77 @@ module brain_scheduler {
       s.last_event == ForgetRejected,
       s.last_event == IdempotentHeld,
     }) or and {
-      s.role == s.before_role,
-      s.known == s.before_known,
-      s.healthy == s.before_healthy,
-      s.draining == s.before_draining,
-      s.hosted == s.before_hosted,
-      s.observed_leader == s.before_observed_leader,
-      s.placement == s.before_placement,
-      s.preferred_leader == s.before_preferred_leader,
-      s.generation == s.before_generation,
-      s.forgotten == s.before_forgotten,
+      s.last_generation_delta == 0,
+      not(s.last_placement_write),
+      not(s.last_forget_write),
     }
 
-  val changed_assignment_is_leader_only =
-    not(or {
+  val placement_write_accounting =
+    s.last_placement_write == or {
+      s.last_event == ColdStartPrepared,
+      s.last_event == SnapshotRestored,
       s.last_event == ColdAdopted,
       s.last_event == DeadReplaced,
       s.last_event == DrainForgotten,
-      s.last_event == SnapshotRestored,
-      s.last_event == ColdStartPrepared,
-    }) or s.before_role == Leader
+    }
 
-  val assignment_changes_advance_generation_once =
-    not(or {
-      s.last_event == ColdAdopted,
-      s.last_event == DeadReplaced,
-      s.last_event == DrainForgotten,
-      s.last_event == SnapshotRestored,
-      s.last_event == ColdStartPrepared,
-    }) or s.generation == s.before_generation + 1
+  val generation_accounting =
+    s.last_generation_delta == if (s.last_placement_write) 1 else 0
+
+  val forget_accounting =
+    s.last_forget_write == (s.last_event == DrainForgotten)
+
+  val changed_assignment_is_leader_only =
+    not(s.last_placement_write) or s.role == Leader
+
+  val follower_hold_shape =
+    s.last_event != FollowerHeld or s.role == Follower
+
+  val incomplete_hold_shape =
+    s.last_event != IncompleteHeld or and {
+      s.placement.size() > 0,
+      not(s.placement.subseteq(s.known)),
+    }
+
+  val degraded_hold_shape =
+    s.last_event != DegradedHeld or and {
+      s.placement == ABC,
+      s.healthy == Set(2, 3),
+      s.draining.contains(1),
+      s.known.contains(1),
+      not(s.hosted.contains(1)),
+    }
+
+  val rejected_forget_shape =
+    s.last_event != ForgetRejected or and {
+      s.known.contains(1),
+      s.draining.contains(1),
+      s.placement.contains(1),
+      not(s.forgotten.contains(1)),
+    }
+
+  val cold_adoption_shape =
+    s.last_event != ColdAdopted or and {
+      s.placement == ABC,
+      s.preferred_leader == 2,
+      s.generation >= 3,
+    }
+
+  val dead_replacement_shape =
+    s.last_event != DeadReplaced or and {
+      s.known == NODES,
+      s.healthy == BCD,
+      s.placement == BCD,
+      s.preferred_leader == 2,
+      not(s.forgotten.contains(1)),
+    }
 
   val drain_finalization_is_safe =
     s.last_event != DrainForgotten or and {
+      s.known == BCD,
+      s.healthy == BCD,
       s.placement == BCD,
-      not(s.known.contains(1)),
+      s.preferred_leader == 2,
       not(s.draining.contains(1)),
       s.forgotten.contains(1),
     }
@@ -547,17 +537,25 @@ module brain_scheduler {
     s.last_event != SnapshotRestored or and {
       s.placement == BCD,
       s.preferred_leader == 2,
-      s.generation == s.before_generation + 1,
+      s.last_generation_delta == 1,
     }
 
   val scheduler_safety = and {
     identifiers_are_bounded,
     placement_shape,
     observed_leader_is_eligible,
-    generation_is_finite_and_positive,
-    hold_or_rejection_preserves_observable_state,
+    transition_accounting_is_bounded,
+    hold_or_rejection_has_no_write,
+    placement_write_accounting,
+    generation_accounting,
+    forget_accounting,
     changed_assignment_is_leader_only,
-    assignment_changes_advance_generation_once,
+    follower_hold_shape,
+    incomplete_hold_shape,
+    degraded_hold_shape,
+    rejected_forget_shape,
+    cold_adoption_shape,
+    dead_replacement_shape,
     drain_finalization_is_safe,
     snapshot_is_authoritative,
   }
