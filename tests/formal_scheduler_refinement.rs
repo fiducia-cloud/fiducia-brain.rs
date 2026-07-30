@@ -102,10 +102,7 @@ impl ControlPlane for HarnessControlPlane {
                 .iter()
                 .all(|known| known.node_id != id)
             {
-                self.forgotten
-                    .lock()
-                    .expect("forgotten mutex")
-                    .insert(node);
+                self.forgotten.lock().expect("forgotten mutex").insert(node);
             }
         }
         true
@@ -179,9 +176,7 @@ impl Harness {
             .collect();
         let observed_leader = nodes
             .iter()
-            .find(|node| {
-                node.health == NodeHealth::Healthy && node.leading_shards.contains(&SHARD)
-            })
+            .find(|node| node.health == NodeHealth::Healthy && node.leading_shards.contains(&SHARD))
             .and_then(|node| node_number(&node.node_id))
             .unwrap_or(0);
         let assignment = self.placement.get(SHARD);
@@ -408,11 +403,11 @@ fn collect_itf_traces(root: &Path, traces: &mut Vec<PathBuf>) {
 }
 
 fn replay_itf_trace(path: &Path, actions: &mut BTreeSet<String>) -> usize {
-    let document: Value = serde_json::from_slice(
-        &fs::read(path)
-            .unwrap_or_else(|error| panic!("failed to read ITF trace {}: {error}", path.display())),
-    )
-    .unwrap_or_else(|error| panic!("failed to parse ITF trace {}: {error}", path.display()));
+    let document: Value =
+        serde_json::from_slice(&fs::read(path).unwrap_or_else(|error| {
+            panic!("failed to read ITF trace {}: {error}", path.display())
+        }))
+        .unwrap_or_else(|error| panic!("failed to parse ITF trace {}: {error}", path.display()));
     let states = document["states"]
         .as_array()
         .unwrap_or_else(|| panic!("ITF trace {} has no states array", path.display()));
@@ -450,19 +445,9 @@ fn assert_model_state(state: &Value, actual: &Projection, path: &Path, index: us
         healthy: itf_set(&state["healthy"], path, index, "healthy"),
         draining: itf_set(&state["draining"], path, index, "draining"),
         hosted: itf_set(&state["hosted"], path, index, "hosted"),
-        observed_leader: itf_bigint(
-            &state["observed_leader"],
-            path,
-            index,
-            "observed_leader",
-        ),
+        observed_leader: itf_bigint(&state["observed_leader"], path, index, "observed_leader"),
         placement: itf_set(&state["placement"], path, index, "placement"),
-        preferred_leader: itf_bigint(
-            &state["preferred_leader"],
-            path,
-            index,
-            "preferred_leader",
-        ),
+        preferred_leader: itf_bigint(&state["preferred_leader"], path, index, "preferred_leader"),
         generation: itf_bigint(&state["generation"], path, index, "generation"),
         forgotten: itf_set(&state["forgotten"], path, index, "forgotten"),
     };
