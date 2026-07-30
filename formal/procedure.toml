@@ -1,0 +1,91 @@
+schema_version = 1
+procedure_version = 1
+repository = "fiducia-cloud/fiducia-brain.rs"
+
+[policy]
+claim_classes = [
+  "typechecked-specification",
+  "randomized-exploration",
+  "bounded-exhaustive-verification",
+  "implementation-replay",
+  "differential-replay",
+  "unbounded-proof",
+]
+required_evidence = [
+  "method",
+  "bounds",
+  "assumptions",
+  "model-hash",
+  "implementation-revision",
+  "tool-versions",
+]
+counterexample = "Preserve, minimize, classify, add a Rust regression when applicable, and retain under formal/regressions."
+change_trigger = "Update this inventory when listed state, timeout, health, placement, snapshot, generation, or retry semantics change."
+
+[[machine]]
+id = "membership-health"
+risk = "critical"
+status = "active"
+backend = "quint+tlc+rust-replay"
+owner = "fiducia-control-plane"
+source_paths = ["src/membership.rs"]
+model_paths = ["formal/brain_membership.qnt", "tests/formal_membership_refinement.rs"]
+safety = [
+  "accepted positive heartbeat sequence never regresses",
+  "duplicate or reordered sequenced heartbeat cannot overwrite accepted shard reports",
+  "draining intent is sticky across heartbeat and sweep",
+  "oracle-running silence cannot transition directly to dead",
+  "oracle-gone eventually transitions a non-draining node to dead",
+]
+liveness = [
+  "under advancing logical time and recurring sweeps, an oracle-gone or timeout-dead node is eventually classified dead",
+]
+faults = [
+  "duplicate heartbeat",
+  "reordered heartbeat",
+  "logical clock advance",
+  "oracle disagreement",
+  "restart-visible stale report",
+]
+bounds = ["one representative node", "finite age bands", "finite heartbeat sequence domain"]
+review_triggers = [
+  "heartbeat acceptance",
+  "health transition",
+  "timeout or oracle policy",
+  "drain behavior",
+]
+
+[[machine]]
+id = "shard-reconfiguration"
+risk = "critical"
+status = "active"
+backend = "quint+tlc"
+owner = "fiducia-control-plane"
+source_paths = ["src/scheduler.rs", "src/placement.rs"]
+model_paths = ["formal/brain_reconfiguration.qnt"]
+safety = [
+  "no move starts from an incomplete membership view",
+  "new candidates are healthy and eligible",
+  "learner catch-up and promotion precede voter removal",
+  "current leader is not removed before safe transfer",
+  "reachable configurations retain the documented voter floor",
+  "placement generations do not regress",
+]
+liveness = [
+  "with a stable leader, recurring reconciliation, healthy capacity, and eventual catch-up, an eligible replacement eventually completes",
+]
+faults = [
+  "target fails before promotion",
+  "target fails after promotion",
+  "leader transfer",
+  "incomplete membership after restart",
+  "degraded healthy capacity",
+]
+bounds = ["one shard", "replication factor three", "four candidate nodes", "one active replacement"]
+review_triggers = [
+  "candidate eligibility",
+  "reconfiguration phase ordering",
+  "replication floor",
+  "leader transfer",
+  "snapshot or generation semantics",
+]
