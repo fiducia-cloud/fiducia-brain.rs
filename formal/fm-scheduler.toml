@@ -1,0 +1,103 @@
+# Secondary schema-v1 manifest for the production scheduler refinement.
+schema_version = 1
+project = "fiducia-brain.rs"
+model = "brain-scheduler"
+language = "quint"
+spec = "formal/brain_scheduler.qnt"
+main = "brain_scheduler"
+init = "init"
+step = "step"
+invariants = ["scheduler_safety"]
+witnesses = [
+  "follower_hold_reached",
+  "incomplete_membership_hold_reached",
+  "degraded_membership_hold_reached",
+  "direct_forget_rejected_reached",
+  "cold_adoption_reached",
+  "dead_replacement_reached",
+  "drain_finalization_reached",
+  "idempotent_reconcile_reached",
+  "snapshot_restore_reached",
+]
+
+[toolchain]
+quint = "0.32.0"
+node = "22"
+java = "21"
+rust = "1.95.0"
+npx = "npx"
+
+[execution]
+timeout_seconds = 1200
+max_output_bytes = 8388608
+artifacts_dir = ".formal-artifacts"
+
+[simulation]
+backend = "typescript"
+max_samples = 20000
+max_steps = 35
+
+[verification]
+backend = "tlc"
+exhaustive_finite_model = true
+
+[traces]
+format = "itf"
+model_based_testing_metadata = true
+backend = "typescript"
+seed = "0x3aec2298b7a6d825"
+count = 256
+max_steps = 30
+max_samples = 20000
+required_actions = [
+  "add_d",
+  "attempt_forget_a_rejected",
+  "become_follower",
+  "become_leader",
+  "begin_drain_a",
+  "evacuate_a",
+  "heartbeat_a",
+  "lose_a_from_soft_membership",
+  "mark_a_dead",
+  "prepare_cold_start",
+  "reconcile_cold_adopt",
+  "reconcile_degraded_hold",
+  "reconcile_follower_hold",
+  "reconcile_forget_drained_a_after_placement",
+  "reconcile_idempotent",
+  "reconcile_incomplete_hold",
+  "reconcile_replace_and_forget_drained_a",
+  "reconcile_replace_dead_a",
+  "restore_snapshot_bcd",
+]
+
+[adapters.rust]
+strategy = "itf-replay-and-scheduler-refinement"
+target = "src/bin/fiducia-brain-scheduler-replay.rs"
+working_directory = "."
+implementation = "fiducia-brain Scheduler"
+observable_state = [
+  "role",
+  "known",
+  "healthy",
+  "draining",
+  "hosted",
+  "observed_leader",
+  "placement",
+  "preferred_leader",
+  "generation",
+  "forgotten",
+]
+status = "active"
+issue = "DEN-569"
+command = [
+  "cargo",
+  "run",
+  "--locked",
+  "--quiet",
+  "--bin",
+  "fiducia-brain-scheduler-replay",
+]
+
+[adapters.rust.environment]
+RUST_BACKTRACE = "1"

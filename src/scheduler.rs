@@ -70,8 +70,16 @@ impl Scheduler {
     }
 
     /// One reconciliation tick: recompute every shard's desired replicas + leader
-    /// and write the ones that changed.
+    /// and write the ones that changed. The leader check is deliberately repeated
+    /// here rather than relying only on [`Scheduler::run`], so direct callers and
+    /// future trigger paths cannot make a follower publish independently-computed
+    /// placement commands.
     pub fn reconcile(&self) {
+        if !self.cp.is_leader() {
+            tracing::debug!("scheduler: reconciliation skipped on follower");
+            return;
+        }
+
         let plan = self.plan.lock().unwrap().clone();
         let rf = plan.replication_factor.max(1);
         let target_nodes = plan.target_nodes.max(rf) as usize;
@@ -221,6 +229,16 @@ impl Scheduler {
                 }
             }
 
+            // `leader_load` initially includes this shard's current preferred leader.
+            // Remove that contribution before selecting its replacement, otherwise a
+            // one-shard cluster sees the current leader as artificially busier than
+            // every peer and oscillates on every reconciliation tick.
+            if let Some(previous) = current.as_ref().and_then(|a| a.preferred_leader.as_ref()) {
+                if let Some(l) = leader_load.get_mut(previous) {
+                    *l = l.saturating_sub(1);
+                }
+            }
+
             let policy = self.placement.policy(shard);
             let leader_slots: Vec<crate::leadership::LeaderSlot> = desired
                 .iter()
@@ -244,11 +262,6 @@ impl Scheduler {
                 &healthy_set,
                 observed_leader.get(&shard),
             );
-            if let Some(previous) = current.as_ref().and_then(|a| a.preferred_leader.as_ref()) {
-                if let Some(l) = leader_load.get_mut(previous) {
-                    *l = l.saturating_sub(1);
-                }
-            }
             if let Some(next) = &preferred_leader {
                 if let Some(l) = leader_load.get_mut(next) {
                     *l += 1;
@@ -307,11 +320,21 @@ impl Scheduler {
             }
         }
 
-        // Scale-down finalize: a drained node that now reports hosting **nothing**
-        // has fully evacuated, so remove it from membership (the last step the
-        // README promised but nothing did — `DELETE` only *starts* the drain).
+        // Scale-down finalize: a drained node that reports hosting nothing is
+        // eligible for removal only after no authoritative assignment names it.
+        // The replicated apply boundary checks the same invariant so stale or
+        // duplicated commands remain harmless across leader changes.
+        let assigned_nodes: HashSet<NodeId> = self
+            .placement
+            .snapshot()
+            .into_iter()
+            .flat_map(|assignment| assignment.replicas)
+            .collect();
         for n in &nodes {
-            if n.health == NodeHealth::Draining && n.hosted_shards.is_empty() {
+            if n.health == NodeHealth::Draining
+                && n.hosted_shards.is_empty()
+                && !assigned_nodes.contains(&n.node_id)
+            {
                 self.cp.propose(Command::ForgetNode(n.node_id.clone()));
             }
         }
@@ -380,6 +403,7 @@ mod tests {
     use super::*;
     use crate::membership::MembershipConfig;
     use crate::model::{HeartbeatReport, PlacementPolicy};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn hb(domain: &str) -> HeartbeatReport {
         HeartbeatReport {
@@ -421,6 +445,52 @@ mod tests {
         Scheduler::new(membership, placement, plan, cp)
     }
 
+    struct FollowerControlPlane {
+        proposals: AtomicUsize,
+    }
+
+    impl ControlPlane for FollowerControlPlane {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn is_leader(&self) -> bool {
+            false
+        }
+
+        fn leader_addr(&self) -> Option<String> {
+            Some("http://brain-leader:9095".to_owned())
+        }
+
+        fn propose(&self, _command: Command) -> bool {
+            self.proposals.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    #[test]
+    fn direct_reconcile_on_follower_never_proposes() {
+        let membership = Arc::new(Membership::new(MembershipConfig::default()));
+        membership.heartbeat(&"a".to_owned(), 0, hb("gcp"));
+        membership.heartbeat(&"b".to_owned(), 0, hb("aws"));
+        membership.heartbeat(&"c".to_owned(), 0, hb("hetzner"));
+        let placement = Arc::new(Placement::new(1));
+        let plan = Arc::new(Mutex::new(ScalePlan {
+            target_nodes: 3,
+            replication_factor: 3,
+        }));
+        let cp = Arc::new(FollowerControlPlane {
+            proposals: AtomicUsize::new(0),
+        });
+        let scheduler = Scheduler::new(membership, placement.clone(), plan, cp.clone());
+
+        scheduler.reconcile();
+
+        assert_eq!(cp.proposals.load(Ordering::Relaxed), 0);
+        assert_eq!(placement.generation(), 0);
+        assert!(placement.get(0).is_none());
+    }
+
     #[test]
     fn reconcile_places_every_shard_at_rf_across_domains() {
         let s = scheduler(8, 3);
@@ -448,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_keeps_healthy_observed_leader_as_preferred_leader() {
+    fn reconcile_keeps_healthy_observed_leader_and_is_idempotent() {
         let s = scheduler(1, 3);
         s.membership.heartbeat(
             &"a".to_string(),
@@ -467,6 +537,17 @@ mod tests {
         let assignment = s.placement.get(0).expect("shard placed");
         assert_eq!(assignment.preferred_leader.as_deref(), Some("a"));
         assert!(assignment.replicas.contains(&"a".to_string()));
+        let generation = s.placement.generation();
+
+        s.reconcile();
+
+        let repeated = s.placement.get(0).expect("shard remains placed");
+        assert_eq!(repeated.preferred_leader.as_deref(), Some("a"));
+        assert_eq!(
+            s.placement.generation(),
+            generation,
+            "stable input must not oscillate preferred leadership or rewrite placement"
+        );
     }
 
     #[test]
@@ -485,6 +566,35 @@ mod tests {
         assert!(
             s.membership.snapshot().iter().all(|n| n.node_id != "a"),
             "a drained, fully-evacuated node is removed from membership"
+        );
+    }
+
+    #[test]
+    fn degraded_floor_keeps_draining_node_known_while_placement_still_requires_it() {
+        let s = scheduler(1, 3);
+        for (id, dom) in [("a", "gcp"), ("b", "aws"), ("c", "hetzner")] {
+            s.membership.heartbeat(&id.to_string(), 0, hb(dom));
+        }
+        s.reconcile();
+        assert!(s.membership.drain(&"a".to_owned()));
+        s.membership.heartbeat(&"a".to_owned(), 1, hb("gcp"));
+
+        s.reconcile();
+
+        assert!(
+            s.placement
+                .get(0)
+                .expect("placement held")
+                .replicas
+                .contains(&"a".to_owned()),
+            "with only two healthy candidates, the RF3 degraded floor keeps the old assignment"
+        );
+        assert!(
+            s.membership
+                .snapshot()
+                .iter()
+                .any(|node| node.node_id == "a"),
+            "an evacuated node cannot be forgotten until authoritative placement removes it"
         );
     }
 

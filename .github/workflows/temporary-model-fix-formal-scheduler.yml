@@ -1,0 +1,194 @@
+name: temporary-model-fix-formal-scheduler
+
+on:
+  push:
+    branches:
+      - agent/den-569-scheduler-refinement
+    paths:
+      - ".github/workflows/temporary-model-fix-formal-scheduler.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: temporary-model-fix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  refine:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/den-569-scheduler-refinement
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Install Java for TLC
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Refine safe forget under incomplete membership
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("formal/brain_scheduler.qnt")
+          source = path.read_text(encoding="utf-8")
+
+          replacements = [
+              (
+                  '''  action reconcile_incomplete_hold = all {
+    s.role == Leader,
+    s.placement.size() > 0,
+    not(s.placement.subseteq(s.known)),
+    s' = {''',
+                  '''  action reconcile_incomplete_hold = all {
+    s.role == Leader,
+    s.placement.size() > 0,
+    not(s.placement.subseteq(s.known)),
+    // Holding placement does not block an independent, safe drain finalization.
+    not(and {
+      s.draining.contains(1),
+      not(s.hosted.contains(1)),
+      not(s.placement.contains(1)),
+    }),
+    s' = {''',
+              ),
+              (
+                  '''  action reconcile_forget_drained_a_after_placement = all {
+    s.role == Leader,
+    s.known == NODES,
+    s.healthy == BCD,
+    s.draining == Set(1),
+    not(s.hosted.contains(1)),
+    s.placement == BCD,
+    s.preferred_leader == 2,
+    s' = {
+      ...s,
+      known: BCD,
+      draining: Set(),''',
+                  '''  action reconcile_forget_drained_a_after_placement = all {
+    s.role == Leader,
+    s.known.contains(1),
+    s.draining == Set(1),
+    not(s.hosted.contains(1)),
+    not(s.placement.contains(1)),
+    s.placement == BCD,
+    s.preferred_leader == 2,
+    s' = {
+      ...s,
+      known: s.known.exclude(Set(1)),
+      draining: Set(),''',
+              ),
+              (
+                  '''  action trace_forget_after_placement_step = any {
+    all { s.last_event == InitEvent, restore_snapshot_bcd },
+    all { s.last_event == SnapshotRestored, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    all { s.last_event == DrainEvacuated, add_d },
+    all { s.last_event == NodeAdded, reconcile_forget_drained_a_after_placement },
+    all { s.last_event == DrainForgottenAfterPlacement, idle },
+  }''',
+                  '''  action trace_forget_after_placement_step = any {
+    all { s.last_event == InitEvent, restore_snapshot_bcd },
+    all { s.last_event == SnapshotRestored, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    // D remains unknown here: placement is held, but A is still safely finalized.
+    all { s.last_event == DrainEvacuated, reconcile_forget_drained_a_after_placement },
+    all { s.last_event == DrainForgottenAfterPlacement, idle },
+  }''',
+              ),
+              (
+                  '''  val incomplete_hold_shape =
+    s.last_event != IncompleteHeld or and {
+      s.placement.size() > 0,
+      not(s.placement.subseteq(s.known)),
+    }''',
+                  '''  val incomplete_hold_shape =
+    s.last_event != IncompleteHeld or and {
+      s.placement.size() > 0,
+      not(s.placement.subseteq(s.known)),
+      not(and {
+        s.draining.contains(1),
+        not(s.hosted.contains(1)),
+        not(s.placement.contains(1)),
+      }),
+    }''',
+              ),
+              (
+                  '''  val drain_finalization_is_safe =
+    not(or {
+      s.last_event == DrainReplacedAndForgotten,
+      s.last_event == DrainForgottenAfterPlacement,
+    }) or and {
+      s.known == BCD,
+      s.healthy == BCD,
+      s.placement == BCD,
+      s.preferred_leader == 2,
+      not(s.draining.contains(1)),
+      s.forgotten.contains(1),
+    }''',
+                  '''  val drain_finalization_is_safe =
+    not(or {
+      s.last_event == DrainReplacedAndForgotten,
+      s.last_event == DrainForgottenAfterPlacement,
+    }) or and {
+      not(s.known.contains(1)),
+      not(s.healthy.contains(1)),
+      s.healthy.subseteq(s.known),
+      s.placement == BCD,
+      s.preferred_leader == 2,
+      not(s.draining.contains(1)),
+      s.forgotten.contains(1),
+    }''',
+              ),
+          ]
+
+          for old, new in replacements:
+              if old not in source:
+                  raise SystemExit(f"expected scheduler-model fragment not found:\n{old}")
+              source = source.replace(old, new, 1)
+
+          path.write_text(source, encoding="utf-8")
+          PY
+
+      - name: Validate refined model
+        shell: bash
+        env:
+          QUINT_PACKAGE: '@informalsystems/quint@0.32.0'
+        run: |
+          set -euo pipefail
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck formal/brain_scheduler.qnt
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_scheduler.qnt \
+            --max-samples=5000 \
+            --max-steps=35 \
+            --invariant=scheduler_safety
+          npx --yes --package="$QUINT_PACKAGE" quint verify \
+            formal/brain_scheduler.qnt \
+            --backend=tlc \
+            --invariant=scheduler_safety
+
+      - name: Commit refinement
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add formal/brain_scheduler.qnt
+          git commit -m "refine safe drain finalization under incomplete membership"
+          git push origin HEAD:agent/den-569-scheduler-refinement

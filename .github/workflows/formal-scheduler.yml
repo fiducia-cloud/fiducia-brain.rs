@@ -1,0 +1,325 @@
+name: formal-scheduler
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/formal-scheduler.yml"
+      - "formal/brain_scheduler.qnt"
+      - "formal/fm-scheduler.toml"
+      - "formal/scheduler_replay_common.rs"
+      - "tests/formal_scheduler_refinement.rs"
+      - "src/bin/fiducia-brain-scheduler-replay.rs"
+      - "src/cluster.rs"
+      - "src/leadership.rs"
+      - "src/membership.rs"
+      - "src/model.rs"
+      - "src/placement.rs"
+      - "src/plan.rs"
+      - "src/scheduler.rs"
+  pull_request:
+    paths:
+      - ".github/workflows/formal-scheduler.yml"
+      - "formal/brain_scheduler.qnt"
+      - "formal/fm-scheduler.toml"
+      - "formal/scheduler_replay_common.rs"
+      - "tests/formal_scheduler_refinement.rs"
+      - "src/bin/fiducia-brain-scheduler-replay.rs"
+      - "src/cluster.rs"
+      - "src/leadership.rs"
+      - "src/membership.rs"
+      - "src/model.rs"
+      - "src/placement.rs"
+      - "src/plan.rs"
+      - "src/scheduler.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scheduler:
+    name: Quint scheduler model and Rust refinement
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: repo
+    env:
+      QUINT_PACKAGE: '@informalsystems/quint@0.32.0'
+      NO_COLOR: '1'
+      RUST_BACKTRACE: full
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: repo
+
+      - name: Checkout shared interfaces
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: ee8fe09f846f5a776d156c0b0d0d15582c8bd539
+          path: fiducia-interfaces
+
+      - name: Checkout shared routing
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: c694bc5c58587bec12989a347e926c0040aacada
+          path: fiducia-routing.rs
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Install Java for TLC
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: repo
+
+      - name: Typecheck scheduler model
+        shell: bash
+        run: |
+          mkdir -p .formal-artifacts/scheduler
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck \
+            formal/brain_scheduler.qnt 2>&1 \
+            | tee .formal-artifacts/scheduler/typecheck.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Simulate invariant and reconciliation witnesses
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_scheduler.qnt \
+            --max-samples=20000 \
+            --max-steps=35 \
+            --invariant=scheduler_safety \
+            --witnesses \
+              follower_hold_reached \
+              incomplete_membership_hold_reached \
+              degraded_membership_hold_reached \
+              direct_forget_rejected_reached \
+              cold_adoption_reached \
+              dead_replacement_reached \
+              drain_finalization_reached \
+              idempotent_reconcile_reached \
+              snapshot_restore_reached 2>&1 \
+            | tee .formal-artifacts/scheduler/simulation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Exhaustively check finite scheduler state space
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint verify \
+            formal/brain_scheduler.qnt \
+            --backend=tlc \
+            --invariant=scheduler_safety 2>&1 \
+            | tee .formal-artifacts/scheduler/tlc.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Generate broad scheduler model-based traces
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_scheduler.qnt \
+            --seed=0x3aec2298b7a6d825 \
+            --max-samples=20000 \
+            --max-steps=30 \
+            --n-traces=12 \
+            --mbt \
+            --out-itf='.formal-artifacts/scheduler/trace-{seq}.itf.json' 2>&1 \
+            | tee .formal-artifacts/scheduler/trace-generation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Generate deterministic required-path traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > .formal-artifacts/scheduler/required-trace-generation.log
+
+          generate_required_trace() {
+            local name="$1"
+            local step="$2"
+            set +e
+            npx --yes --package="$QUINT_PACKAGE" quint run \
+              formal/brain_scheduler.qnt \
+              --init=init \
+              --step="$step" \
+              --max-samples=1 \
+              --max-steps=8 \
+              --n-traces=1 \
+              --invariant=scheduler_safety \
+              --mbt \
+              --out-itf=".formal-artifacts/scheduler/required-${name}-{seq}.itf.json" 2>&1 \
+              | tee -a .formal-artifacts/scheduler/required-trace-generation.log
+            local status=${PIPESTATUS[0]}
+            set -e
+            if [[ "$status" -ne 0 ]]; then
+              return "$status"
+            fi
+          }
+
+          generate_required_trace follower trace_follower_step
+          generate_required_trace incomplete trace_incomplete_step
+          generate_required_trace membership-recovery trace_membership_recovery_step
+          generate_required_trace degraded trace_degraded_step
+          generate_required_trace forget-rejection trace_forget_rejection_step
+          generate_required_trace cold-adoption trace_cold_adoption_step
+          generate_required_trace dead-replacement trace_dead_replacement_step
+          generate_required_trace drain-replacement trace_drain_replacement_step
+          generate_required_trace forget-after-placement trace_forget_after_placement_step
+          generate_required_trace idempotent trace_idempotent_step
+          generate_required_trace snapshot trace_snapshot_step
+
+      - name: Require complete refinement action coverage
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import pathlib
+          import sys
+
+          required = {
+              "add_d",
+              "attempt_forget_a_rejected",
+              "become_follower",
+              "become_leader",
+              "begin_drain_a",
+              "evacuate_a",
+              "heartbeat_a",
+              "lose_a_from_soft_membership",
+              "mark_a_dead",
+              "prepare_cold_start",
+              "reconcile_cold_adopt",
+              "reconcile_degraded_hold",
+              "reconcile_follower_hold",
+              "reconcile_forget_drained_a_after_placement",
+              "reconcile_idempotent",
+              "reconcile_incomplete_hold",
+              "reconcile_replace_and_forget_drained_a",
+              "reconcile_replace_dead_a",
+              "restore_snapshot_bcd",
+          }
+          covered = set()
+          transitions = 0
+          paths = sorted(glob.glob(".formal-artifacts/scheduler/*.itf.json"))
+          if not paths:
+              raise SystemExit("no scheduler ITF traces were generated")
+
+          for raw_path in paths:
+              path = pathlib.Path(raw_path)
+              with path.open(encoding="utf-8") as stream:
+                  document = json.load(stream)
+              for state in document.get("states", [])[1:]:
+                  action = state.get("mbt::actionTaken")
+                  if action:
+                      covered.add(action)
+                      if action != "idle":
+                          transitions += 1
+
+          missing = sorted(required - covered)
+          print(
+              f"scheduler ITF coverage: {len(paths)} traces, "
+              f"{transitions} non-idle transitions, actions={sorted(covered)}"
+          )
+          if missing:
+              print(f"missing required production-refinement actions: {missing}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Replay generated traces against production scheduler
+        env:
+          FIDUCIA_SCHEDULER_ITF_TRACE_DIR: .formal-artifacts/scheduler
+          FIDUCIA_REQUIRE_SCHEDULER_ITF_REPLAY: '1'
+        run: >-
+          cargo test --locked --test formal_scheduler_refinement
+          generated_scheduler_itf_traces_replay_against_production -- --nocapture
+
+      - name: Exercise fmctl adapter protocol
+        shell: bash
+        run: |
+          python3 - <<'PY' > .formal-artifacts/scheduler/fmctl-request.json
+          import glob
+          import json
+          import pathlib
+
+          traces = [str(pathlib.Path(path).resolve()) for path in sorted(
+              glob.glob(".formal-artifacts/scheduler/*.itf.json")
+          )]
+          request = {
+              "protocol": "fmctl.adapter.v1",
+              "project": "fiducia-brain.rs",
+              "model": "brain-scheduler",
+              "adapter": "rust",
+              "specification": str(pathlib.Path("formal/brain_scheduler.qnt").resolve()),
+              "traces": traces,
+          }
+          json.dump(request, open("/dev/stdout", "w", encoding="utf-8"))
+          PY
+
+          cargo run --locked --quiet --bin fiducia-brain-scheduler-replay \
+            < .formal-artifacts/scheduler/fmctl-request.json \
+            > .formal-artifacts/scheduler/fmctl-response.json
+
+          python3 - <<'PY'
+          import json
+
+          with open(
+              ".formal-artifacts/scheduler/fmctl-response.json", encoding="utf-8"
+          ) as stream:
+              response = json.load(stream)
+          assert response["protocol"] == "fmctl.adapter.v1", response
+          assert response["success"] is True, response
+          assert response["traces_total"] > 0, response
+          assert response["traces_passed"] == response["traces_total"], response
+          assert response["mismatches"] == [], response
+          assert response["implementation"]["language"] == "rust", response
+          print(
+              "fmctl adapter protocol passed "
+              f"{response['traces_passed']} scheduler traces"
+          )
+          PY
+
+      - name: Upload scheduler diagnostics and traces
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fiducia-brain-scheduler-formal
+          path: repo/.formal-artifacts/scheduler/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

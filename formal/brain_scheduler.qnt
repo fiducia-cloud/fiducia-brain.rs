@@ -1,0 +1,693 @@
+// Finite executable model of fiducia-brain's desired-placement reconciler.
+//
+// This is intentionally separate from brain_reconfiguration.qnt. That model proves
+// the data-plane learner/catch-up/promote/remove sequence. This model proves the
+// brain-side decision boundary: only the elected leader may publish placement,
+// incomplete soft membership and degraded capacity hold the last authoritative
+// assignment, cold starts adopt observed hosting, snapshots replace stale state,
+// repeated stable reconciliation is idempotent, and drain finalization cannot
+// forget a node while placement still requires it.
+module brain_scheduler {
+  type Role = Leader | Follower
+
+  type Event =
+    | InitEvent
+    | BecameLeader
+    | BecameFollower
+    | SoftMembershipLost
+    | HeartbeatRestored
+    | NodeAdded
+    | NodeDied
+    | DrainStarted
+    | DrainEvacuated
+    | ColdStartPrepared
+    | SnapshotRestored
+    | FollowerHeld
+    | IncompleteHeld
+    | DegradedHeld
+    | ForgetRejected
+    | ColdAdopted
+    | DeadReplaced
+    | DrainReplacedAndForgotten
+    | DrainForgottenAfterPlacement
+    | IdempotentHeld
+
+  pure val NODES = Set(1, 2, 3, 4)
+  pure val ABC = Set(1, 2, 3)
+  pure val BCD = Set(2, 3, 4)
+  pure val RF = 3
+  pure val NO_NODE = 0
+
+  type State = {
+    role: Role,
+    known: Set[int],
+    healthy: Set[int],
+    draining: Set[int],
+    hosted: Set[int],
+    observed_leader: int,
+    placement: Set[int],
+    preferred_leader: int,
+    generation: int,
+    forgotten: Set[int],
+    last_event: Event,
+
+    // Per-transition accounting makes writes explicit in counterexamples and lets
+    // invariants distinguish a true hold from a safe-looking rewrite.
+    last_generation_delta: int,
+    last_placement_write: bool,
+    last_forget_write: bool,
+  }
+
+  var s: State
+
+  action init = {
+    s' = {
+      role: Leader,
+      known: ABC,
+      healthy: ABC,
+      draining: Set(),
+      hosted: ABC,
+      observed_leader: 1,
+      placement: ABC,
+      preferred_leader: 1,
+      generation: 1,
+      forgotten: Set(),
+      last_event: InitEvent,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    }
+  }
+
+  action become_follower = all {
+    s.role == Leader,
+    s' = {
+      ...s,
+      role: Follower,
+      last_event: BecameFollower,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  action become_leader = all {
+    s.role == Follower,
+    s' = {
+      ...s,
+      role: Leader,
+      last_event: BecameLeader,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  // Leader-local membership can be empty/incomplete after failover even while the
+  // replicated placement still names a live node. This is not a durable forget.
+  action lose_a_from_soft_membership = all {
+    s.known.contains(1),
+    not(s.forgotten.contains(1)),
+    s.observed_leader == 1,
+    s' = {
+      ...s,
+      known: s.known.exclude(Set(1)),
+      healthy: s.healthy.exclude(Set(1)),
+      draining: s.draining.exclude(Set(1)),
+      hosted: s.hosted.exclude(Set(1)),
+      observed_leader: NO_NODE,
+      last_event: SoftMembershipLost,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  action heartbeat_a = all {
+    not(s.forgotten.contains(1)),
+    not(s.known.contains(1)),
+    s' = {
+      ...s,
+      known: s.known.union(Set(1)),
+      healthy: s.healthy.union(Set(1)),
+      hosted: s.hosted.union(Set(1)),
+      observed_leader: 1,
+      last_event: HeartbeatRestored,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  action add_d = all {
+    not(s.known.contains(4)),
+    s' = {
+      ...s,
+      known: s.known.union(Set(4)),
+      healthy: s.healthy.union(Set(4)),
+      last_event: NodeAdded,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  // A dead node remains KNOWN, which distinguishes a confirmed failure from an
+  // incomplete leader-local membership view.
+  action mark_a_dead = all {
+    s.known.contains(1),
+    s.healthy.contains(1),
+    not(s.draining.contains(1)),
+    s' = {
+      ...s,
+      healthy: s.healthy.exclude(Set(1)),
+      observed_leader: if (s.observed_leader == 1) NO_NODE else s.observed_leader,
+      last_event: NodeDied,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  action begin_drain_a = all {
+    s.known.contains(1),
+    s.healthy.contains(1),
+    not(s.forgotten.contains(1)),
+    s' = {
+      ...s,
+      healthy: s.healthy.exclude(Set(1)),
+      draining: s.draining.union(Set(1)),
+      // Production builds observed_leader from Healthy reports only. The raw
+      // heartbeat may still say A leads, but the scheduler no longer observes it.
+      observed_leader: if (s.observed_leader == 1) NO_NODE else s.observed_leader,
+      last_event: DrainStarted,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  action evacuate_a = all {
+    s.draining.contains(1),
+    s.hosted.contains(1),
+    s' = {
+      ...s,
+      hosted: s.hosted.exclude(Set(1)),
+      observed_leader: if (s.observed_leader == 1) NO_NODE else s.observed_leader,
+      last_event: DrainEvacuated,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  // A cold brain has no desired map yet, but receives healthy data-plane reports.
+  // Placement.restore_from([]) advances generation before reconciliation adopts
+  // the observed ABC layout and observed leader B.
+  action prepare_cold_start = all {
+    s.role == Leader,
+    s.generation == 1,
+    s.known == ABC,
+    s.healthy == ABC,
+    s.draining.size() == 0,
+    s.placement == ABC,
+    s.forgotten.size() == 0,
+    s' = {
+      ...s,
+      placement: Set(),
+      preferred_leader: NO_NODE,
+      hosted: ABC,
+      observed_leader: 2,
+      generation: s.generation + 1,
+      last_event: ColdStartPrepared,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: false,
+    },
+  }
+
+  // A replicated snapshot is authoritative: it replaces ABC with BCD even when
+  // the leader-local soft membership has not heard from D yet.
+  action restore_snapshot_bcd = all {
+    s.role == Leader,
+    s.generation == 1,
+    s.placement == ABC,
+    s.forgotten.size() == 0,
+    s' = {
+      ...s,
+      placement: BCD,
+      preferred_leader: 2,
+      generation: s.generation + 1,
+      last_event: SnapshotRestored,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: false,
+    },
+  }
+
+  action reconcile_follower_hold = all {
+    s.role == Follower,
+    s' = {
+      ...s,
+      last_event: FollowerHeld,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  action reconcile_incomplete_hold = all {
+    s.role == Leader,
+    s.placement.size() > 0,
+    not(s.placement.subseteq(s.known)),
+    s' = {
+      ...s,
+      last_event: IncompleteHeld,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  // With only B and C healthy, planning would return two replicas. The degraded
+  // floor therefore retains ABC and, critically, retains A in membership too.
+  action reconcile_degraded_hold = all {
+    s.role == Leader,
+    s.placement == ABC,
+    s.placement.subseteq(s.known),
+    s.healthy == Set(2, 3),
+    s.draining.contains(1),
+    not(s.hosted.contains(1)),
+    s' = {
+      ...s,
+      last_event: DegradedHeld,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  // Even a directly proposed durable ForgetNode is rejected while placement names A.
+  action attempt_forget_a_rejected = all {
+    s.role == Leader,
+    s.known.contains(1),
+    s.draining.contains(1),
+    not(s.hosted.contains(1)),
+    s.placement.contains(1),
+    s' = {
+      ...s,
+      last_event: ForgetRejected,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  action reconcile_cold_adopt = all {
+    s.role == Leader,
+    s.placement.size() == 0,
+    s.known == ABC,
+    s.healthy == ABC,
+    s.hosted == ABC,
+    s.observed_leader == 2,
+    s' = {
+      ...s,
+      placement: ABC,
+      preferred_leader: 2,
+      generation: s.generation + 1,
+      last_event: ColdAdopted,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: false,
+    },
+  }
+
+  action reconcile_replace_dead_a = all {
+    s.role == Leader,
+    s.known == NODES,
+    s.healthy == BCD,
+    s.draining.size() == 0,
+    s.placement == ABC,
+    s.observed_leader == NO_NODE,
+    s' = {
+      ...s,
+      placement: BCD,
+      preferred_leader: 2,
+      generation: s.generation + 1,
+      last_event: DeadReplaced,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: false,
+    },
+  }
+
+  // Once D is healthy, reconcile can publish BCD and then safely finalize A in the
+  // same leader tick because the committed assignment no longer references A.
+  action reconcile_replace_and_forget_drained_a = all {
+    s.role == Leader,
+    s.known == NODES,
+    s.healthy == BCD,
+    s.draining == Set(1),
+    not(s.hosted.contains(1)),
+    s.placement == ABC,
+    s.observed_leader == NO_NODE,
+    s' = {
+      ...s,
+      known: BCD,
+      draining: Set(),
+      placement: BCD,
+      preferred_leader: 2,
+      generation: s.generation + 1,
+      forgotten: s.forgotten.union(Set(1)),
+      last_event: DrainReplacedAndForgotten,
+      last_generation_delta: 1,
+      last_placement_write: true,
+      last_forget_write: true,
+    },
+  }
+
+  // Placement can already exclude A because a snapshot or a previous committed
+  // reconciliation installed BCD. The next stable leader tick then performs only
+  // the final durable ForgetNode, without rewriting placement or generation.
+  action reconcile_forget_drained_a_after_placement = all {
+    s.role == Leader,
+    s.known == NODES,
+    s.healthy == BCD,
+    s.draining == Set(1),
+    not(s.hosted.contains(1)),
+    s.placement == BCD,
+    s.preferred_leader == 2,
+    s' = {
+      ...s,
+      known: BCD,
+      draining: Set(),
+      forgotten: s.forgotten.union(Set(1)),
+      last_event: DrainForgottenAfterPlacement,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: true,
+    },
+  }
+
+  // These are the stable one-shard fixed points of the production planner under
+  // target_nodes=RF=3. A second tick must not rewrite placement or rotate leaders.
+  // An evacuated draining node outside placement is deliberately excluded because
+  // that state has a pending forget-only transition rather than being a fixed point.
+  action reconcile_idempotent = all {
+    s.role == Leader,
+    s.placement.subseteq(s.known),
+    s.placement.subseteq(s.healthy),
+    not(and {
+      s.draining.contains(1),
+      not(s.hosted.contains(1)),
+      not(s.placement.contains(1)),
+    }),
+    or {
+      and { s.placement == ABC, s.preferred_leader == 1, s.observed_leader == 1 },
+      and { s.placement == ABC, s.preferred_leader == 2, s.observed_leader == 2 },
+      and { s.placement == BCD, s.preferred_leader == 2, s.observed_leader == NO_NODE },
+      and { s.placement == BCD, s.preferred_leader == 2, s.observed_leader == 1 },
+    },
+    s' = {
+      ...s,
+      last_event: IdempotentHeld,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: false,
+    },
+  }
+
+  action idle = s' = s
+
+  // Deterministic scenario steppers are used only for model-based trace export.
+  // The exhaustive `step` relation below remains the unconstrained behavior model.
+  // Each scenario starts from `init`, takes one canonical path, then stutters so CI
+  // can require concrete production replay for every critical transition instead of
+  // relying on random trace generation to happen to cover rare paths.
+  action trace_follower_step = any {
+    all { s.last_event == InitEvent, become_follower },
+    all { s.last_event == BecameFollower, reconcile_follower_hold },
+    all { s.last_event == FollowerHeld, become_leader },
+    all { s.last_event == BecameLeader, reconcile_idempotent },
+    all { s.last_event == IdempotentHeld, idle },
+  }
+
+  action trace_incomplete_step = any {
+    all { s.last_event == InitEvent, lose_a_from_soft_membership },
+    all { s.last_event == SoftMembershipLost, reconcile_incomplete_hold },
+    all { s.last_event == IncompleteHeld, idle },
+  }
+
+  action trace_membership_recovery_step = any {
+    all { s.last_event == InitEvent, lose_a_from_soft_membership },
+    all { s.last_event == SoftMembershipLost, heartbeat_a },
+    all { s.last_event == HeartbeatRestored, reconcile_idempotent },
+    all { s.last_event == IdempotentHeld, idle },
+  }
+
+  action trace_degraded_step = any {
+    all { s.last_event == InitEvent, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    all { s.last_event == DrainEvacuated, reconcile_degraded_hold },
+    all { s.last_event == DegradedHeld, idle },
+  }
+
+  action trace_forget_rejection_step = any {
+    all { s.last_event == InitEvent, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    all { s.last_event == DrainEvacuated, attempt_forget_a_rejected },
+    all { s.last_event == ForgetRejected, idle },
+  }
+
+  action trace_cold_adoption_step = any {
+    all { s.last_event == InitEvent, prepare_cold_start },
+    all { s.last_event == ColdStartPrepared, reconcile_cold_adopt },
+    all { s.last_event == ColdAdopted, idle },
+  }
+
+  action trace_dead_replacement_step = any {
+    all { s.last_event == InitEvent, add_d },
+    all { s.last_event == NodeAdded, mark_a_dead },
+    all { s.last_event == NodeDied, reconcile_replace_dead_a },
+    all { s.last_event == DeadReplaced, idle },
+  }
+
+  action trace_drain_replacement_step = any {
+    all { s.last_event == InitEvent, add_d },
+    all { s.last_event == NodeAdded, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    all { s.last_event == DrainEvacuated, reconcile_replace_and_forget_drained_a },
+    all { s.last_event == DrainReplacedAndForgotten, idle },
+  }
+
+  action trace_forget_after_placement_step = any {
+    all { s.last_event == InitEvent, restore_snapshot_bcd },
+    all { s.last_event == SnapshotRestored, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    all { s.last_event == DrainEvacuated, add_d },
+    all { s.last_event == NodeAdded, reconcile_forget_drained_a_after_placement },
+    all { s.last_event == DrainForgottenAfterPlacement, idle },
+  }
+
+  action trace_idempotent_step = any {
+    all { s.last_event == InitEvent, reconcile_idempotent },
+    all { s.last_event == IdempotentHeld, idle },
+  }
+
+  action trace_snapshot_step = any {
+    all { s.last_event == InitEvent, restore_snapshot_bcd },
+    all { s.last_event == SnapshotRestored, idle },
+  }
+
+  action step = any {
+    become_follower,
+    become_leader,
+    lose_a_from_soft_membership,
+    heartbeat_a,
+    add_d,
+    mark_a_dead,
+    begin_drain_a,
+    evacuate_a,
+    prepare_cold_start,
+    restore_snapshot_bcd,
+    reconcile_follower_hold,
+    reconcile_incomplete_hold,
+    reconcile_degraded_hold,
+    attempt_forget_a_rejected,
+    reconcile_cold_adopt,
+    reconcile_replace_dead_a,
+    reconcile_replace_and_forget_drained_a,
+    reconcile_forget_drained_a_after_placement,
+    reconcile_idempotent,
+    idle,
+  }
+
+  val identifiers_are_bounded = and {
+    s.known.subseteq(NODES),
+    s.healthy.subseteq(NODES),
+    s.draining.subseteq(NODES),
+    s.hosted.subseteq(NODES),
+    s.placement.subseteq(NODES),
+    s.forgotten.subseteq(NODES),
+    s.healthy.subseteq(s.known),
+    s.draining.subseteq(s.known),
+    s.hosted.subseteq(s.known),
+    s.healthy.intersect(s.draining).size() == 0,
+    s.forgotten.intersect(s.known).size() == 0,
+    or { s.observed_leader == NO_NODE, NODES.contains(s.observed_leader) },
+    or { s.preferred_leader == NO_NODE, NODES.contains(s.preferred_leader) },
+  }
+
+  val placement_shape = and {
+    s.placement.size() <= RF,
+    or {
+      s.preferred_leader == NO_NODE,
+      s.placement.contains(s.preferred_leader),
+    },
+    s.forgotten.intersect(s.placement).size() == 0,
+  }
+
+  val observed_leader_is_eligible = or {
+    s.observed_leader == NO_NODE,
+    and {
+      s.known.contains(s.observed_leader),
+      s.healthy.contains(s.observed_leader),
+      s.hosted.contains(s.observed_leader),
+    },
+  }
+
+  val transition_accounting_is_bounded = and {
+    or { s.last_generation_delta == 0, s.last_generation_delta == 1 },
+    s.generation >= 1,
+    s.generation <= 4,
+  }
+
+  val hold_or_rejection_has_no_write =
+    not(or {
+      s.last_event == FollowerHeld,
+      s.last_event == IncompleteHeld,
+      s.last_event == DegradedHeld,
+      s.last_event == ForgetRejected,
+      s.last_event == IdempotentHeld,
+    }) or and {
+      s.last_generation_delta == 0,
+      not(s.last_placement_write),
+      not(s.last_forget_write),
+    }
+
+  val placement_write_accounting =
+    s.last_placement_write == or {
+      s.last_event == ColdStartPrepared,
+      s.last_event == SnapshotRestored,
+      s.last_event == ColdAdopted,
+      s.last_event == DeadReplaced,
+      s.last_event == DrainReplacedAndForgotten,
+    }
+
+  val generation_accounting =
+    s.last_generation_delta == if (s.last_placement_write) 1 else 0
+
+  val forget_accounting =
+    s.last_forget_write == or {
+      s.last_event == DrainReplacedAndForgotten,
+      s.last_event == DrainForgottenAfterPlacement,
+    }
+
+  val durable_writes_are_leader_only =
+    not(or { s.last_placement_write, s.last_forget_write }) or s.role == Leader
+
+  val follower_hold_shape =
+    s.last_event != FollowerHeld or s.role == Follower
+
+  val incomplete_hold_shape =
+    s.last_event != IncompleteHeld or and {
+      s.placement.size() > 0,
+      not(s.placement.subseteq(s.known)),
+    }
+
+  val degraded_hold_shape =
+    s.last_event != DegradedHeld or and {
+      s.placement == ABC,
+      s.healthy == Set(2, 3),
+      s.draining.contains(1),
+      s.known.contains(1),
+      not(s.hosted.contains(1)),
+    }
+
+  val rejected_forget_shape =
+    s.last_event != ForgetRejected or and {
+      s.known.contains(1),
+      s.draining.contains(1),
+      s.placement.contains(1),
+      not(s.forgotten.contains(1)),
+    }
+
+  val cold_adoption_shape =
+    s.last_event != ColdAdopted or and {
+      s.placement == ABC,
+      s.preferred_leader == 2,
+      s.generation >= 3,
+    }
+
+  val dead_replacement_shape =
+    s.last_event != DeadReplaced or and {
+      s.known == NODES,
+      s.healthy == BCD,
+      s.placement == BCD,
+      s.preferred_leader == 2,
+      not(s.forgotten.contains(1)),
+    }
+
+  val drain_finalization_is_safe =
+    not(or {
+      s.last_event == DrainReplacedAndForgotten,
+      s.last_event == DrainForgottenAfterPlacement,
+    }) or and {
+      s.known == BCD,
+      s.healthy == BCD,
+      s.placement == BCD,
+      s.preferred_leader == 2,
+      not(s.draining.contains(1)),
+      s.forgotten.contains(1),
+    }
+
+  val snapshot_is_authoritative =
+    s.last_event != SnapshotRestored or and {
+      s.placement == BCD,
+      s.preferred_leader == 2,
+      s.last_generation_delta == 1,
+    }
+
+  val scheduler_safety = and {
+    identifiers_are_bounded,
+    placement_shape,
+    observed_leader_is_eligible,
+    transition_accounting_is_bounded,
+    hold_or_rejection_has_no_write,
+    placement_write_accounting,
+    generation_accounting,
+    forget_accounting,
+    durable_writes_are_leader_only,
+    follower_hold_shape,
+    incomplete_hold_shape,
+    degraded_hold_shape,
+    rejected_forget_shape,
+    cold_adoption_shape,
+    dead_replacement_shape,
+    drain_finalization_is_safe,
+    snapshot_is_authoritative,
+  }
+
+  val follower_hold_reached = s.last_event == FollowerHeld
+  val incomplete_membership_hold_reached = s.last_event == IncompleteHeld
+  val degraded_membership_hold_reached = s.last_event == DegradedHeld
+  val direct_forget_rejected_reached = s.last_event == ForgetRejected
+  val cold_adoption_reached = s.last_event == ColdAdopted
+  val dead_replacement_reached = s.last_event == DeadReplaced
+  val drain_finalization_reached = or {
+    s.last_event == DrainReplacedAndForgotten,
+    s.last_event == DrainForgottenAfterPlacement,
+  }
+  val idempotent_reconcile_reached = s.last_event == IdempotentHeld
+  val snapshot_restore_reached = s.last_event == SnapshotRestored
+}
