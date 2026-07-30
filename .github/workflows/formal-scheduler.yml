@@ -7,7 +7,9 @@ on:
       - ".github/workflows/formal-scheduler.yml"
       - "formal/brain_scheduler.qnt"
       - "formal/fm-scheduler.toml"
+      - "formal/scheduler_replay_common.rs"
       - "tests/formal_scheduler_refinement.rs"
+      - "src/bin/fiducia-brain-scheduler-replay.rs"
       - "src/cluster.rs"
       - "src/leadership.rs"
       - "src/membership.rs"
@@ -20,7 +22,9 @@ on:
       - ".github/workflows/formal-scheduler.yml"
       - "formal/brain_scheduler.qnt"
       - "formal/fm-scheduler.toml"
+      - "formal/scheduler_replay_common.rs"
       - "tests/formal_scheduler_refinement.rs"
+      - "src/bin/fiducia-brain-scheduler-replay.rs"
       - "src/cluster.rs"
       - "src/leadership.rs"
       - "src/membership.rs"
@@ -149,6 +153,7 @@ jobs:
           set +e
           npx --yes --package="$QUINT_PACKAGE" quint run \
             formal/brain_scheduler.qnt \
+            --seed=0x3aec2298b7a6d825 \
             --max-samples=20000 \
             --max-steps=30 \
             --n-traces=12 \
@@ -263,6 +268,51 @@ jobs:
         run: >-
           cargo test --locked --test formal_scheduler_refinement
           generated_scheduler_itf_traces_replay_against_production -- --nocapture
+
+      - name: Exercise fmctl adapter protocol
+        shell: bash
+        run: |
+          python3 - <<'PY' > .formal-artifacts/scheduler/fmctl-request.json
+          import glob
+          import json
+          import pathlib
+
+          traces = [str(pathlib.Path(path).resolve()) for path in sorted(
+              glob.glob(".formal-artifacts/scheduler/*.itf.json")
+          )]
+          request = {
+              "protocol": "fmctl.adapter.v1",
+              "project": "fiducia-brain.rs",
+              "model": "brain-scheduler",
+              "adapter": "rust",
+              "specification": str(pathlib.Path("formal/brain_scheduler.qnt").resolve()),
+              "traces": traces,
+          }
+          json.dump(request, open("/dev/stdout", "w", encoding="utf-8"))
+          PY
+
+          cargo run --locked --quiet --bin fiducia-brain-scheduler-replay \
+            < .formal-artifacts/scheduler/fmctl-request.json \
+            > .formal-artifacts/scheduler/fmctl-response.json
+
+          python3 - <<'PY'
+          import json
+
+          with open(
+              ".formal-artifacts/scheduler/fmctl-response.json", encoding="utf-8"
+          ) as stream:
+              response = json.load(stream)
+          assert response["protocol"] == "fmctl.adapter.v1", response
+          assert response["success"] is True, response
+          assert response["traces_total"] > 0, response
+          assert response["traces_passed"] == response["traces_total"], response
+          assert response["mismatches"] == [], response
+          assert response["implementation"]["language"] == "rust", response
+          print(
+              "fmctl adapter protocol passed "
+              f"{response['traces_passed']} scheduler traces"
+          )
+          PY
 
       - name: Upload scheduler diagnostics and traces
         if: always()
