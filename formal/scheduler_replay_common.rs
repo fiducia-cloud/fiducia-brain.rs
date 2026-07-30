@@ -411,6 +411,8 @@ pub fn replay_paths(paths: &[PathBuf]) -> ReplaySummary {
     }
 }
 
+// A mismatch deliberately carries the full expected/actual JSON projection so counterexamples remain self-contained.
+#[allow(clippy::result_large_err)]
 fn replay_trace(path: &Path) -> Result<TraceSummary, ReplayMismatch> {
     let bytes = fs::read(path).map_err(|error| mismatch(path, None, None, error.to_string()))?;
     let document: Value = serde_json::from_slice(&bytes)
