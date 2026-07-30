@@ -143,7 +143,7 @@ jobs:
           set -e
           exit "$status"
 
-      - name: Generate scheduler model-based traces
+      - name: Generate broad scheduler model-based traces
         shell: bash
         run: |
           set +e
@@ -158,6 +158,103 @@ jobs:
           status=${PIPESTATUS[0]}
           set -e
           exit "$status"
+
+      - name: Generate deterministic required-path traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > .formal-artifacts/scheduler/required-trace-generation.log
+
+          generate_required_trace() {
+            local name="$1"
+            local step="$2"
+            set +e
+            npx --yes --package="$QUINT_PACKAGE" quint run \
+              formal/brain_scheduler.qnt \
+              --init=init \
+              --step="$step" \
+              --max-samples=1 \
+              --max-steps=8 \
+              --n-traces=1 \
+              --invariant=scheduler_safety \
+              --mbt \
+              --out-itf=".formal-artifacts/scheduler/required-${name}-{seq}.itf.json" 2>&1 \
+              | tee -a .formal-artifacts/scheduler/required-trace-generation.log
+            local status=${PIPESTATUS[0]}
+            set -e
+            if [[ "$status" -ne 0 ]]; then
+              return "$status"
+            fi
+          }
+
+          generate_required_trace follower trace_follower_step
+          generate_required_trace incomplete trace_incomplete_step
+          generate_required_trace membership-recovery trace_membership_recovery_step
+          generate_required_trace degraded trace_degraded_step
+          generate_required_trace forget-rejection trace_forget_rejection_step
+          generate_required_trace cold-adoption trace_cold_adoption_step
+          generate_required_trace dead-replacement trace_dead_replacement_step
+          generate_required_trace drain-replacement trace_drain_replacement_step
+          generate_required_trace forget-after-placement trace_forget_after_placement_step
+          generate_required_trace idempotent trace_idempotent_step
+          generate_required_trace snapshot trace_snapshot_step
+
+      - name: Require complete refinement action coverage
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import pathlib
+          import sys
+
+          required = {
+              "add_d",
+              "attempt_forget_a_rejected",
+              "become_follower",
+              "become_leader",
+              "begin_drain_a",
+              "evacuate_a",
+              "heartbeat_a",
+              "lose_a_from_soft_membership",
+              "mark_a_dead",
+              "prepare_cold_start",
+              "reconcile_cold_adopt",
+              "reconcile_degraded_hold",
+              "reconcile_follower_hold",
+              "reconcile_forget_drained_a_after_placement",
+              "reconcile_idempotent",
+              "reconcile_incomplete_hold",
+              "reconcile_replace_and_forget_drained_a",
+              "reconcile_replace_dead_a",
+              "restore_snapshot_bcd",
+          }
+          covered = set()
+          transitions = 0
+          paths = sorted(glob.glob(".formal-artifacts/scheduler/*.itf.json"))
+          if not paths:
+              raise SystemExit("no scheduler ITF traces were generated")
+
+          for raw_path in paths:
+              path = pathlib.Path(raw_path)
+              with path.open(encoding="utf-8") as stream:
+                  document = json.load(stream)
+              for state in document.get("states", [])[1:]:
+                  action = state.get("mbt::actionTaken")
+                  if action:
+                      covered.add(action)
+                      if action != "idle":
+                          transitions += 1
+
+          missing = sorted(required - covered)
+          print(
+              f"scheduler ITF coverage: {len(paths)} traces, "
+              f"{transitions} non-idle transitions, actions={sorted(covered)}"
+          )
+          if missing:
+              print(f"missing required production-refinement actions: {missing}", file=sys.stderr)
+              raise SystemExit(1)
+          PY
 
       - name: Replay generated traces against production scheduler
         env:
