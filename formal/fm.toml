@@ -47,7 +47,7 @@ max_steps = 30
 max_samples = 10000
 
 [adapters.rust]
-strategy = "bounded-independent-reference"
+strategy = "itf-replay-and-bounded-independent-reference"
 target = "tests/formal_membership_refinement.rs"
-status = "planned"
+status = "active"
 issue = "DEN-569"

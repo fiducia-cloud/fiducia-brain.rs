@@ -112,12 +112,13 @@ $QUINT verify formal/brain_reconfiguration.qnt \
 ```
 
 CI also exports model-based testing traces in Informal Trace Format. The
-membership model already has an independent bounded Rust refinement harness in
+membership model has an independent bounded Rust refinement harness in
 `tests/formal_membership_refinement.rs`; it compares the production `Membership`
-state after every explored transition. That harness does not yet ingest the ITF
-corpus. ITF replay for membership and an implementation adapter for scheduler
-reconfiguration remain explicit planned work in the corresponding manifests, so
-model checking is not overstated as production conformance.
+state after every explored transition. The formal workflow also replays every
+generated membership ITF trace through that production implementation and fails
+closed if the corpus is absent or any state diverges. A production adapter for
+scheduler reconfiguration remains explicit planned work, so model checking is
+not overstated as conformance for that second model.
 
 ## Deliberate limits and next refinements
 
@@ -132,7 +133,7 @@ These models do not yet cover:
 
 The next highest-value refinements and models are:
 
-- ITF replay and production scheduler/placement refinement for these brain models;
+- production scheduler/placement replay for the reconfiguration model;
 - Raft stale-leader and snapshot/commit safety;
 - effects escrow and idempotency across duplicate delivery and failover;
 - task claim/reclaim and cron-fire ownership.

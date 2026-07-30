@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -157,6 +157,27 @@ fn unavailable(s: &BrainState) -> Option<(StatusCode, Json<Value>)> {
             })),
         ))
     }
+}
+
+/// A write reached a follower during an election and was not applied.
+///
+/// Use a retryable availability status instead of a redirect: callers retry the
+/// endpoint they were configured to trust, never a server-selected location.
+fn not_leader() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "ok": false,
+            "error": "not_leader",
+            "leader": Value::Null,
+            "retryable": true,
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 pub fn router(state: BrainState) -> Router {
@@ -448,10 +469,7 @@ async fn set_policy(
                 let url = leader_v1(&leader, "/policies");
                 return forwarded(s.http.post(url).json(&update)).await;
             }
-            None => {
-                return Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
-                    .into_response()
-            }
+            None => return not_leader(),
         }
     }
 
@@ -493,8 +511,7 @@ async fn set_scale(
             let url = leader_v1(&leader, "/scale");
             forwarded(s.http.post(url).json(&plan)).await
         }
-        _ => Json(json!({ "ok": false, "error": "not_leader", "leader": Value::Null }))
-            .into_response(),
+        _ => not_leader(),
     }
 }
 
@@ -767,8 +784,47 @@ mod tests {
         )
         .await;
         // Mid-election: refuse rather than apply somewhere it will never be read.
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(RETRY_AFTER).unwrap(), "1");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "not_leader");
+        assert_eq!(body["retryable"], true);
         assert!(follower.placement.policies_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_scale_plan_posted_without_a_leader_is_retryable_not_leader() {
+        let follower = state_with(Arc::new(FakeControlPlane {
+            available: true,
+            leader: false,
+            leader_addr: None,
+        }));
+        let resp = set_scale(
+            State(follower.clone()),
+            HeaderMap::new(),
+            Json(ScalePlan {
+                target_nodes: 9,
+                replication_factor: 3,
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(RETRY_AFTER).unwrap(), "1");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "not_leader");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(
+            follower.plan.lock().unwrap().target_nodes,
+            3,
+            "uncommitted scale intent must not be applied locally"
+        );
     }
 
     #[tokio::test]

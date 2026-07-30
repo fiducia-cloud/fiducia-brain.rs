@@ -18,6 +18,9 @@ jobs:
     name: Quint hybrid membership model
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: repo
     env:
       QUINT_PACKAGE: '@informalsystems/quint@0.32.0'
     steps:
@@ -25,6 +28,23 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          path: repo
+
+      - name: Checkout shared interfaces
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: ee8fe09f846f5a776d156c0b0d0d15582c8bd539
+          path: fiducia-interfaces
+
+      - name: Checkout shared routing
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: c694bc5c58587bec12989a347e926c0040aacada
+          path: fiducia-routing.rs
 
       - name: Install Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -36,6 +56,16 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: repo
 
       - name: Typecheck membership model
         shell: bash
@@ -99,12 +129,20 @@ jobs:
           set -e
           exit "$status"
 
+      - name: Replay generated membership traces against production Rust
+        env:
+          FIDUCIA_MEMBERSHIP_ITF_TRACE_DIR: .formal-artifacts/membership
+          FIDUCIA_REQUIRE_MEMBERSHIP_ITF_REPLAY: '1'
+        run: >-
+          cargo test --locked --test formal_membership_refinement
+          generated_itf_traces_replay_against_membership -- --nocapture
+
       - name: Upload membership diagnostics and traces
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fiducia-brain-membership-formal
-          path: .formal-artifacts/membership/
+          path: repo/.formal-artifacts/membership/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14

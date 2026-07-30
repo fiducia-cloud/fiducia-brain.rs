@@ -29,6 +29,13 @@ sequence floor, both timeout bands, one-shot death notification, Kubernetes
 `Running` partition damping, immediate `Gone` death, sticky draining across both
 heartbeats and sweeps, and resurrection.
 
+The same test binary also consumes Quint's generated ITF corpus. It decodes each
+model action and nondeterministic pick, executes the corresponding operation on
+the real `Membership`, and compares health, oracle state, timeout band, sequence,
+report payload, and draining history after every step. The dedicated formal
+workflow sets `FIDUCIA_REQUIRE_MEMBERSHIP_ITF_REPLAY=1`, so missing traces fail
+the job instead of silently skipping conformance.
+
 ## Bounds and claim strength
 
 The run is capped at depth 6, 10,000 unique reference states, and 200,000 checked
@@ -43,8 +50,14 @@ DEN-80.
 
 ```bash
 cargo test --test formal_membership_refinement --locked -- --nocapture
+
+FIDUCIA_MEMBERSHIP_ITF_TRACE_DIR=/path/to/traces \
+FIDUCIA_REQUIRE_MEMBERSHIP_ITF_REPLAY=1 \
+  cargo test --locked --test formal_membership_refinement \
+    generated_itf_traces_replay_against_membership -- --nocapture
 ```
 
 The ordinary Rust CI executes the same test through `cargo test --all-targets
---all-features --locked`, while the formal workflow continues to typecheck,
-simulate, exhaustively check, and emit ITF traces from the Quint models.
+--all-features --locked`, while the formal workflow typechecks, simulates,
+exhaustively checks, emits ITF traces, and replays the membership corpus against
+production Rust.

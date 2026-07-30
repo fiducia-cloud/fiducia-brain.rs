@@ -10,11 +10,14 @@ mod model;
 mod oracle;
 
 use std::collections::{HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use membership::{Membership, MembershipConfig};
 use model::{HeartbeatReport, NodeHealth, NodeId, ShardId};
 use oracle::{LivenessOracle, PodLiveness};
+use serde_json::Value;
 
 const NODE: &str = "node-a";
 const SUSPECT_AFTER_MS: u64 = 10;
@@ -469,6 +472,258 @@ fn bounded_membership_refinement_matches_rust_implementation() {
         transitions,
         MAX_DEPTH
     );
+}
+
+#[test]
+fn generated_itf_traces_replay_against_membership() {
+    let required = std::env::var("FIDUCIA_REQUIRE_MEMBERSHIP_ITF_REPLAY")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    let Some(directory) = std::env::var_os("FIDUCIA_MEMBERSHIP_ITF_TRACE_DIR") else {
+        assert!(
+            !required,
+            "FIDUCIA_MEMBERSHIP_ITF_TRACE_DIR is required when replay is mandatory"
+        );
+        eprintln!("membership ITF replay skipped: FIDUCIA_MEMBERSHIP_ITF_TRACE_DIR is unset");
+        return;
+    };
+
+    let mut traces = fs::read_dir(&directory)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read membership ITF directory {}: {error}",
+                PathBuf::from(&directory).display()
+            )
+        })
+        .map(|entry| entry.expect("membership ITF directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".itf.json"))
+        })
+        .collect::<Vec<_>>();
+    traces.sort();
+    assert!(
+        !traces.is_empty(),
+        "no *.itf.json traces found under {}",
+        PathBuf::from(&directory).display()
+    );
+
+    let mut transitions = 0usize;
+    for trace in &traces {
+        transitions += replay_itf_trace(trace);
+    }
+    assert!(
+        transitions > 0,
+        "membership ITF corpus contained no executable transitions"
+    );
+    eprintln!(
+        "replayed {} Quint membership traces and {} transitions against production Membership",
+        traces.len(),
+        transitions
+    );
+}
+
+fn replay_itf_trace(path: &Path) -> usize {
+    let document: Value =
+        serde_json::from_slice(&fs::read(path).unwrap_or_else(|error| {
+            panic!("failed to read ITF trace {}: {error}", path.display())
+        }))
+        .unwrap_or_else(|error| panic!("failed to parse ITF trace {}: {error}", path.display()));
+    let states = document["states"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ITF trace {} has no states array", path.display()));
+    assert!(
+        !states.is_empty(),
+        "ITF trace {} contains no states",
+        path.display()
+    );
+
+    let (membership, oracle, mut reference) = replay(&[]);
+    assert_model_state(&states[0]["s"], &reference, path, 0);
+
+    let mut transitions = 0usize;
+    for (index, state) in states.iter().enumerate().skip(1) {
+        let action_name = state["mbt::actionTaken"].as_str().unwrap_or_else(|| {
+            panic!(
+                "ITF trace {} state {index} has no mbt::actionTaken",
+                path.display()
+            )
+        });
+        if action_name != "idle" {
+            let action = itf_action(action_name, &state["mbt::nondetPicks"], path, index);
+            let actual = execute(&membership, &oracle, &reference, action);
+            let expected = reference.apply(action);
+            assert_eq!(
+                actual,
+                expected,
+                "production output diverged from Quint action {action_name} in {} state {index}",
+                path.display()
+            );
+            transitions += 1;
+        }
+
+        assert_eq!(
+            Projection::from_membership(&membership),
+            Projection::from_reference(&reference),
+            "production membership diverged in {} state {index} after {action_name}",
+            path.display()
+        );
+        assert_model_state(&state["s"], &reference, path, index);
+    }
+    transitions
+}
+
+fn itf_action(action: &str, picks: &Value, path: &Path, index: usize) -> Action {
+    match action {
+        "accept_heartbeat" | "ignore_stale_heartbeat" => Action::Heartbeat {
+            seq: itf_bigint(itf_pick(picks, "seq", path, index), path, index, "seq"),
+            report_version: u8::try_from(itf_bigint(
+                itf_pick(picks, "report", path, index),
+                path,
+                index,
+                "report",
+            ))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "ITF report version is outside u8 in {} state {index}",
+                    path.display()
+                )
+            }),
+        },
+        "sweep" => Action::Sweep,
+        "age_and_sweep" => match itf_tag(itf_pick(picks, "age", path, index)) {
+            "SuspectAge" => Action::AdvanceToSuspect,
+            "DeadAge" => Action::AdvanceToDead,
+            age => panic!(
+                "unsupported ITF age {age:?} in {} state {index}",
+                path.display()
+            ),
+        },
+        "oracle_and_sweep" => {
+            Action::OracleAndSweep(match itf_tag(itf_pick(picks, "verdict", path, index)) {
+                "OracleUnknown" => Verdict::Unknown,
+                "OracleRunning" => Verdict::Running,
+                "OracleGone" => Verdict::Gone,
+                verdict => panic!(
+                    "unsupported ITF oracle {verdict:?} in {} state {index}",
+                    path.display()
+                ),
+            })
+        }
+        "drain" => Action::Drain,
+        other => panic!(
+            "unsupported Quint membership action {other:?} in {} state {index}",
+            path.display()
+        ),
+    }
+}
+
+fn itf_pick<'a>(picks: &'a Value, name: &str, path: &Path, index: usize) -> &'a Value {
+    let pick = &picks[name];
+    assert_eq!(
+        pick["tag"].as_str(),
+        Some("Some"),
+        "ITF pick {name} is absent in {} state {index}",
+        path.display()
+    );
+    &pick["value"]
+}
+
+fn itf_bigint(value: &Value, path: &Path, index: usize, field: &str) -> u64 {
+    value["#bigint"]
+        .as_str()
+        .and_then(|raw| raw.parse().ok())
+        .or_else(|| value.as_u64())
+        .unwrap_or_else(|| {
+            panic!(
+                "ITF field {field} is not a non-negative integer in {} state {index}",
+                path.display()
+            )
+        })
+}
+
+fn itf_tag(value: &Value) -> &str {
+    value["tag"].as_str().unwrap_or("<missing-tag>")
+}
+
+fn assert_model_state(state: &Value, reference: &Reference, path: &Path, index: usize) {
+    let model_health = match itf_tag(&state["health"]) {
+        "Healthy" => Health::Healthy,
+        "Suspect" => Health::Suspect,
+        "Dead" => Health::Dead,
+        "Draining" => Health::Draining,
+        other => panic!(
+            "unsupported ITF health {other:?} in {} state {index}",
+            path.display()
+        ),
+    };
+    let model_oracle = match itf_tag(&state["oracle"]) {
+        "OracleUnknown" => Verdict::Unknown,
+        "OracleRunning" => Verdict::Running,
+        "OracleGone" => Verdict::Gone,
+        other => panic!(
+            "unsupported ITF oracle {other:?} in {} state {index}",
+            path.display()
+        ),
+    };
+    assert_eq!(
+        reference.health,
+        model_health,
+        "health diverged in {} state {index}",
+        path.display()
+    );
+    assert_eq!(
+        reference.oracle,
+        model_oracle,
+        "oracle diverged in {} state {index}",
+        path.display()
+    );
+    assert_eq!(
+        reference.last_seq,
+        itf_bigint(&state["last_seq"], path, index, "last_seq"),
+        "sequence diverged in {} state {index}",
+        path.display()
+    );
+    assert_eq!(
+        u64::from(reference.report_version),
+        itf_bigint(&state["report_version"], path, index, "report_version"),
+        "report version diverged in {} state {index}",
+        path.display()
+    );
+    assert_eq!(
+        reference.ever_draining,
+        state["ever_draining"].as_bool().unwrap_or_else(|| {
+            panic!(
+                "ITF ever_draining is not boolean in {} state {index}",
+                path.display()
+            )
+        }),
+        "draining history diverged in {} state {index}",
+        path.display()
+    );
+
+    let silent_for = reference.now_ms.saturating_sub(reference.last_seen_ms);
+    match itf_tag(&state["age"]) {
+        "Fresh" => assert!(
+            silent_for < SUSPECT_AFTER_MS,
+            "Fresh age diverged in {} state {index}",
+            path.display()
+        ),
+        "SuspectAge" => assert!(
+            (SUSPECT_AFTER_MS..DEAD_AFTER_MS).contains(&silent_for),
+            "SuspectAge diverged in {} state {index}",
+            path.display()
+        ),
+        "DeadAge" => assert!(
+            silent_for >= DEAD_AFTER_MS,
+            "DeadAge diverged in {} state {index}",
+            path.display()
+        ),
+        other => panic!(
+            "unsupported ITF age {other:?} in {} state {index}",
+            path.display()
+        ),
+    }
 }
 
 fn replay(trace: &[Action]) -> (Membership, Arc<MutableOracle>, Reference) {
