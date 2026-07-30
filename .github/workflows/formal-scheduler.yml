@@ -1,0 +1,178 @@
+name: formal-scheduler
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/formal-scheduler.yml"
+      - "formal/brain_scheduler.qnt"
+      - "formal/fm-scheduler.toml"
+      - "tests/formal_scheduler_refinement.rs"
+      - "src/cluster.rs"
+      - "src/leadership.rs"
+      - "src/membership.rs"
+      - "src/model.rs"
+      - "src/placement.rs"
+      - "src/plan.rs"
+      - "src/scheduler.rs"
+  pull_request:
+    paths:
+      - ".github/workflows/formal-scheduler.yml"
+      - "formal/brain_scheduler.qnt"
+      - "formal/fm-scheduler.toml"
+      - "tests/formal_scheduler_refinement.rs"
+      - "src/cluster.rs"
+      - "src/leadership.rs"
+      - "src/membership.rs"
+      - "src/model.rs"
+      - "src/placement.rs"
+      - "src/plan.rs"
+      - "src/scheduler.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scheduler:
+    name: Quint scheduler model and Rust refinement
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: repo
+    env:
+      QUINT_PACKAGE: '@informalsystems/quint@0.32.0'
+      NO_COLOR: '1'
+      RUST_BACKTRACE: full
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: repo
+
+      - name: Checkout shared interfaces
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: ee8fe09f846f5a776d156c0b0d0d15582c8bd539
+          path: fiducia-interfaces
+
+      - name: Checkout shared routing
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: c694bc5c58587bec12989a347e926c0040aacada
+          path: fiducia-routing.rs
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+
+      - name: Install Java for TLC
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: '1.95.0'
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: repo
+
+      - name: Typecheck scheduler model
+        shell: bash
+        run: |
+          mkdir -p .formal-artifacts/scheduler
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck \
+            formal/brain_scheduler.qnt 2>&1 \
+            | tee .formal-artifacts/scheduler/typecheck.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Simulate invariant and reconciliation witnesses
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_scheduler.qnt \
+            --max-samples=20000 \
+            --max-steps=35 \
+            --invariant=scheduler_safety \
+            --witnesses \
+              follower_hold_reached \
+              incomplete_membership_hold_reached \
+              degraded_membership_hold_reached \
+              direct_forget_rejected_reached \
+              cold_adoption_reached \
+              dead_replacement_reached \
+              drain_finalization_reached \
+              idempotent_reconcile_reached \
+              snapshot_restore_reached 2>&1 \
+            | tee .formal-artifacts/scheduler/simulation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Exhaustively check finite scheduler state space
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint verify \
+            formal/brain_scheduler.qnt \
+            --backend=tlc \
+            --invariant=scheduler_safety 2>&1 \
+            | tee .formal-artifacts/scheduler/tlc.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Generate scheduler model-based traces
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_scheduler.qnt \
+            --max-samples=20000 \
+            --max-steps=30 \
+            --n-traces=12 \
+            --mbt \
+            --out-itf='.formal-artifacts/scheduler/trace-{seq}.itf.json' 2>&1 \
+            | tee .formal-artifacts/scheduler/trace-generation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Replay generated traces against production scheduler
+        env:
+          FIDUCIA_SCHEDULER_ITF_TRACE_DIR: .formal-artifacts/scheduler
+          FIDUCIA_REQUIRE_SCHEDULER_ITF_REPLAY: '1'
+        run: >-
+          cargo test --locked --test formal_scheduler_refinement
+          generated_scheduler_itf_traces_replay_against_production -- --nocapture
+
+      - name: Upload scheduler diagnostics and traces
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fiducia-brain-scheduler-formal
+          path: repo/.formal-artifacts/scheduler/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
