@@ -78,7 +78,10 @@ fn run_protocol() -> Result<(), Box<dyn Error>> {
         request.protocol == ADAPTER_PROTOCOL,
         format!("unsupported adapter protocol {:?}", request.protocol),
     )?;
-    ensure(request.adapter == "rust", "request selected a non-Rust adapter")?;
+    ensure(
+        request.adapter == "rust",
+        "request selected a non-Rust adapter",
+    )?;
     ensure(
         request.project == "fiducia-brain.rs",
         format!("unexpected project {:?}", request.project),
@@ -105,10 +108,7 @@ fn run_protocol() -> Result<(), Box<dyn Error>> {
     let summary = replay_paths(&request.traces);
     eprintln!(
         "replayed {} Quint scheduler traces, {} states, and {} non-idle transitions; actions={:?}",
-        summary.traces_total,
-        summary.states,
-        summary.non_idle_transitions,
-        summary.actions
+        summary.traces_total, summary.states, summary.non_idle_transitions, summary.actions
     );
     let response = ReplayResponse {
         protocol: ADAPTER_PROTOCOL,
@@ -138,9 +138,7 @@ fn run_human(paths: Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
         let rendered = serde_json::to_string_pretty(&summary.mismatches)?;
         return Err(invalid(format!(
             "scheduler refinement failed for {} of {} traces:\n{rendered}",
-            summary
-                .traces_total
-                .saturating_sub(summary.traces_passed),
+            summary.traces_total.saturating_sub(summary.traces_passed),
             summary.traces_total
         )));
     }

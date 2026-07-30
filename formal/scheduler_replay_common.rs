@@ -172,12 +172,7 @@ impl Harness {
             placement.clone(),
             plan.clone(),
         ));
-        let scheduler = Scheduler::new(
-            membership.clone(),
-            placement.clone(),
-            plan,
-            cp.clone(),
-        );
+        let scheduler = Scheduler::new(membership.clone(), placement.clone(), plan, cp.clone());
         Self {
             membership,
             placement,
@@ -420,14 +415,9 @@ fn replay_trace(path: &Path) -> Result<TraceSummary, ReplayMismatch> {
     let bytes = fs::read(path).map_err(|error| mismatch(path, None, None, error.to_string()))?;
     let document: Value = serde_json::from_slice(&bytes)
         .map_err(|error| mismatch(path, None, None, error.to_string()))?;
-    let states = document["states"].as_array().ok_or_else(|| {
-        mismatch(
-            path,
-            None,
-            None,
-            "ITF trace has no states array".to_owned(),
-        )
-    })?;
+    let states = document["states"]
+        .as_array()
+        .ok_or_else(|| mismatch(path, None, None, "ITF trace has no states array".to_owned()))?;
     if states.is_empty() {
         return Err(mismatch(
             path,
@@ -470,9 +460,8 @@ fn replay_trace(path: &Path) -> Result<TraceSummary, ReplayMismatch> {
                 actual: serde_json::to_value(harness.projection()).unwrap_or(Value::Null),
             });
         }
-        let expected = expected_projection(&state["s"]).map_err(|message| {
-            mismatch(path, Some(index as u64), Some(action), message)
-        })?;
+        let expected = expected_projection(&state["s"])
+            .map_err(|message| mismatch(path, Some(index as u64), Some(action), message))?;
         let actual = harness.projection();
         if actual != expected {
             return Err(projection_mismatch(path, index, action, &expected, &actual));
