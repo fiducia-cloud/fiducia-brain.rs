@@ -243,6 +243,7 @@ impl Harness {
             | "reconcile_cold_adopt"
             | "reconcile_replace_dead_a"
             | "reconcile_replace_and_forget_drained_a"
+            | "reconcile_forget_drained_a_after_placement"
             | "reconcile_idempotent" => self.scheduler.reconcile(),
             "attempt_forget_a_rejected" => {
                 assert!(self.cp.propose(Command::ForgetNode(A.to_owned())));
