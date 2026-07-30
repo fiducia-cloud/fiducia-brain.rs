@@ -419,6 +419,86 @@ module brain_scheduler {
 
   action idle = s' = s
 
+  // Deterministic scenario steppers are used only for model-based trace export.
+  // The exhaustive `step` relation below remains the unconstrained behavior model.
+  // Each scenario starts from `init`, takes one canonical path, then stutters so CI
+  // can require concrete production replay for every critical transition instead of
+  // relying on random trace generation to happen to cover rare paths.
+  action trace_follower_step = any {
+    all { s.last_event == InitEvent, become_follower },
+    all { s.last_event == BecameFollower, reconcile_follower_hold },
+    all { s.last_event == FollowerHeld, become_leader },
+    all { s.last_event == BecameLeader, reconcile_idempotent },
+    all { s.last_event == IdempotentHeld, idle },
+  }
+
+  action trace_incomplete_step = any {
+    all { s.last_event == InitEvent, lose_a_from_soft_membership },
+    all { s.last_event == SoftMembershipLost, reconcile_incomplete_hold },
+    all { s.last_event == IncompleteHeld, idle },
+  }
+
+  action trace_membership_recovery_step = any {
+    all { s.last_event == InitEvent, lose_a_from_soft_membership },
+    all { s.last_event == SoftMembershipLost, heartbeat_a },
+    all { s.last_event == HeartbeatRestored, reconcile_idempotent },
+    all { s.last_event == IdempotentHeld, idle },
+  }
+
+  action trace_degraded_step = any {
+    all { s.last_event == InitEvent, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    all { s.last_event == DrainEvacuated, reconcile_degraded_hold },
+    all { s.last_event == DegradedHeld, idle },
+  }
+
+  action trace_forget_rejection_step = any {
+    all { s.last_event == InitEvent, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    all { s.last_event == DrainEvacuated, attempt_forget_a_rejected },
+    all { s.last_event == ForgetRejected, idle },
+  }
+
+  action trace_cold_adoption_step = any {
+    all { s.last_event == InitEvent, prepare_cold_start },
+    all { s.last_event == ColdStartPrepared, reconcile_cold_adopt },
+    all { s.last_event == ColdAdopted, idle },
+  }
+
+  action trace_dead_replacement_step = any {
+    all { s.last_event == InitEvent, add_d },
+    all { s.last_event == NodeAdded, mark_a_dead },
+    all { s.last_event == NodeDied, reconcile_replace_dead_a },
+    all { s.last_event == DeadReplaced, idle },
+  }
+
+  action trace_drain_replacement_step = any {
+    all { s.last_event == InitEvent, add_d },
+    all { s.last_event == NodeAdded, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    all { s.last_event == DrainEvacuated, reconcile_replace_and_forget_drained_a },
+    all { s.last_event == DrainReplacedAndForgotten, idle },
+  }
+
+  action trace_forget_after_placement_step = any {
+    all { s.last_event == InitEvent, restore_snapshot_bcd },
+    all { s.last_event == SnapshotRestored, begin_drain_a },
+    all { s.last_event == DrainStarted, evacuate_a },
+    all { s.last_event == DrainEvacuated, add_d },
+    all { s.last_event == NodeAdded, reconcile_forget_drained_a_after_placement },
+    all { s.last_event == DrainForgottenAfterPlacement, idle },
+  }
+
+  action trace_idempotent_step = any {
+    all { s.last_event == InitEvent, reconcile_idempotent },
+    all { s.last_event == IdempotentHeld, idle },
+  }
+
+  action trace_snapshot_step = any {
+    all { s.last_event == InitEvent, restore_snapshot_bcd },
+    all { s.last_event == SnapshotRestored, idle },
+  }
+
   action step = any {
     become_follower,
     become_leader,
