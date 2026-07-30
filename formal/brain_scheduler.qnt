@@ -28,7 +28,8 @@ module brain_scheduler {
     | ForgetRejected
     | ColdAdopted
     | DeadReplaced
-    | DrainForgotten
+    | DrainReplacedAndForgotten
+    | DrainForgottenAfterPlacement
     | IdempotentHeld
 
   pure val NODES = Set(1, 2, 3, 4)
@@ -358,19 +359,49 @@ module brain_scheduler {
       preferred_leader: 2,
       generation: s.generation + 1,
       forgotten: s.forgotten.union(Set(1)),
-      last_event: DrainForgotten,
+      last_event: DrainReplacedAndForgotten,
       last_generation_delta: 1,
       last_placement_write: true,
       last_forget_write: true,
     },
   }
 
+  // Placement can already exclude A because a snapshot or a previous committed
+  // reconciliation installed BCD. The next stable leader tick then performs only
+  // the final durable ForgetNode, without rewriting placement or generation.
+  action reconcile_forget_drained_a_after_placement = all {
+    s.role == Leader,
+    s.known == NODES,
+    s.healthy == BCD,
+    s.draining == Set(1),
+    not(s.hosted.contains(1)),
+    s.placement == BCD,
+    s.preferred_leader == 2,
+    s' = {
+      ...s,
+      known: BCD,
+      draining: Set(),
+      forgotten: s.forgotten.union(Set(1)),
+      last_event: DrainForgottenAfterPlacement,
+      last_generation_delta: 0,
+      last_placement_write: false,
+      last_forget_write: true,
+    },
+  }
+
   // These are the stable one-shard fixed points of the production planner under
   // target_nodes=RF=3. A second tick must not rewrite placement or rotate leaders.
+  // An evacuated draining node outside placement is deliberately excluded because
+  // that state has a pending forget-only transition rather than being a fixed point.
   action reconcile_idempotent = all {
     s.role == Leader,
     s.placement.subseteq(s.known),
     s.placement.subseteq(s.healthy),
+    not(and {
+      s.draining.contains(1),
+      not(s.hosted.contains(1)),
+      not(s.placement.contains(1)),
+    }),
     or {
       and { s.placement == ABC, s.preferred_leader == 1, s.observed_leader == 1 },
       and { s.placement == ABC, s.preferred_leader == 2, s.observed_leader == 2 },
@@ -406,6 +437,7 @@ module brain_scheduler {
     reconcile_cold_adopt,
     reconcile_replace_dead_a,
     reconcile_replace_and_forget_drained_a,
+    reconcile_forget_drained_a_after_placement,
     reconcile_idempotent,
     idle,
   }
@@ -469,17 +501,20 @@ module brain_scheduler {
       s.last_event == SnapshotRestored,
       s.last_event == ColdAdopted,
       s.last_event == DeadReplaced,
-      s.last_event == DrainForgotten,
+      s.last_event == DrainReplacedAndForgotten,
     }
 
   val generation_accounting =
     s.last_generation_delta == if (s.last_placement_write) 1 else 0
 
   val forget_accounting =
-    s.last_forget_write == (s.last_event == DrainForgotten)
+    s.last_forget_write == or {
+      s.last_event == DrainReplacedAndForgotten,
+      s.last_event == DrainForgottenAfterPlacement,
+    }
 
-  val changed_assignment_is_leader_only =
-    not(s.last_placement_write) or s.role == Leader
+  val durable_writes_are_leader_only =
+    not(or { s.last_placement_write, s.last_forget_write }) or s.role == Leader
 
   val follower_hold_shape =
     s.last_event != FollowerHeld or s.role == Follower
@@ -524,7 +559,10 @@ module brain_scheduler {
     }
 
   val drain_finalization_is_safe =
-    s.last_event != DrainForgotten or and {
+    not(or {
+      s.last_event == DrainReplacedAndForgotten,
+      s.last_event == DrainForgottenAfterPlacement,
+    }) or and {
       s.known == BCD,
       s.healthy == BCD,
       s.placement == BCD,
@@ -549,7 +587,7 @@ module brain_scheduler {
     placement_write_accounting,
     generation_accounting,
     forget_accounting,
-    changed_assignment_is_leader_only,
+    durable_writes_are_leader_only,
     follower_hold_shape,
     incomplete_hold_shape,
     degraded_hold_shape,
@@ -566,7 +604,10 @@ module brain_scheduler {
   val direct_forget_rejected_reached = s.last_event == ForgetRejected
   val cold_adoption_reached = s.last_event == ColdAdopted
   val dead_replacement_reached = s.last_event == DeadReplaced
-  val drain_finalization_reached = s.last_event == DrainForgotten
+  val drain_finalization_reached = or {
+    s.last_event == DrainReplacedAndForgotten,
+    s.last_event == DrainForgottenAfterPlacement,
+  }
   val idempotent_reconcile_reached = s.last_event == IdempotentHeld
   val snapshot_restore_reached = s.last_event == SnapshotRestored
 }
