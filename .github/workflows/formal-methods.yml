@@ -131,7 +131,7 @@ jobs:
 
       - name: Replay generated membership traces against production Rust
         env:
-          FIDUCIA_MEMBERSHIP_ITF_TRACE_DIR: .formal-artifacts/membership
+          FIDUCIA_MEMBERSHIP_ITF_TRACE_DIR: .formal-artifacts
           FIDUCIA_REQUIRE_MEMBERSHIP_ITF_REPLAY: '1'
         run: >-
           cargo test --locked --test formal_membership_refinement

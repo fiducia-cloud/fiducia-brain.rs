@@ -51,3 +51,17 @@ strategy = "itf-replay-and-bounded-independent-reference"
 target = "tests/formal_membership_refinement.rs"
 status = "active"
 issue = "DEN-569"
+command = [
+  "cargo",
+  "test",
+  "--locked",
+  "--test",
+  "formal_membership_refinement",
+  "generated_itf_traces_replay_against_membership",
+  "--",
+  "--nocapture",
+]
+
+[adapters.rust.environment]
+FIDUCIA_MEMBERSHIP_ITF_TRACE_DIR = ".formal-artifacts"
+FIDUCIA_REQUIRE_MEMBERSHIP_ITF_REPLAY = "1"

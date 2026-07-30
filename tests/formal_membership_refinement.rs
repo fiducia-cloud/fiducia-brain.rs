@@ -487,20 +487,8 @@ fn generated_itf_traces_replay_against_membership() {
         return;
     };
 
-    let mut traces = fs::read_dir(&directory)
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to read membership ITF directory {}: {error}",
-                PathBuf::from(&directory).display()
-            )
-        })
-        .map(|entry| entry.expect("membership ITF directory entry").path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".itf.json"))
-        })
-        .collect::<Vec<_>>();
+    let mut traces = Vec::new();
+    collect_itf_traces(&PathBuf::from(&directory), &mut traces);
     traces.sort();
     assert!(
         !traces.is_empty(),
@@ -521,6 +509,23 @@ fn generated_itf_traces_replay_against_membership() {
         traces.len(),
         transitions
     );
+}
+
+fn collect_itf_traces(root: &Path, traces: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(root)
+        .unwrap_or_else(|error| panic!("failed to read ITF directory {}: {error}", root.display()))
+    {
+        let path = entry.expect("membership ITF directory entry").path();
+        if path.is_dir() {
+            collect_itf_traces(&path, traces);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".itf.json"))
+        {
+            traces.push(path);
+        }
+    }
 }
 
 fn replay_itf_trace(path: &Path) -> usize {
