@@ -1,33 +1,36 @@
 name: scheduler-data-plane-composition
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/scheduler-data-plane-composition.yml"
+      - "docs/scheduler-data-plane-composition.md"
+      - "tools/scheduler-data-plane-composition/**"
   pull_request:
     paths:
       - ".github/workflows/scheduler-data-plane-composition.yml"
       - "docs/scheduler-data-plane-composition.md"
       - "tools/scheduler-data-plane-composition/**"
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  format-and-validate:
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.head_ref == 'den-1516-scheduler-data-plane-composition'
-    name: Format and validate the owned DEN-1516 branch
+  composition:
+    name: Publication, activation, restart, and term fencing
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Checkout owned pull-request branch
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.head_ref }}
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -35,11 +38,13 @@ jobs:
           toolchain: '1.95.0'
           components: rustfmt, clippy
 
-      - name: Apply rustfmt
+      - name: Check formatting
         run: >-
           cargo fmt
           --manifest-path tools/scheduler-data-plane-composition/Cargo.toml
           --all
+          --
+          --check
 
       - name: Lint with warnings denied
         run: >-
@@ -64,17 +69,3 @@ jobs:
           --manifest-path tools/scheduler-data-plane-composition/Cargo.toml
           --locked
           --no-deps
-
-      - name: Commit exact formatter output
-        shell: bash
-        run: |
-          set -euo pipefail
-          git add tools/scheduler-data-plane-composition
-          if git diff --cached --quiet; then
-            echo "rustfmt produced no changes"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "style(DEN-1516): apply rustfmt"
-          git push origin "HEAD:${GITHUB_HEAD_REF}"
