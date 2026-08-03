@@ -38,13 +38,11 @@ jobs:
           toolchain: '1.95.0'
           components: rustfmt, clippy
 
-      - name: Check formatting
+      - name: Format working tree
         run: >-
           cargo fmt
           --manifest-path tools/scheduler-data-plane-composition/Cargo.toml
           --all
-          --
-          --check
 
       - name: Lint with warnings denied
         run: >-
@@ -69,3 +67,6 @@ jobs:
           --manifest-path tools/scheduler-data-plane-composition/Cargo.toml
           --locked
           --no-deps
+
+      - name: Verify formatting is committed
+        run: git diff --exit-code -- tools/scheduler-data-plane-composition
