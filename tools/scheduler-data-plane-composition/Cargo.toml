@@ -1,0 +1,13 @@
+[package]
+name = "fiducia-scheduler-data-plane-composition"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Executable safety model for Fiducia scheduler publication and node activation"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

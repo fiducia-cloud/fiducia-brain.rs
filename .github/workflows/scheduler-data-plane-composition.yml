@@ -1,0 +1,71 @@
+name: scheduler-data-plane-composition
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/scheduler-data-plane-composition.yml"
+      - "docs/scheduler-data-plane-composition.md"
+      - "tools/scheduler-data-plane-composition/**"
+  pull_request:
+    paths:
+      - ".github/workflows/scheduler-data-plane-composition.yml"
+      - "docs/scheduler-data-plane-composition.md"
+      - "tools/scheduler-data-plane-composition/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  composition:
+    name: Publication, activation, restart, and term fencing
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: '1.95.0'
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: >-
+          cargo fmt
+          --manifest-path tools/scheduler-data-plane-composition/Cargo.toml
+          --all
+          --
+          --check
+
+      - name: Lint with warnings denied
+        run: >-
+          cargo clippy
+          --manifest-path tools/scheduler-data-plane-composition/Cargo.toml
+          --all-targets
+          --locked
+          --
+          -D warnings
+
+      - name: Run deterministic composition tests
+        run: >-
+          cargo test
+          --manifest-path tools/scheduler-data-plane-composition/Cargo.toml
+          --locked
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: >-
+          cargo doc
+          --manifest-path tools/scheduler-data-plane-composition/Cargo.toml
+          --locked
+          --no-deps
