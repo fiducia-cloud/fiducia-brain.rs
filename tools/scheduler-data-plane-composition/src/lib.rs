@@ -194,14 +194,10 @@ impl BrainPublisher {
         match self.published.get(&snapshot.generation) {
             Some(published) if published == snapshot => {}
             Some(_) => {
-                return Err(ModelError::ConflictingGeneration(
-                    snapshot.generation,
-                ));
+                return Err(ModelError::ConflictingGeneration(snapshot.generation));
             }
             None => {
-                return Err(ModelError::UnknownPublishedGeneration(
-                    snapshot.generation,
-                ));
+                return Err(ModelError::UnknownPublishedGeneration(snapshot.generation));
             }
         }
         self.committed_generation = snapshot.generation;
@@ -293,9 +289,7 @@ impl NodeReplica {
     pub fn active_shards(&self) -> BTreeSet<ShardId> {
         self.active
             .as_ref()
-            .map_or_else(BTreeSet::new, |placement| {
-                placement.assigned_shards.clone()
-            })
+            .map_or_else(BTreeSet::new, |placement| placement.assigned_shards.clone())
     }
 
     #[must_use]
@@ -397,10 +391,7 @@ impl NodeReplica {
         generation: Generation,
         shard: ShardId,
     ) -> Result<AckOutcome, ModelError> {
-        let staged = self
-            .staged
-            .as_mut()
-            .ok_or(ModelError::NoStagedPlacement)?;
+        let staged = self.staged.as_mut().ok_or(ModelError::NoStagedPlacement)?;
         if generation != staged.snapshot.generation {
             return Err(ModelError::AckGenerationMismatch {
                 staged: staged.snapshot.generation,
@@ -418,10 +409,7 @@ impl NodeReplica {
     }
 
     pub fn activate(&mut self, generation: Generation) -> Result<(), ModelError> {
-        let staged = self
-            .staged
-            .as_ref()
-            .ok_or(ModelError::NoStagedPlacement)?;
+        let staged = self.staged.as_ref().ok_or(ModelError::NoStagedPlacement)?;
         if generation != staged.snapshot.generation {
             return Err(ModelError::AckGenerationMismatch {
                 staged: staged.snapshot.generation,
@@ -474,13 +462,9 @@ impl NodeReplica {
     #[must_use]
     pub fn accepts_write(&self, fence: WriteFence, shard: ShardId) -> bool {
         self.write_fence == Some(fence)
-            && self
-                .active
-                .as_ref()
-                .is_some_and(|active| {
-                    active.generation == fence.generation
-                        && active.assigned_shards.contains(&shard)
-                })
+            && self.active.as_ref().is_some_and(|active| {
+                active.generation == fence.generation && active.assigned_shards.contains(&shard)
+            })
     }
 
     /// Simulates a process restart with durable active/staged generation metadata.
@@ -502,7 +486,10 @@ pub enum ModelError {
     NotLeader,
     EmptyPlacement,
     EmptyReplicaSet(ShardId),
-    DuplicateReplica { shard: ShardId, node: NodeId },
+    DuplicateReplica {
+        shard: ShardId,
+        node: NodeId,
+    },
     GenerationOverflow,
     UnknownPublishedGeneration(Generation),
     ConflictingGeneration(Generation),
@@ -514,7 +501,10 @@ pub enum ModelError {
         committed: Generation,
         requested: Generation,
     },
-    StaleTerm { observed: Term, provided: Term },
+    StaleTerm {
+        observed: Term,
+        provided: Term,
+    },
     StaleGeneration {
         active: Generation,
         provided: Generation,
@@ -548,10 +538,16 @@ impl Display for ModelError {
             }
             Self::GenerationOverflow => write!(formatter, "placement generation overflow"),
             Self::UnknownPublishedGeneration(generation) => {
-                write!(formatter, "generation {generation} was not published in this term")
+                write!(
+                    formatter,
+                    "generation {generation} was not published in this term"
+                )
             }
             Self::ConflictingGeneration(generation) => {
-                write!(formatter, "generation {generation} has conflicting contents")
+                write!(
+                    formatter,
+                    "generation {generation} has conflicting contents"
+                )
             }
             Self::NonSequentialCommit { expected, provided } => write!(
                 formatter,
@@ -630,12 +626,8 @@ mod tests {
     #[test]
     fn publication_and_commit_generations_are_strictly_sequential() {
         let mut brain = BrainPublisher::new(BrainRole::Leader, 1, 0).unwrap();
-        let first = brain
-            .publish_next(assignments(&[(1, &[1, 2, 3])]))
-            .unwrap();
-        let second = brain
-            .publish_next(assignments(&[(1, &[2, 3, 4])]))
-            .unwrap();
+        let first = brain.publish_next(assignments(&[(1, &[1, 2, 3])])).unwrap();
+        let second = brain.publish_next(assignments(&[(1, &[2, 3, 4])])).unwrap();
         assert_eq!(first.generation, 1);
         assert_eq!(second.generation, 2);
         assert!(matches!(
@@ -664,8 +656,7 @@ mod tests {
 
     #[test]
     fn duplicate_delivery_is_idempotent_but_same_generation_conflict_is_rejected() {
-        let snapshot =
-            PlacementSnapshot::new(1, 1, assignments(&[(1, &[1]), (2, &[1])])).unwrap();
+        let snapshot = PlacementSnapshot::new(1, 1, assignments(&[(1, &[1]), (2, &[1])])).unwrap();
         let mut node = NodeReplica::new(1);
         assert_eq!(node.stage(snapshot.clone()).unwrap(), StageOutcome::Staged);
         assert_eq!(
@@ -683,8 +674,7 @@ mod tests {
 
     #[test]
     fn partial_generation_cannot_activate_or_serve_writes() {
-        let snapshot =
-            PlacementSnapshot::new(1, 1, assignments(&[(1, &[1]), (2, &[1])])).unwrap();
+        let snapshot = PlacementSnapshot::new(1, 1, assignments(&[(1, &[1]), (2, &[1])])).unwrap();
         let mut node = NodeReplica::new(1);
         node.stage(snapshot).unwrap();
         node.acknowledge_shard(1, 1).unwrap();
@@ -781,14 +771,9 @@ mod tests {
 
     #[test]
     fn restart_preserves_generation_but_loses_volatile_ack_and_write_authority() {
-        let first =
-            PlacementSnapshot::new(1, 1, assignments(&[(1, &[1]), (2, &[1])])).unwrap();
-        let second = PlacementSnapshot::new(
-            1,
-            2,
-            assignments(&[(1, &[1]), (2, &[1]), (3, &[1])]),
-        )
-        .unwrap();
+        let first = PlacementSnapshot::new(1, 1, assignments(&[(1, &[1]), (2, &[1])])).unwrap();
+        let second =
+            PlacementSnapshot::new(1, 2, assignments(&[(1, &[1]), (2, &[1]), (3, &[1])])).unwrap();
         let mut node = NodeReplica::new(1);
         activate_all(&mut node, first);
         node.install_write_fence(WriteFence {
@@ -812,10 +797,8 @@ mod tests {
 
     #[test]
     fn newer_staged_generation_rejects_delayed_snapshot_and_ack() {
-        let second =
-            PlacementSnapshot::new(1, 2, assignments(&[(1, &[1]), (2, &[1])])).unwrap();
-        let third =
-            PlacementSnapshot::new(1, 3, assignments(&[(1, &[1]), (3, &[1])])).unwrap();
+        let second = PlacementSnapshot::new(1, 2, assignments(&[(1, &[1]), (2, &[1])])).unwrap();
+        let third = PlacementSnapshot::new(1, 3, assignments(&[(1, &[1]), (3, &[1])])).unwrap();
         let mut node = NodeReplica::new(1);
         node.stage(second.clone()).unwrap();
         node.stage(third).unwrap();
@@ -862,12 +845,8 @@ mod tests {
 
     #[test]
     fn acknowledgement_order_does_not_change_activation_result() {
-        let snapshot = PlacementSnapshot::new(
-            4,
-            9,
-            assignments(&[(1, &[7]), (2, &[7]), (3, &[7])]),
-        )
-        .unwrap();
+        let snapshot =
+            PlacementSnapshot::new(4, 9, assignments(&[(1, &[7]), (2, &[7]), (3, &[7])])).unwrap();
         let orders = [
             [1, 2, 3],
             [1, 3, 2],
