@@ -250,6 +250,12 @@ impl RaftControlPlane {
         placement: Arc<Placement>,
         plan: Arc<Mutex<ScalePlan>>,
     ) -> io::Result<Arc<Self>> {
+        cfg.validate().map_err(|message| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid Raft timing configuration: {message}"),
+            )
+        })?;
         // Recovery: entries at or below `base_index` exist only inside the WAL
         // snapshot — the log no longer has them. The engine resumes replay from
         // `base_index`, so the snapshot must be folded into the live state machine

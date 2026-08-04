@@ -14,7 +14,7 @@
 //! decisions, not customer ops), so simplicity beats incremental append here.
 
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,55 +79,71 @@ impl RaftStore {
         let log_path = dir.join("log");
         let snapshot_path = dir.join("snapshot");
 
-        let meta: Meta = match fs::read(&meta_path) {
-            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes).map_err(invalid)?,
-            Ok(_) => Meta::default(),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Meta::default(),
+        let (meta, meta_was_missing): (Meta, bool) = match fs::read(&meta_path) {
+            Ok(bytes) if bytes.is_empty() => {
+                return Err(invalid_data("Raft meta file is empty"));
+            }
+            Ok(bytes) => (serde_json::from_slice(&bytes).map_err(invalid)?, false),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (Meta::default(), true),
             Err(err) => return Err(err),
         };
 
         // The state-machine snapshot, present once the log has been compacted.
         let snapshot = match fs::read(&snapshot_path) {
-            Ok(bytes) if !bytes.is_empty() => Some(bytes),
-            Ok(_) => None,
+            Ok(bytes) if bytes.is_empty() => {
+                return Err(invalid_data("Raft snapshot file is empty"));
+            }
+            Ok(bytes) => Some(bytes),
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
             Err(err) => return Err(err),
         };
 
-        // Parse every complete JSON line; stop at the first that fails — that's a
-        // record torn by a crash mid-write, and everything after it. A v1 log
-        // opens with its header; a v0 log (written before the header existed)
-        // starts straight at the first entry and takes its base from meta.
+        // Parse every complete JSON line. Only the final malformed,
+        // unterminated fragment can be a crash-torn write; a malformed complete
+        // record or an empty record in the middle is durable corruption.
+        let log_bytes = match fs::read(&log_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        let terminated = log_bytes.ends_with(b"\n");
+        let lines: Vec<&[u8]> = log_bytes.split(|byte| *byte == b'\n').collect();
         let mut header: Option<LogHeader> = None;
         let mut log: Vec<LogEntry> = Vec::new();
-        match File::open(&log_path) {
-            Ok(file) => {
-                for (n, line) in BufReader::new(file).split(b'\n').enumerate() {
-                    let line = line?;
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if n == 0 {
-                        if let Ok(parsed) = serde_json::from_slice::<LogHeader>(&line) {
-                            header = Some(parsed);
-                            continue;
-                        }
-                    }
-                    match serde_json::from_slice::<LogEntry>(&line) {
-                        Ok(entry) => log.push(entry),
-                        Err(_) => break,
-                    }
+        for (line_number, line) in lines.iter().enumerate() {
+            let is_last = line_number + 1 == lines.len();
+            if line.is_empty() {
+                if is_last && (terminated || log_bytes.is_empty()) {
+                    continue;
+                }
+                return Err(invalid_data(format!(
+                    "Raft log contains an empty record at line {}",
+                    line_number + 1
+                )));
+            }
+            if line_number == 0 {
+                if let Ok(parsed) = serde_json::from_slice::<LogHeader>(line) {
+                    header = Some(parsed);
+                    continue;
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
+            match serde_json::from_slice::<LogEntry>(line) {
+                Ok(entry) => log.push(entry),
+                Err(_) if is_last && !terminated => break,
+                Err(error) => {
+                    return Err(invalid_data(format!(
+                        "invalid Raft log record at line {}: {error}",
+                        line_number + 1
+                    )));
+                }
+            }
         }
         if let Some(header) = &header {
-            if header.v > LOG_FORMAT_VERSION {
+            if header.v != LOG_FORMAT_VERSION {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "Raft log format v{} is newer than this binary understands (v{LOG_FORMAT_VERSION})",
+                        "unsupported Raft log format v{} (this binary requires v{LOG_FORMAT_VERSION}; headerless files are the v0 format)",
                         header.v
                     ),
                 ));
@@ -137,6 +153,11 @@ impl RaftStore {
             Some(h) => (h.base_index, h.base_term),
             None => (meta.base_index, meta.base_term),
         };
+        if meta_was_missing && (base_index > 0 || !log.is_empty() || snapshot.is_some()) {
+            return Err(invalid_data(
+                "Raft meta is missing while durable log/snapshot state exists",
+            ));
+        }
         // A crash between the log and meta writes can leave meta a step behind.
         // The snapshot beside a non-zero base only ever holds *committed* state
         // (compaction refuses to fold in anything above `commit_index`), so
@@ -152,7 +173,15 @@ impl RaftStore {
             #[cfg(test)]
             fail_saves: AtomicBool::new(false),
         };
-        validate_recovered(commit_index, base_index, snapshot.as_deref(), &log)?;
+        validate_persisted(
+            meta.current_term,
+            meta.voted_for.as_deref(),
+            commit_index,
+            base_index,
+            base_term,
+            snapshot.as_deref(),
+            &log,
+        )?;
         // Canonicalize on disk so the next write starts from clean bytes.
         store.write_log(base_index, base_term, &log)?;
 
@@ -175,6 +204,15 @@ impl RaftStore {
         if self.fail_saves.load(Ordering::SeqCst) {
             return Err(io::Error::other("injected RaftStore save failure"));
         }
+        validate_persisted(
+            p.current_term,
+            p.voted_for.as_deref(),
+            p.commit_index,
+            p.base_index,
+            p.base_term,
+            p.snapshot.as_deref(),
+            &p.log,
+        )?;
         // Snapshot first, then log, then meta — so the `base_index`/`commit_index`
         // recorded in meta can never reference a snapshot or entries not yet on disk.
         // The log's header carries the base alongside the entries it belongs to, so
@@ -225,41 +263,84 @@ impl RaftStore {
 /// Reject inconsistent durable state before canonicalizing a torn log. In
 /// particular, recovery may discard only an uncommitted torn tail; it must
 /// never erase evidence of an entry referenced by the durable commit index.
-fn validate_recovered(
+fn validate_persisted(
+    current_term: u64,
+    voted_for: Option<&str>,
     commit_index: u64,
     base_index: u64,
+    base_term: u64,
     snapshot: Option<&[u8]>,
     log: &[LogEntry],
 ) -> io::Result<()> {
-    if base_index > 0 && snapshot.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Raft snapshot is missing for non-zero base_index",
+    if current_term == 0 && voted_for.is_some() {
+        return Err(invalid_data("Raft hard state contains a vote in term zero"));
+    }
+    if (base_index == 0) != (base_term == 0) {
+        return Err(invalid_data(format!(
+            "Raft snapshot base index/term mismatch: index={base_index}, term={base_term}"
+        )));
+    }
+    if (base_index > 0) != snapshot.is_some() {
+        return Err(invalid_data(
+            "Raft snapshot presence does not match the non-zero snapshot base",
         ));
     }
-    let mut expected = base_index.saturating_add(1);
-    for entry in log {
+    if base_term > current_term {
+        return Err(invalid_data(format!(
+            "Raft snapshot term {base_term} exceeds current term {current_term}"
+        )));
+    }
+    if commit_index < base_index {
+        return Err(invalid_data(format!(
+            "Raft commit_index {commit_index} precedes snapshot base {base_index}"
+        )));
+    }
+
+    let mut previous_term = base_term;
+    for (position, entry) in log.iter().enumerate() {
+        let offset = u64::try_from(position)
+            .map_err(|_| invalid_data("Raft log position does not fit in u64"))?;
+        let expected = base_index
+            .checked_add(1)
+            .and_then(|first| first.checked_add(offset))
+            .ok_or_else(|| invalid_data("Raft log index overflow"))?;
         if entry.index != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Raft log is not contiguous: expected index {expected}, found {}",
-                    entry.index
-                ),
-            ));
+            return Err(invalid_data(format!(
+                "Raft log is not contiguous: expected index {expected}, found {}",
+                entry.index
+            )));
         }
-        expected = expected.saturating_add(1);
+        if entry.term == 0 {
+            return Err(invalid_data(format!(
+                "Raft log entry {} has term zero",
+                entry.index
+            )));
+        }
+        if entry.term < previous_term {
+            return Err(invalid_data(format!(
+                "Raft log term descends at index {}: previous {previous_term}, found {}",
+                entry.index, entry.term
+            )));
+        }
+        if entry.term > current_term {
+            return Err(invalid_data(format!(
+                "Raft log term {} at index {} exceeds current term {current_term}",
+                entry.term, entry.index
+            )));
+        }
+        previous_term = entry.term;
     }
     let last_index = log.last().map(|entry| entry.index).unwrap_or(base_index);
     if commit_index > last_index {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Raft commit_index {commit_index} exceeds last recoverable index {last_index}; refusing to truncate committed entries"
-            ),
-        ));
+        return Err(invalid_data(format!(
+            "Raft commit_index {commit_index} exceeds last recoverable index {last_index}; refusing to truncate committed entries"
+        )));
     }
     Ok(())
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 fn invalid<E>(e: E) -> io::Error
@@ -310,6 +391,107 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    fn open_error(dir: &Path) -> io::Error {
+        match RaftStore::open(dir) {
+            Ok(_) => panic!("corrupt Raft store unexpectedly opened"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn newline_terminated_corruption_is_rejected_and_preserved() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store
+            .save(&Persisted {
+                current_term: 1,
+                commit_index: 1,
+                log: vec![entry(1, 1)],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log"))
+            .unwrap();
+        file.write_all(b"not-json\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let before = fs::read(dir.join("log")).unwrap();
+        let error = open_error(&dir);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 3"));
+        assert_eq!(fs::read(dir.join("log")).unwrap(), before);
+    }
+
+    #[test]
+    fn descending_log_terms_are_rejected() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store
+            .write_meta(&Meta {
+                current_term: 3,
+                voted_for: None,
+                commit_index: 0,
+                base_index: 0,
+                base_term: 0,
+            })
+            .unwrap();
+        store.write_log(0, 0, &[entry(1, 3), entry(2, 2)]).unwrap();
+
+        let error = open_error(&dir);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("term descends"));
+    }
+
+    #[test]
+    fn durable_log_without_hard_state_is_rejected() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store.write_log(0, 0, &[entry(1, 1)]).unwrap();
+
+        let error = open_error(&dir);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("meta is missing"));
+    }
+
+    #[test]
+    fn snapshot_without_a_nonzero_base_is_rejected() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store
+            .write_meta(&Meta {
+                current_term: 1,
+                voted_for: None,
+                commit_index: 0,
+                base_index: 0,
+                base_term: 0,
+            })
+            .unwrap();
+        fs::write(dir.join("snapshot"), b"stale snapshot").unwrap();
+
+        let error = open_error(&dir);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("snapshot presence"));
+    }
+
+    #[test]
+    fn save_rejects_term_history_ahead_of_hard_state() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        let error = store
+            .save(&Persisted {
+                current_term: 1,
+                commit_index: 0,
+                log: vec![entry(1, 2)],
+                ..Default::default()
+            })
+            .expect_err("invalid in-memory state must not become durable");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds current term"));
     }
 
     #[test]

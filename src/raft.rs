@@ -170,6 +170,21 @@ impl Default for RaftConfig {
     }
 }
 
+impl RaftConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.heartbeat_ticks == 0 {
+            return Err("heartbeat_ticks must be greater than zero");
+        }
+        if self.election_min_ticks <= self.heartbeat_ticks {
+            return Err("election_min_ticks must exceed heartbeat_ticks");
+        }
+        if self.election_max_ticks < self.election_min_ticks {
+            return Err("election_max_ticks must be at least election_min_ticks");
+        }
+        Ok(())
+    }
+}
+
 /// The side effects of a `tick`/`step`/`propose`, drained by the driver.
 #[derive(Debug, Default)]
 pub struct Ready {
@@ -201,14 +216,39 @@ pub struct Ready {
 /// real leader sends does; anything else is malformed (or forged) and is rejected
 /// before it can reach the log.
 fn entries_are_contiguous(req: &AppendEntriesReq) -> bool {
-    req.entries.iter().enumerate().all(|(i, entry)| {
-        entry.index
-            == req
-                .prev_log_index
-                .saturating_add(1)
-                .saturating_add(i as u64)
-            && entry.term <= req.term
-    })
+    if req.term == 0 || (req.prev_log_index == 0) != (req.prev_log_term == 0) {
+        return false;
+    }
+
+    let mut previous_term = req.prev_log_term;
+    for (position, entry) in req.entries.iter().enumerate() {
+        let Ok(offset) = u64::try_from(position) else {
+            return false;
+        };
+        let Some(expected_index) = req
+            .prev_log_index
+            .checked_add(1)
+            .and_then(|first| first.checked_add(offset))
+        else {
+            return false;
+        };
+        if entry.index != expected_index
+            || entry.term == 0
+            || entry.term < previous_term
+            || entry.term > req.term
+        {
+            return false;
+        }
+        previous_term = entry.term;
+    }
+    true
+}
+
+fn snapshot_metadata_is_valid(req: &InstallSnapshotReq) -> bool {
+    req.term > 0
+        && req.last_included_index > 0
+        && req.last_included_term > 0
+        && req.last_included_term <= req.term
 }
 
 /// The fixed-membership single-group Raft state machine.
@@ -246,6 +286,10 @@ pub struct Raft {
     // Leader replication bookkeeping.
     next_index: HashMap<NodeId, u64>,
     match_index: HashMap<NodeId, u64>,
+    /// Snapshot index most recently sent to each peer. A response may acknowledge
+    /// no more than this request-specific boundary, even if compaction advances
+    /// again before the response returns.
+    snapshot_inflight: HashMap<NodeId, u64>,
 
     // Timers (ticks).
     election_elapsed: u64,
@@ -292,6 +336,7 @@ impl Raft {
             acked_since_check: HashSet::new(),
             next_index: HashMap::new(),
             match_index: HashMap::new(),
+            snapshot_inflight: HashMap::new(),
             election_elapsed: 0,
             heartbeat_elapsed: 0,
             randomized_election_timeout: 0,
@@ -382,8 +427,13 @@ impl Raft {
     }
     fn reset_election_timer(&mut self) {
         self.election_elapsed = 0;
-        let span = self.cfg.election_max_ticks - self.cfg.election_min_ticks + 1;
-        self.randomized_election_timeout = self.cfg.election_min_ticks + self.next_rand() % span;
+        // The live driver rejects bad timing configuration. Keep the pure engine
+        // defensive as well so direct test/harness construction cannot underflow
+        // or divide by zero.
+        let min = self.cfg.election_min_ticks.max(1);
+        let max = self.cfg.election_max_ticks.max(min);
+        let span = max - min + 1;
+        self.randomized_election_timeout = min + self.next_rand() % span;
     }
 
     fn send(&mut self, to: &NodeId, msg: RaftMessage) {
@@ -491,6 +541,7 @@ impl Raft {
         let next = self.last_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
+        self.snapshot_inflight.clear();
         for p in self.peers.clone() {
             self.next_index.insert(p.clone(), next);
             self.match_index.insert(p, 0);
@@ -522,6 +573,7 @@ impl Raft {
         self.role = Role::Follower;
         self.leader_id = leader;
         self.votes.clear();
+        self.snapshot_inflight.clear();
         self.reset_election_timer();
     }
 
@@ -536,7 +588,15 @@ impl Raft {
     /// become the URL the API forwards control-plane writes to — with the
     /// internal secret attached.
     pub fn step(&mut self, from: NodeId, msg: RaftMessage) {
-        if !self.peers.contains(&from) {
+        let body_identity_matches = match &msg {
+            RaftMessage::RequestVote(req) => req.candidate_id == from,
+            RaftMessage::AppendEntries(req) => req.leader_id == from,
+            RaftMessage::InstallSnapshot(req) => req.leader_id == from,
+            RaftMessage::RequestVoteResp(_)
+            | RaftMessage::AppendEntriesResp(_)
+            | RaftMessage::InstallSnapshotResp(_) => true,
+        };
+        if !self.peers.contains(&from) || !body_identity_matches {
             return;
         }
         match msg {
@@ -550,6 +610,17 @@ impl Raft {
     }
 
     fn handle_request_vote(&mut self, from: NodeId, req: RequestVoteReq) {
+        if req.term == 0 {
+            self.send(
+                &from,
+                RaftMessage::RequestVoteResp(RequestVoteResp {
+                    term: self.current_term,
+                    granted: false,
+                    pre_vote: req.pre_vote,
+                }),
+            );
+            return;
+        }
         // A real (non-pre) vote at a higher term forces us to adopt it and step down.
         if !req.pre_vote && req.term > self.current_term {
             self.become_follower(req.term, None);
@@ -620,15 +691,14 @@ impl Raft {
             return;
         }
 
-        // Valid leader for our term or newer: adopt term if higher, recognize it,
-        // and refresh the election timer (we've heard from a leader).
-        self.become_follower(req.term, Some(from.clone()));
+        // A higher authenticated term is durable even when the rest of the
+        // request is malformed, but malformed input must not install a leader id.
+        if req.term > self.current_term {
+            self.become_follower(req.term, None);
+        }
 
-        // Reject a malformed batch before touching the log. A real leader always
-        // sends entries contiguous from `prev_log_index`, in its own term or
-        // older; splicing in a batch that isn't would leave the log's indices
-        // disagreeing with its length (and a forged term could later be treated
-        // as this leader's own, committing entries no quorum ever held).
+        // Reject malformed index/term history before touching the log. A real
+        // leader sends a contiguous, non-zero, non-descending term sequence.
         if !entries_are_contiguous(&req) {
             let resp = AppendEntriesResp {
                 term: self.current_term,
@@ -639,6 +709,10 @@ impl Raft {
             return;
         }
 
+        // Only a structurally valid request establishes the current leader and
+        // refreshes the election timer.
+        self.become_follower(req.term, Some(from.clone()));
+
         // Log-consistency check at prev_log_index.
         let success;
         let match_index;
@@ -647,24 +721,21 @@ impl Raft {
             success = false;
             match_index = self.last_index();
         } else if req.prev_log_index > 0 && self.term_at(req.prev_log_index) != req.prev_log_term {
-            // Conflict at prev: drop it and everything after, then back up.
-            let _ = self.truncate_from(req.prev_log_index);
+            // A failed consistency check proves nothing about the suffix. Do not
+            // mutate it until a matching prefix supplies replacement entries.
             success = false;
-            match_index = req.prev_log_index - 1;
+            match_index = req.prev_log_index.saturating_sub(1);
         } else {
-            // Prefix matches: splice in the entries, truncating any conflicts.
-            // The last entry this request actually carries (the match point when
-            // it carries none) bounds how far `leader_commit` may move us.
-            let last_new = req
-                .entries
-                .last()
-                .map(|e| e.index)
-                .unwrap_or(req.prev_log_index);
+            // Prefix matches: splice in the entries, truncating conflicts.
+            // `confirmed` is the highest index this specific request proved equal;
+            // an existing follower suffix beyond it is not an acknowledgement.
             let mut spliced = true;
+            let mut confirmed = req.prev_log_index;
             for entry in req.entries {
-                if entry.index <= self.last_index() {
-                    if self.term_at(entry.index) != entry.term {
-                        if !self.truncate_from(entry.index) {
+                let entry_index = entry.index;
+                if entry_index <= self.last_index() {
+                    if self.term_at(entry_index) != entry.term {
+                        if !self.truncate_from(entry_index) {
                             // Would rewrite a committed entry — impossible from a
                             // real leader, so refuse rather than corrupt the log.
                             spliced = false;
@@ -673,23 +744,21 @@ impl Raft {
                         self.log.push(entry);
                         self.dirty = true;
                     }
-                    // else: already have this exact entry — skip.
+                    // else: already have this exact term/index — skip.
                 } else {
                     self.log.push(entry);
                     self.dirty = true;
                 }
+                confirmed = entry_index;
             }
-            // Commit only up to the last entry THIS request replicated (Raft
-            // §5.3). Clamping to our own last index instead would let a bare
-            // heartbeat with an inflated `leader_commit` commit a stale-term
-            // suffix the current leader never replicated.
-            let commit = req.leader_commit.min(last_new);
+            // Commit only through the match point this request proved (Raft §5.3).
+            let commit = req.leader_commit.min(confirmed);
             if spliced && commit > self.commit_index {
                 self.commit_index = commit;
                 self.dirty = true;
             }
             success = spliced;
-            match_index = self.last_index();
+            match_index = confirmed;
         }
 
         let resp = AppendEntriesResp {
@@ -711,21 +780,29 @@ impl Raft {
         // Any answer in our term proves this peer still reaches us (check-quorum).
         self.acked_since_check.insert(from.clone());
         if resp.success {
-            self.match_index.insert(from.clone(), resp.match_index);
-            // `match_index` is peer-supplied: saturate rather than wrap/panic.
-            self.next_index
-                .insert(from, resp.match_index.saturating_add(1));
+            // Never let a stale or malformed response move replication backward or
+            // claim an index beyond the leader's own log.
+            let acknowledged = resp.match_index.min(self.last_index());
+            let matched = acknowledged.max(self.match_index.get(&from).copied().unwrap_or(0));
+            self.match_index.insert(from.clone(), matched);
+            self.next_index.insert(from, matched.saturating_add(1));
             if self.maybe_advance_commit() {
                 // Tell followers the commit point moved so they apply promptly,
                 // instead of waiting for the next heartbeat.
                 self.broadcast_append();
             }
         } else {
-            // Fast-rewind next_index toward the follower's hint and retry.
-            let backed = resp.match_index.saturating_add(1);
+            // A failure must make progress before an immediate retry. At index 1
+            // there is nowhere further to rewind, so wait for the next heartbeat
+            // rather than creating an unbounded response/retry loop.
+            let hinted = resp.match_index.saturating_add(1).max(1);
             let entry = self.next_index.entry(from.clone()).or_insert(1);
-            *entry = backed.max(1).min(*entry);
-            self.send_append(&from);
+            let previous = *entry;
+            let next = hinted.min(previous.saturating_sub(1).max(1));
+            if next < previous {
+                *entry = next;
+                self.send_append(&from);
+            }
         }
     }
 
@@ -742,7 +819,19 @@ impl Raft {
             self.send(&from, RaftMessage::InstallSnapshotResp(resp));
             return;
         }
-        // Valid leader: adopt its term and recognize it (refreshes the election timer).
+        if req.term > self.current_term {
+            self.become_follower(req.term, None);
+        }
+        if !snapshot_metadata_is_valid(&req) {
+            let resp = InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+                last_included_index: 0,
+            };
+            self.send(&from, RaftMessage::InstallSnapshotResp(resp));
+            return;
+        }
+        // Only valid metadata establishes the current leader.
         self.become_follower(req.term, Some(from.clone()));
 
         // Already at or past this snapshot ⇒ ack without applying (it's stale to us).
@@ -752,7 +841,7 @@ impl Raft {
             let resp = InstallSnapshotResp {
                 term: self.current_term,
                 success: true,
-                last_included_index: self.commit_index.max(self.base_index),
+                last_included_index: req.last_included_index,
             };
             self.send(&from, RaftMessage::InstallSnapshotResp(resp));
             return;
@@ -794,9 +883,11 @@ impl Raft {
         }
         self.acked_since_check.insert(from.clone());
         if resp.success {
-            let matched = resp
-                .last_included_index
-                .max(self.match_index.get(&from).copied().unwrap_or(0));
+            // A response may acknowledge only the snapshot boundary sent in this
+            // in-flight request; compaction may have advanced again meanwhile.
+            let sent = self.snapshot_inflight.remove(&from).unwrap_or(0);
+            let acknowledged = resp.last_included_index.min(sent);
+            let matched = acknowledged.max(self.match_index.get(&from).copied().unwrap_or(0));
             self.match_index.insert(from.clone(), matched);
             self.next_index.insert(from, matched.saturating_add(1));
             if self.maybe_advance_commit() {
@@ -877,6 +968,7 @@ impl Raft {
             last_included_term: self.base_term,
             data,
         };
+        self.snapshot_inflight.insert(peer.clone(), self.base_index);
         self.send(peer, RaftMessage::InstallSnapshot(req));
     }
 
@@ -1149,6 +1241,218 @@ mod tests {
         fn node(&mut self, id: &str) -> &mut Raft {
             self.nodes.get_mut(id).unwrap()
         }
+    }
+
+    fn pop_append_response(raft: &mut Raft) -> AppendEntriesResp {
+        match raft.ready().messages.pop().map(|message| message.msg) {
+            Some(RaftMessage::AppendEntriesResp(response)) => response,
+            other => panic!("expected AppendEntriesResp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_timing_configuration_is_rejected() {
+        assert!(RaftConfig {
+            heartbeat_ticks: 0,
+            election_min_ticks: 5,
+            election_max_ticks: 10,
+        }
+        .validate()
+        .is_err());
+        assert!(RaftConfig {
+            heartbeat_ticks: 5,
+            election_min_ticks: 5,
+            election_max_ticks: 10,
+        }
+        .validate()
+        .is_err());
+        assert!(RaftConfig {
+            heartbeat_ticks: 1,
+            election_min_ticks: 10,
+            election_max_ticks: 9,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn heartbeat_acknowledges_only_the_prefix_this_request_proved() {
+        let mut follower = Raft::new(
+            "brain-0".to_string(),
+            vec!["brain-1".to_string()],
+            cfg(),
+            1,
+            Persisted {
+                current_term: 1,
+                log: vec![
+                    LogEntry {
+                        term: 1,
+                        index: 1,
+                        command: Some(plan(1)),
+                    },
+                    LogEntry {
+                        term: 1,
+                        index: 2,
+                        command: Some(plan(2)),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        follower.step(
+            "brain-1".to_string(),
+            RaftMessage::AppendEntries(AppendEntriesReq {
+                term: 1,
+                leader_id: "brain-1".to_string(),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        );
+        let response = pop_append_response(&mut follower);
+        assert!(response.success);
+        assert_eq!(response.match_index, 1);
+        assert_eq!(
+            follower.last_index(),
+            2,
+            "the unproved suffix remains local"
+        );
+    }
+
+    #[test]
+    fn append_rejects_zero_or_descending_terms_without_installing_a_leader() {
+        let mut follower = Raft::new(
+            "brain-0".to_string(),
+            vec!["brain-1".to_string()],
+            cfg(),
+            1,
+            Persisted::default(),
+        );
+        follower.step(
+            "brain-1".to_string(),
+            RaftMessage::AppendEntries(AppendEntriesReq {
+                term: 2,
+                leader_id: "brain-1".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 2,
+                        index: 1,
+                        command: None,
+                    },
+                    LogEntry {
+                        term: 1,
+                        index: 2,
+                        command: None,
+                    },
+                ],
+                leader_commit: 0,
+            }),
+        );
+        assert!(!pop_append_response(&mut follower).success);
+        assert_eq!(follower.log_len(), 0);
+        assert_eq!(follower.leader(), None);
+    }
+
+    #[test]
+    fn request_body_identity_must_match_the_transport_sender() {
+        let mut follower = Raft::new(
+            "brain-0".to_string(),
+            vec!["brain-1".to_string(), "brain-2".to_string()],
+            cfg(),
+            1,
+            Persisted::default(),
+        );
+        follower.step(
+            "brain-1".to_string(),
+            RaftMessage::AppendEntries(AppendEntriesReq {
+                term: 9,
+                leader_id: "brain-2".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        );
+        assert_eq!(follower.term(), 0);
+        assert_eq!(follower.leader(), None);
+        assert!(follower.ready().messages.is_empty());
+    }
+
+    #[test]
+    fn invalid_snapshot_metadata_is_rejected_before_installing_a_leader() {
+        let mut follower = Raft::new(
+            "brain-0".to_string(),
+            vec!["brain-1".to_string()],
+            cfg(),
+            1,
+            Persisted::default(),
+        );
+        follower.step(
+            "brain-1".to_string(),
+            RaftMessage::InstallSnapshot(InstallSnapshotReq {
+                term: 1,
+                leader_id: "brain-1".to_string(),
+                last_included_index: 4,
+                last_included_term: 2,
+                data: b"snapshot".to_vec(),
+            }),
+        );
+        let response = match follower.ready().messages.pop().map(|message| message.msg) {
+            Some(RaftMessage::InstallSnapshotResp(response)) => response,
+            other => panic!("expected InstallSnapshotResp, got {other:?}"),
+        };
+        assert!(!response.success);
+        assert_eq!(follower.base_index(), 0);
+        assert_eq!(follower.leader(), None);
+    }
+
+    #[test]
+    fn stale_success_responses_cannot_regress_match_index() {
+        let mut cluster = Cluster::new(3);
+        let leader = cluster.elect();
+        let peer = cluster.ids().into_iter().find(|id| *id != leader).unwrap();
+        let term = cluster.node(&leader).term();
+        let last = cluster.node(&leader).last_index();
+        cluster.node(&leader).step(
+            peer.clone(),
+            RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: true,
+                match_index: last,
+            }),
+        );
+        cluster.node(&leader).ready();
+        cluster.node(&leader).step(
+            peer.clone(),
+            RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: true,
+                match_index: 0,
+            }),
+        );
+        assert_eq!(cluster.node(&leader).match_index.get(&peer), Some(&last));
+    }
+
+    #[test]
+    fn a_failure_at_next_index_one_does_not_spin_an_immediate_retry() {
+        let mut cluster = Cluster::new(3);
+        let leader = cluster.elect();
+        let peer = cluster.ids().into_iter().find(|id| *id != leader).unwrap();
+        let term = cluster.node(&leader).term();
+        cluster.node(&leader).ready();
+        cluster.node(&leader).next_index.insert(peer.clone(), 1);
+        cluster.node(&leader).step(
+            peer,
+            RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: false,
+                match_index: 0,
+            }),
+        );
+        assert!(cluster.node(&leader).ready().messages.is_empty());
     }
 
     #[test]
