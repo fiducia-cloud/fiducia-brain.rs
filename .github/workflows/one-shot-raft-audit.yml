@@ -1,0 +1,1277 @@
+name: one-shot brain Raft hardening
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'audit/raft-recovery-hardening'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: true
+          path: repo
+          submodules: recursive
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: ee8fe09f846f5a776d156c0b0d0d15582c8bd539
+          path: fiducia-interfaces
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-routing.rs
+          ref: c694bc5c58587bec12989a347e926c0040aacada
+          path: fiducia-routing.rs
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Apply Raft protocol and recovery hardening
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      f"{path}: expected one replacement target, found {count}; anchor={old[:240]!r}"
+                  )
+              target.write_text(text.replace(old, new, 1))
+
+          # Strict timing validation at the live driver boundary, plus defensive
+          # arithmetic inside the pure engine so malformed direct construction
+          # cannot underflow or wrap election timers.
+          replace_once(
+              'src/raft.rs',
+              '''impl Default for RaftConfig {
+    fn default() -> Self {
+        // With a ~50ms driver tick: heartbeat 150ms, election 500–900ms — well
+        // above 3× the heartbeat so a healthy leader isn't spuriously displaced.
+        RaftConfig {
+            heartbeat_ticks: 3,
+            election_min_ticks: 10,
+            election_max_ticks: 18,
+        }
+    }
+}
+''',
+              '''impl Default for RaftConfig {
+    fn default() -> Self {
+        // With a ~50ms driver tick: heartbeat 150ms, election 500–900ms — well
+        // above 3× the heartbeat so a healthy leader isn't spuriously displaced.
+        RaftConfig {
+            heartbeat_ticks: 3,
+            election_min_ticks: 10,
+            election_max_ticks: 18,
+        }
+    }
+}
+
+impl RaftConfig {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.heartbeat_ticks == 0 {
+            return Err("heartbeat_ticks must be greater than zero");
+        }
+        if self.election_min_ticks <= self.heartbeat_ticks {
+            return Err("election_min_ticks must exceed heartbeat_ticks");
+        }
+        if self.election_max_ticks < self.election_min_ticks {
+            return Err("election_max_ticks must be at least election_min_ticks");
+        }
+        Ok(())
+    }
+}
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''fn entries_are_contiguous(req: &AppendEntriesReq) -> bool {
+    req.entries.iter().enumerate().all(|(i, entry)| {
+        entry.index
+            == req
+                .prev_log_index
+                .saturating_add(1)
+                .saturating_add(i as u64)
+            && entry.term <= req.term
+    })
+}
+''',
+              '''fn entries_are_contiguous(req: &AppendEntriesReq) -> bool {
+    if req.term == 0 || (req.prev_log_index == 0) != (req.prev_log_term == 0) {
+        return false;
+    }
+
+    let mut previous_term = req.prev_log_term;
+    for (position, entry) in req.entries.iter().enumerate() {
+        let Ok(offset) = u64::try_from(position) else {
+            return false;
+        };
+        let Some(expected_index) = req
+            .prev_log_index
+            .checked_add(1)
+            .and_then(|first| first.checked_add(offset))
+        else {
+            return false;
+        };
+        if entry.index != expected_index
+            || entry.term == 0
+            || entry.term < previous_term
+            || entry.term > req.term
+        {
+            return false;
+        }
+        previous_term = entry.term;
+    }
+    true
+}
+
+fn snapshot_metadata_is_valid(req: &InstallSnapshotReq) -> bool {
+    req.term > 0
+        && req.last_included_index > 0
+        && req.last_included_term > 0
+        && req.last_included_term <= req.term
+}
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '        self.base_index + self.log.len() as u64\n',
+              '        self.base_index.saturating_add(self.log.len() as u64)\n',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''    fn reset_election_timer(&mut self) {
+        self.election_elapsed = 0;
+        let span = self.cfg.election_max_ticks - self.cfg.election_min_ticks + 1;
+        self.randomized_election_timeout = self.cfg.election_min_ticks + self.next_rand() % span;
+    }
+''',
+              '''    fn reset_election_timer(&mut self) {
+        self.election_elapsed = 0;
+        // `RaftControlPlane::new` rejects invalid production configuration. Keep
+        // the pure engine defensive too: direct test/harness construction must
+        // never underflow, divide by zero, or wrap a timeout.
+        let min = self.cfg.election_min_ticks.max(1);
+        let max = self.cfg.election_max_ticks.max(min);
+        let span = max - min + 1;
+        self.randomized_election_timeout = min + self.next_rand() % span;
+    }
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '            self.heartbeat_elapsed += 1;\n',
+              '            self.heartbeat_elapsed = self.heartbeat_elapsed.saturating_add(1);\n',
+          )
+          # There are two election_elapsed increments in tick.
+          path = Path('src/raft.rs')
+          text = path.read_text()
+          old = '            self.election_elapsed += 1;\n'
+          if text.count(old) != 2:
+              raise SystemExit(f"src/raft.rs: expected two election increments, found {text.count(old)}")
+          path.write_text(text.replace(old, '            self.election_elapsed = self.election_elapsed.saturating_add(1);\n'))
+
+          replace_once(
+              'src/raft.rs',
+              '''    fn start_pre_election(&mut self) {
+        self.reset_election_timer();
+        self.role = Role::PreCandidate;
+        self.votes.clear();
+        self.votes.insert(self.id.clone());
+        let req = RequestVoteReq {
+            term: self.current_term + 1, // would-be term
+''',
+              '''    fn start_pre_election(&mut self) {
+        self.reset_election_timer();
+        let Some(next_term) = self.current_term.checked_add(1) else {
+            // Term exhaustion is unrecoverable without a wider on-disk format.
+            // Fail closed instead of wrapping to term zero.
+            self.role = Role::Follower;
+            self.leader_id = None;
+            return;
+        };
+        self.role = Role::PreCandidate;
+        self.votes.clear();
+        self.votes.insert(self.id.clone());
+        let req = RequestVoteReq {
+            term: next_term, // would-be term
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''    fn start_election(&mut self) {
+        self.current_term += 1;
+        self.voted_for = Some(self.id.clone());
+''',
+              '''    fn start_election(&mut self) {
+        let Some(next_term) = self.current_term.checked_add(1) else {
+            self.become_follower(self.current_term, None);
+            return;
+        };
+        self.current_term = next_term;
+        self.voted_for = Some(self.id.clone());
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''    fn become_leader(&mut self) {
+        self.role = Role::Leader;
+        self.leader_id = Some(self.id.clone());
+        let next = self.last_index() + 1;
+''',
+              '''    fn become_leader(&mut self) {
+        let Some(index) = self.last_index().checked_add(1) else {
+            self.become_follower(self.current_term, None);
+            return;
+        };
+        self.role = Role::Leader;
+        self.leader_id = Some(self.id.clone());
+        let next = index;
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''        let index = self.last_index() + 1;
+        self.log.push(LogEntry {
+''',
+              '''        self.log.push(LogEntry {
+''',
+          )
+
+          # Bind the body identity to the transport-supplied sender. Today HTTP
+          # derives `from` from the body, so this is also the contract an eventual
+          # mTLS/SPIFFE transport must satisfy.
+          replace_once(
+              'src/raft.rs',
+              '''        if !self.peers.contains(&from) {
+            return;
+        }
+        match msg {
+''',
+              '''        let body_identity_matches = match &msg {
+            RaftMessage::RequestVote(req) => req.candidate_id == from,
+            RaftMessage::AppendEntries(req) => req.leader_id == from,
+            RaftMessage::InstallSnapshot(req) => req.leader_id == from,
+            RaftMessage::RequestVoteResp(_)
+            | RaftMessage::AppendEntriesResp(_)
+            | RaftMessage::InstallSnapshotResp(_) => true,
+        };
+        if !self.peers.contains(&from) || !body_identity_matches {
+            return;
+        }
+        match msg {
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''    fn handle_request_vote(&mut self, from: NodeId, req: RequestVoteReq) {
+        // A real (non-pre) vote at a higher term forces us to adopt it and step down.
+''',
+              '''    fn handle_request_vote(&mut self, from: NodeId, req: RequestVoteReq) {
+        if req.term == 0 {
+            self.send(
+                &from,
+                RaftMessage::RequestVoteResp(RequestVoteResp {
+                    term: self.current_term,
+                    granted: false,
+                    pre_vote: req.pre_vote,
+                }),
+            );
+            return;
+        }
+        // A real (non-pre) vote at a higher term forces us to adopt it and step down.
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''        // Valid leader for our term or newer: adopt term if higher, recognize it,
+        // and refresh the election timer (we've heard from a leader).
+        self.become_follower(req.term, Some(from.clone()));
+
+        // Reject a malformed batch before touching the log. A real leader always
+        // sends entries contiguous from `prev_log_index`, in its own term or
+        // older; splicing in a batch that isn't would leave the log's indices
+        // disagreeing with its length (and a forged term could later be treated
+        // as this leader's own, committing entries no quorum ever held).
+        if !entries_are_contiguous(&req) {
+            let resp = AppendEntriesResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_index(),
+            };
+            self.send(&from, RaftMessage::AppendEntriesResp(resp));
+            return;
+        }
+''',
+              '''        // A higher authenticated term is durable even when the rest of the
+        // request is malformed, but malformed input must not install a leader id.
+        if req.term > self.current_term {
+            self.become_follower(req.term, None);
+        }
+        // Reject malformed index/term history before touching the log. A real
+        // leader sends a contiguous, non-zero, non-descending term sequence.
+        if !entries_are_contiguous(&req) {
+            let resp = AppendEntriesResp {
+                term: self.current_term,
+                success: false,
+                match_index: self.last_index(),
+            };
+            self.send(&from, RaftMessage::AppendEntriesResp(resp));
+            return;
+        }
+        // Only a structurally valid request establishes the current leader.
+        self.become_follower(req.term, Some(from.clone()));
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''        } else if req.prev_log_index > 0 && self.term_at(req.prev_log_index) != req.prev_log_term {
+            // Conflict at prev: drop it and everything after, then back up.
+            let _ = self.truncate_from(req.prev_log_index);
+            success = false;
+            match_index = req.prev_log_index - 1;
+''',
+              '''        } else if req.prev_log_index > 0 && self.term_at(req.prev_log_index) != req.prev_log_term {
+            // A failed consistency check proves nothing about the suffix. Do not
+            // mutate it until a request with a matching prefix supplies replacement
+            // entries; merely tell the leader how far to back up.
+            success = false;
+            match_index = req.prev_log_index.saturating_sub(1);
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''            // Prefix matches: splice in the entries, truncating any conflicts.
+            // The last entry this request actually carries (the match point when
+            // it carries none) bounds how far `leader_commit` may move us.
+            let last_new = req
+                .entries
+                .last()
+                .map(|e| e.index)
+                .unwrap_or(req.prev_log_index);
+            let mut spliced = true;
+            for entry in req.entries {
+                if entry.index <= self.last_index() {
+                    if self.term_at(entry.index) != entry.term {
+                        if !self.truncate_from(entry.index) {
+                            // Would rewrite a committed entry — impossible from a
+                            // real leader, so refuse rather than corrupt the log.
+                            spliced = false;
+                            break;
+                        }
+                        self.log.push(entry);
+                        self.dirty = true;
+                    }
+                    // else: already have this exact entry — skip.
+                } else {
+                    self.log.push(entry);
+                    self.dirty = true;
+                }
+            }
+            // Commit only up to the last entry THIS request replicated (Raft
+            // §5.3). Clamping to our own last index instead would let a bare
+            // heartbeat with an inflated `leader_commit` commit a stale-term
+            // suffix the current leader never replicated.
+            let commit = req.leader_commit.min(last_new);
+            if spliced && commit > self.commit_index {
+                self.commit_index = commit;
+                self.dirty = true;
+            }
+            success = spliced;
+            match_index = self.last_index();
+''',
+              '''            // Prefix matches: splice in the entries, truncating conflicts.
+            // `confirmed` is the highest index this specific request proved equal;
+            // an existing follower suffix beyond it is not an acknowledgement.
+            let mut spliced = true;
+            let mut confirmed = req.prev_log_index;
+            for entry in req.entries {
+                let entry_index = entry.index;
+                if entry_index <= self.last_index() {
+                    if self.term_at(entry_index) != entry.term {
+                        if !self.truncate_from(entry_index) {
+                            // Would rewrite a committed entry — impossible from a
+                            // real leader, so refuse rather than corrupt the log.
+                            spliced = false;
+                            break;
+                        }
+                        self.log.push(entry);
+                        self.dirty = true;
+                    }
+                    // else: already have this exact term/index — skip.
+                } else {
+                    self.log.push(entry);
+                    self.dirty = true;
+                }
+                confirmed = entry_index;
+            }
+            // Commit only through the match point this request proved (Raft §5.3).
+            let commit = req.leader_commit.min(confirmed);
+            if spliced && commit > self.commit_index {
+                self.commit_index = commit;
+                self.dirty = true;
+            }
+            success = spliced;
+            match_index = confirmed;
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''        if resp.success {
+            self.match_index.insert(from.clone(), resp.match_index);
+            // `match_index` is peer-supplied: saturate rather than wrap/panic.
+            self.next_index
+                .insert(from, resp.match_index.saturating_add(1));
+            if self.maybe_advance_commit() {
+                // Tell followers the commit point moved so they apply promptly,
+                // instead of waiting for the next heartbeat.
+                self.broadcast_append();
+            }
+        } else {
+            // Fast-rewind next_index toward the follower's hint and retry.
+            let backed = resp.match_index.saturating_add(1);
+            let entry = self.next_index.entry(from.clone()).or_insert(1);
+            *entry = backed.max(1).min(*entry);
+            self.send_append(&from);
+        }
+''',
+              '''        if resp.success {
+            // Never let a stale or malformed response move replication backward or
+            // claim an index beyond the leader's own log.
+            let acknowledged = resp.match_index.min(self.last_index());
+            let matched = acknowledged.max(self.match_index.get(&from).copied().unwrap_or(0));
+            self.match_index.insert(from.clone(), matched);
+            self.next_index
+                .insert(from, matched.checked_add(1).unwrap_or(u64::MAX));
+            if self.maybe_advance_commit() {
+                // Tell followers the commit point moved so they apply promptly,
+                // instead of waiting for the next heartbeat.
+                self.broadcast_append();
+            }
+        } else {
+            // A failure must make progress before an immediate retry. At index 1
+            // there is nowhere further to rewind, so wait for the next heartbeat
+            // instead of creating an unbounded response/retry loop.
+            let hinted = resp.match_index.saturating_add(1).max(1);
+            let entry = self.next_index.entry(from.clone()).or_insert(1);
+            let previous = *entry;
+            let next = hinted.min(previous.saturating_sub(1).max(1));
+            if next < previous {
+                *entry = next;
+                self.send_append(&from);
+            }
+        }
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''        // Valid leader: adopt its term and recognize it (refreshes the election timer).
+        self.become_follower(req.term, Some(from.clone()));
+
+        // Already at or past this snapshot ⇒ ack without applying (it's stale to us).
+''',
+              '''        if req.term > self.current_term {
+            self.become_follower(req.term, None);
+        }
+        if !snapshot_metadata_is_valid(&req) {
+            let resp = InstallSnapshotResp {
+                term: self.current_term,
+                success: false,
+                last_included_index: 0,
+            };
+            self.send(&from, RaftMessage::InstallSnapshotResp(resp));
+            return;
+        }
+        // Only valid metadata establishes the current leader.
+        self.become_follower(req.term, Some(from.clone()));
+
+        // Already at or past this snapshot ⇒ ack without applying (it's stale to us).
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''                last_included_index: self.commit_index.max(self.base_index),
+''',
+              '''                last_included_index: req.last_included_index,
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''        if resp.success {
+            let matched = resp
+                .last_included_index
+                .max(self.match_index.get(&from).copied().unwrap_or(0));
+            self.match_index.insert(from.clone(), matched);
+            self.next_index.insert(from, matched.saturating_add(1));
+''',
+              '''        if resp.success {
+            // This RPC proves only a snapshot boundary the leader actually owns;
+            // a peer cannot use the response to acknowledge an arbitrary suffix.
+            let acknowledged = resp.last_included_index.min(self.base_index);
+            let matched = acknowledged.max(self.match_index.get(&from).copied().unwrap_or(0));
+            self.match_index.insert(from.clone(), matched);
+            self.next_index
+                .insert(from, matched.checked_add(1).unwrap_or(u64::MAX));
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''            .unwrap_or(self.last_index() + 1);
+''',
+              '''            .unwrap_or_else(|| self.last_index().checked_add(1).unwrap_or(u64::MAX));
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''        for n in (self.commit_index + 1)..=last {
+''',
+              '''        let Some(first_candidate) = self.commit_index.checked_add(1) else {
+            return false;
+        };
+        for n in first_candidate..=last {
+''',
+          )
+          replace_once(
+              'src/raft.rs',
+              '''        let index = self.last_index() + 1;
+        self.log.push(LogEntry {
+            term: self.current_term,
+            index,
+            command: Some(command),
+        });
+''',
+              '''        let Some(index) = self.last_index().checked_add(1) else {
+            self.become_follower(self.current_term, None);
+            return Err(None);
+        };
+        self.log.push(LogEntry {
+            term: self.current_term,
+            index,
+            command: Some(command),
+        });
+''',
+          )
+
+          # Reject bad live timing configuration at startup rather than silently
+          # normalizing it in a production member.
+          replace_once(
+              'src/raft_driver.rs',
+              '''    ) -> io::Result<Arc<Self>> {
+        // Recovery: entries at or below `base_index` exist only inside the WAL
+''',
+              '''    ) -> io::Result<Arc<Self>> {
+        cfg.validate().map_err(|message| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid Raft timing configuration: {message}"),
+            )
+        })?;
+        // Recovery: entries at or below `base_index` exist only inside the WAL
+''',
+          )
+
+          # Strict WAL parsing and exact recovery invariants.
+          replace_once(
+              'src/raft_store.rs',
+              'use std::io::{self, BufRead, BufReader, Write};\n',
+              'use std::io::{self, Write};\n',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''        let meta: Meta = match fs::read(&meta_path) {
+            Ok(bytes) if !bytes.is_empty() => serde_json::from_slice(&bytes).map_err(invalid)?,
+            Ok(_) => Meta::default(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Meta::default(),
+            Err(err) => return Err(err),
+        };
+
+        // The state-machine snapshot, present once the log has been compacted.
+        let snapshot = match fs::read(&snapshot_path) {
+            Ok(bytes) if !bytes.is_empty() => Some(bytes),
+            Ok(_) => None,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+''',
+              '''        let (meta, meta_was_missing): (Meta, bool) = match fs::read(&meta_path) {
+            Ok(bytes) if bytes.is_empty() => {
+                return Err(invalid_data("Raft meta file is empty"));
+            }
+            Ok(bytes) => (serde_json::from_slice(&bytes).map_err(invalid)?, false),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (Meta::default(), true),
+            Err(err) => return Err(err),
+        };
+
+        // The state-machine snapshot, present once the log has been compacted.
+        let snapshot = match fs::read(&snapshot_path) {
+            Ok(bytes) if bytes.is_empty() => {
+                return Err(invalid_data("Raft snapshot file is empty"));
+            }
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+''',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''        // Parse every complete JSON line; stop at the first that fails — that's a
+        // record torn by a crash mid-write, and everything after it. A v1 log
+        // opens with its header; a v0 log (written before the header existed)
+        // starts straight at the first entry and takes its base from meta.
+        let mut header: Option<LogHeader> = None;
+        let mut log: Vec<LogEntry> = Vec::new();
+        match File::open(&log_path) {
+            Ok(file) => {
+                for (n, line) in BufReader::new(file).split(b'\n').enumerate() {
+                    let line = line?;
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if n == 0 {
+                        if let Ok(parsed) = serde_json::from_slice::<LogHeader>(&line) {
+                            header = Some(parsed);
+                            continue;
+                        }
+                    }
+                    match serde_json::from_slice::<LogEntry>(&line) {
+                        Ok(entry) => log.push(entry),
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+''',
+              '''        // Parse every complete JSON line. Only the final malformed,
+        // unterminated fragment can be a crash-torn write; a malformed complete
+        // record or an empty record in the middle is durable corruption.
+        let log_bytes = match fs::read(&log_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        let terminated = log_bytes.ends_with(b"\\n");
+        let lines: Vec<&[u8]> = log_bytes.split(|byte| *byte == b'\\n').collect();
+        let mut header: Option<LogHeader> = None;
+        let mut log: Vec<LogEntry> = Vec::new();
+        for (line_number, line) in lines.iter().enumerate() {
+            let is_last = line_number + 1 == lines.len();
+            if line.is_empty() {
+                if is_last && (terminated || log_bytes.is_empty()) {
+                    continue;
+                }
+                return Err(invalid_data(format!(
+                    "Raft log contains an empty record at line {}",
+                    line_number + 1
+                )));
+            }
+            if line_number == 0 {
+                if let Ok(parsed) = serde_json::from_slice::<LogHeader>(line) {
+                    header = Some(parsed);
+                    continue;
+                }
+            }
+            match serde_json::from_slice::<LogEntry>(line) {
+                Ok(entry) => log.push(entry),
+                Err(_) if is_last && !terminated => break,
+                Err(error) => {
+                    return Err(invalid_data(format!(
+                        "invalid Raft log record at line {}: {error}",
+                        line_number + 1
+                    )));
+                }
+            }
+        }
+''',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''        if let Some(header) = &header {
+            if header.v > LOG_FORMAT_VERSION {
+''',
+              '''        if let Some(header) = &header {
+            if header.v != LOG_FORMAT_VERSION {
+''',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''                        "Raft log format v{} is newer than this binary understands (v{LOG_FORMAT_VERSION})",
+''',
+              '''                        "unsupported Raft log format v{} (this binary requires v{LOG_FORMAT_VERSION}; headerless files are the v0 format)",
+''',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''        let (base_index, base_term) = match &header {
+            Some(h) => (h.base_index, h.base_term),
+            None => (meta.base_index, meta.base_term),
+        };
+''',
+              '''        let (base_index, base_term) = match &header {
+            Some(h) => (h.base_index, h.base_term),
+            None => (meta.base_index, meta.base_term),
+        };
+        if meta_was_missing && (base_index > 0 || !log.is_empty() || snapshot.is_some()) {
+            return Err(invalid_data(
+                "Raft meta is missing while durable log/snapshot state exists",
+            ));
+        }
+''',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''        validate_recovered(commit_index, base_index, snapshot.as_deref(), &log)?;
+''',
+              '''        validate_persisted(
+            meta.current_term,
+            meta.voted_for.as_deref(),
+            commit_index,
+            base_index,
+            base_term,
+            snapshot.as_deref(),
+            &log,
+        )?;
+''',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''        // Snapshot first, then log, then meta — so the `base_index`/`commit_index`
+''',
+              '''        validate_persisted(
+            p.current_term,
+            p.voted_for.as_deref(),
+            p.commit_index,
+            p.base_index,
+            p.base_term,
+            p.snapshot.as_deref(),
+            &p.log,
+        )?;
+        // Snapshot first, then log, then meta — so the `base_index`/`commit_index`
+''',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''fn validate_recovered(
+    commit_index: u64,
+    base_index: u64,
+    snapshot: Option<&[u8]>,
+    log: &[LogEntry],
+) -> io::Result<()> {
+    if base_index > 0 && snapshot.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Raft snapshot is missing for non-zero base_index",
+        ));
+    }
+    let mut expected = base_index.saturating_add(1);
+    for entry in log {
+        if entry.index != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Raft log is not contiguous: expected index {expected}, found {}",
+                    entry.index
+                ),
+            ));
+        }
+        expected = expected.saturating_add(1);
+    }
+    let last_index = log.last().map(|entry| entry.index).unwrap_or(base_index);
+    if commit_index > last_index {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Raft commit_index {commit_index} exceeds last recoverable index {last_index}; refusing to truncate committed entries"
+            ),
+        ));
+    }
+    Ok(())
+}
+''',
+              '''fn validate_persisted(
+    current_term: u64,
+    voted_for: Option<&str>,
+    commit_index: u64,
+    base_index: u64,
+    base_term: u64,
+    snapshot: Option<&[u8]>,
+    log: &[LogEntry],
+) -> io::Result<()> {
+    if current_term == 0 && voted_for.is_some() {
+        return Err(invalid_data("Raft hard state contains a vote in term zero"));
+    }
+    if (base_index == 0) != (base_term == 0) {
+        return Err(invalid_data(format!(
+            "Raft snapshot base index/term mismatch: index={base_index}, term={base_term}"
+        )));
+    }
+    if (base_index > 0) != snapshot.is_some() {
+        return Err(invalid_data(
+            "Raft snapshot presence does not match the non-zero snapshot base",
+        ));
+    }
+    if base_term > current_term {
+        return Err(invalid_data(format!(
+            "Raft snapshot term {base_term} exceeds current term {current_term}"
+        )));
+    }
+    if commit_index < base_index {
+        return Err(invalid_data(format!(
+            "Raft commit_index {commit_index} precedes snapshot base {base_index}"
+        )));
+    }
+
+    let mut previous_term = base_term;
+    for (position, entry) in log.iter().enumerate() {
+        let offset = u64::try_from(position)
+            .map_err(|_| invalid_data("Raft log position does not fit in u64"))?;
+        let expected = base_index
+            .checked_add(1)
+            .and_then(|first| first.checked_add(offset))
+            .ok_or_else(|| invalid_data("Raft log index overflow"))?;
+        if entry.index != expected {
+            return Err(invalid_data(format!(
+                "Raft log is not contiguous: expected index {expected}, found {}",
+                entry.index
+            )));
+        }
+        if entry.term == 0 {
+            return Err(invalid_data(format!(
+                "Raft log entry {} has term zero",
+                entry.index
+            )));
+        }
+        if entry.term < previous_term {
+            return Err(invalid_data(format!(
+                "Raft log term descends at index {}: previous {previous_term}, found {}",
+                entry.index, entry.term
+            )));
+        }
+        if entry.term > current_term {
+            return Err(invalid_data(format!(
+                "Raft log term {} at index {} exceeds current term {current_term}",
+                entry.term, entry.index
+            )));
+        }
+        previous_term = entry.term;
+    }
+    let last_index = log.last().map(|entry| entry.index).unwrap_or(base_index);
+    if commit_index > last_index {
+        return Err(invalid_data(format!(
+            "Raft commit_index {commit_index} exceeds last recoverable index {last_index}; refusing to truncate committed entries"
+        )));
+    }
+    Ok(())
+}
+''',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''fn invalid<E>(e: E) -> io::Error
+''',
+              '''fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn invalid<E>(e: E) -> io::Error
+''',
+          )
+
+          # Protocol regression tests.
+          replace_once(
+              'src/raft.rs',
+              '''    /// Regression (F14b): `match_index` is peer-supplied; the leader's `+ 1`
+''',
+              '''    #[test]
+    fn invalid_timing_configuration_is_rejected() {
+        assert!(RaftConfig {
+            heartbeat_ticks: 0,
+            election_min_ticks: 5,
+            election_max_ticks: 10,
+        }
+        .validate()
+        .is_err());
+        assert!(RaftConfig {
+            heartbeat_ticks: 5,
+            election_min_ticks: 5,
+            election_max_ticks: 10,
+        }
+        .validate()
+        .is_err());
+        assert!(RaftConfig {
+            heartbeat_ticks: 1,
+            election_min_ticks: 10,
+            election_max_ticks: 9,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn append_rejects_zero_or_descending_terms() {
+        let mut r = follower_of("brain-1");
+        r.step(
+            "brain-1".to_string(),
+            RaftMessage::AppendEntries(AppendEntriesReq {
+                term: 2,
+                leader_id: "brain-1".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 2,
+                        index: 1,
+                        command: None,
+                    },
+                    LogEntry {
+                        term: 1,
+                        index: 2,
+                        command: None,
+                    },
+                ],
+                leader_commit: 0,
+            }),
+        );
+        assert!(!last_resp(&mut r).success);
+        assert_eq!(r.log_len(), 0);
+        assert_eq!(r.leader(), None, "malformed RPC cannot install a leader");
+
+        let mut r = follower_of("brain-1");
+        r.step(
+            "brain-1".to_string(),
+            RaftMessage::AppendEntries(AppendEntriesReq {
+                term: 1,
+                leader_id: "brain-1".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 0,
+                    index: 1,
+                    command: None,
+                }],
+                leader_commit: 0,
+            }),
+        );
+        assert!(!last_resp(&mut r).success);
+        assert_eq!(r.log_len(), 0);
+    }
+
+    #[test]
+    fn append_response_reports_only_the_match_point_this_request_proved() {
+        let mut r = Raft::new(
+            "brain-0".to_string(),
+            vec!["brain-1".to_string()],
+            cfg(),
+            1,
+            Persisted {
+                current_term: 1,
+                log: vec![
+                    LogEntry {
+                        term: 1,
+                        index: 1,
+                        command: Some(plan(1)),
+                    },
+                    LogEntry {
+                        term: 1,
+                        index: 2,
+                        command: Some(plan(2)),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        r.step(
+            "brain-1".to_string(),
+            append("brain-1", 1, 1, vec![], 0),
+        );
+        let response = last_resp(&mut r);
+        assert!(response.success);
+        assert_eq!(
+            response.match_index, 1,
+            "a heartbeat at index 1 does not prove the follower's suffix at index 2"
+        );
+    }
+
+    #[test]
+    fn body_identity_must_match_the_transport_sender() {
+        let mut r = follower_of("brain-1");
+        r.step(
+            "brain-1".to_string(),
+            RaftMessage::AppendEntries(AppendEntriesReq {
+                term: 9,
+                leader_id: "brain-2".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        );
+        assert_eq!(r.term(), 0);
+        assert_eq!(r.leader(), None);
+        assert!(r.ready().messages.is_empty());
+    }
+
+    #[test]
+    fn invalid_snapshot_metadata_is_rejected_before_installing_a_leader() {
+        let mut r = follower_of("brain-1");
+        r.step(
+            "brain-1".to_string(),
+            RaftMessage::InstallSnapshot(InstallSnapshotReq {
+                term: 1,
+                leader_id: "brain-1".to_string(),
+                last_included_index: 4,
+                last_included_term: 2,
+                data: b"snapshot".to_vec(),
+            }),
+        );
+        let response = match r.ready().messages.pop().map(|message| message.msg) {
+            Some(RaftMessage::InstallSnapshotResp(response)) => response,
+            other => panic!("expected InstallSnapshotResp, got {other:?}"),
+        };
+        assert!(!response.success);
+        assert_eq!(r.base_index(), 0);
+        assert_eq!(r.leader(), None);
+    }
+
+    #[test]
+    fn stale_success_responses_cannot_regress_match_index() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+        let peer = c.ids().into_iter().find(|id| *id != leader).unwrap();
+        let term = c.node(&leader).term();
+        let last = c.node(&leader).last_index();
+        c.node(&leader).step(
+            peer.clone(),
+            RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: true,
+                match_index: last,
+            }),
+        );
+        c.node(&leader).ready();
+        c.node(&leader).step(
+            peer.clone(),
+            RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: true,
+                match_index: 0,
+            }),
+        );
+        assert_eq!(c.node(&leader).match_index.get(&peer), Some(&last));
+    }
+
+    #[test]
+    fn a_failure_at_next_index_one_does_not_spin_an_immediate_retry() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+        let peer = c.ids().into_iter().find(|id| *id != leader).unwrap();
+        let term = c.node(&leader).term();
+        c.node(&leader).ready();
+        c.node(&leader).next_index.insert(peer.clone(), 1);
+        c.node(&leader).step(
+            peer,
+            RaftMessage::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: false,
+                match_index: 0,
+            }),
+        );
+        assert!(
+            c.node(&leader).ready().messages.is_empty(),
+            "no-progress failure waits for the next heartbeat"
+        );
+    }
+
+    #[test]
+    fn snapshot_response_cannot_acknowledge_beyond_the_sent_snapshot() {
+        let mut c = Cluster::new(3);
+        let leader = c.elect();
+        c.node(&leader).propose(plan(7)).unwrap();
+        c.pump();
+        let commit = c.node(&leader).commit_index();
+        c.node(&leader).compact(commit, b"snapshot".to_vec());
+        let base = c.node(&leader).base_index();
+        let peer = c.ids().into_iter().find(|id| *id != leader).unwrap();
+        let term = c.node(&leader).term();
+        c.node(&leader).match_index.insert(peer.clone(), 0);
+        c.node(&leader).step(
+            peer.clone(),
+            RaftMessage::InstallSnapshotResp(InstallSnapshotResp {
+                term,
+                success: true,
+                last_included_index: u64::MAX,
+            }),
+        );
+        assert_eq!(c.node(&leader).match_index.get(&peer), Some(&base));
+    }
+
+    /// Regression (F14b): `match_index` is peer-supplied; the leader's `+ 1`
+''',
+          )
+
+          # Recovery tests and helper.
+          replace_once(
+              'src/raft_store.rs',
+              '''    #[test]
+    fn fresh_store_recovers_empty() {
+''',
+              '''    fn open_error(dir: &Path) -> io::Error {
+        match RaftStore::open(dir) {
+            Ok(_) => panic!("corrupt Raft store unexpectedly opened"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn fresh_store_recovers_empty() {
+''',
+          )
+          replace_once(
+              'src/raft_store.rs',
+              '''    #[test]
+    fn torn_committed_record_aborts_recovery_without_canonicalizing_log() {
+''',
+              '''    #[test]
+    fn newline_terminated_corruption_is_rejected_and_preserved() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store
+            .write_meta(&Meta {
+                current_term: 1,
+                voted_for: None,
+                commit_index: 1,
+                base_index: 0,
+                base_term: 0,
+            })
+            .unwrap();
+        store.write_log(0, 0, &[entry(1, 1)]).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("log"))
+            .unwrap();
+        file.write_all(b"not-json\\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let before = fs::read(dir.join("log")).unwrap();
+        let error = open_error(&dir);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 3"));
+        assert_eq!(fs::read(dir.join("log")).unwrap(), before);
+    }
+
+    #[test]
+    fn descending_log_terms_are_rejected() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store
+            .write_meta(&Meta {
+                current_term: 3,
+                voted_for: None,
+                commit_index: 0,
+                base_index: 0,
+                base_term: 0,
+            })
+            .unwrap();
+        store
+            .write_log(0, 0, &[entry(1, 3), entry(2, 2)])
+            .unwrap();
+
+        let error = open_error(&dir);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("term descends"));
+    }
+
+    #[test]
+    fn durable_log_without_hard_state_is_rejected() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store.write_log(0, 0, &[entry(1, 1)]).unwrap();
+
+        let error = open_error(&dir);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("meta is missing"));
+    }
+
+    #[test]
+    fn snapshot_without_a_nonzero_base_is_rejected() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        store
+            .write_meta(&Meta {
+                current_term: 1,
+                voted_for: None,
+                commit_index: 0,
+                base_index: 0,
+                base_term: 0,
+            })
+            .unwrap();
+        fs::write(dir.join("snapshot"), b"stale snapshot").unwrap();
+
+        let error = open_error(&dir);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("snapshot presence"));
+    }
+
+    #[test]
+    fn save_rejects_term_history_ahead_of_hard_state() {
+        let dir = tmpdir();
+        let (store, _) = RaftStore::open(&dir).unwrap();
+        let error = store
+            .save(&Persisted {
+                current_term: 1,
+                commit_index: 0,
+                log: vec![entry(1, 2)],
+                ..Default::default()
+            })
+            .expect_err("invalid in-memory state must not become durable");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds current term"));
+    }
+
+    #[test]
+    fn torn_committed_record_aborts_recovery_without_canonicalizing_log() {
+''',
+          )
+
+          docs = Path('docs/raft-safety-boundaries.md')
+          docs.write_text('''# Raft safety boundaries\n\nThe brain Raft engine is a crash-fault-tolerant replicated log. It assumes authenticated, non-Byzantine configured members and a driver that persists every `Ready.persist` value before sending messages or applying commands. Recovery rejects malformed complete WAL records, missing hard state beside durable data, zero or descending terms, non-contiguous indexes, snapshot/base mismatches, and commit pointers beyond durable state.\n\nA successful `AppendEntries` response acknowledges only the highest index carried or matched by that request. Existing follower suffixes are not implicit acknowledgements. Leader replication indexes are monotonic, bounded by the leader log, and no-progress failures wait for the next heartbeat rather than creating a tight retry loop. Snapshot responses acknowledge at most a snapshot boundary the leader actually owns.\n\nThe current shared bearer secret authenticates membership in the peer plane, not an individual member identity: any holder can claim another configured body identity. The pure engine now requires the transport sender and body identity to agree, which creates the correct seam for per-member mTLS or SPIFFE identities. Deployments must continue to treat the present protocol as crash-fault, not Byzantine-fault, until that transport work lands.\n\nThe data-plane lock queue is a separate deterministic state-machine concern. Its container mechanics may remain orthogonal to Raft, but enqueue, cancellation, expiry, grant, and promotion become authoritative only through committed commands and are persisted through Raft log replay or snapshots.\n''')
+          PY
+      - name: Format
+        working-directory: repo
+        run: cargo fmt --all
+      - name: Test all targets
+        working-directory: repo
+        run: cargo test --locked --all-targets
+      - name: Clippy
+        working-directory: repo
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Commit verified hardening and remove one-shot workflow
+        working-directory: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/one-shot-raft-audit.yml
+          git add src/raft.rs src/raft_driver.rs src/raft_store.rs docs/raft-safety-boundaries.md
+          git diff --cached --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'fix: harden brain Raft replication and recovery invariants'
+          git push origin HEAD:audit/raft-recovery-hardening
