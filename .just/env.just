@@ -237,12 +237,15 @@ env-check:
     else echo "  ✓ no dotenv secrets tracked"; fi
 
     # A tracked file that .gitignore also matches was force-added past the
-    # rules — the exact signature of a leaked secret. Negated paths (topology.env)
-    # are not ignored, so they correctly do not appear here.
+    # rules — the signature of a leaked secret. Scoped to secret-shaped paths on
+    # purpose: repos legitimately track a Cargo.lock or an asset that some other
+    # rule ignores, and failing on those would just train people to ignore this
+    # check. Negated paths (topology.env) aren't ignored, so they never appear.
     # --no-index is required: without it check-ignore skips tracked files,
     # which are precisely the ones we are looking for here.
     forced=$(git ls-files -z 2>/dev/null | tr '\0' '\n' \
-      | git check-ignore --no-index --stdin 2>/dev/null || true)
+      | git check-ignore --no-index --stdin 2>/dev/null \
+      | grep -E '(^|/)env/|\.env$|\.age-?key$|(^|/)keys\.txt$|sops-private' || true)
     if [[ -n $forced ]]; then note "tracked despite .gitignore (force-added?):"; echo "$forced" | sed 's/^/      /'
     else echo "  ✓ nothing force-added past .gitignore"; fi
 
