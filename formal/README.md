@@ -1,6 +1,6 @@
 # fiducia-brain formal verification
 
-This directory contains executable, finite Quint models for the three control-plane
+This directory contains executable, finite Quint models for the four control-plane
 state machines most likely to turn a transient failure into lost quorum or unsafe
 placement.
 
@@ -101,10 +101,39 @@ the complete observable production projection after every model action: role,
 known/healthy/draining membership, reported hosting, observed leader, authoritative
 replicas, preferred leader, placement generation, and finalized removals.
 
+## 4. Scheduler-to-data-plane composition
+
+[`brain_composition.qnt`](brain_composition.qnt) composes one desired BCD
+placement generation with the staged learner/catch-up/promote/leader-transfer/
+remove protocol. It allows one target failure before or immediately after
+promotion, then permits a single retry.
+
+It verifies:
+
+- only one reconfiguration generation is active;
+- reconciliation during an active generation holds rather than overlapping a
+  second replacement;
+- the voter set never drops below RF=3;
+- learner and voter identities remain disjoint;
+- promotion produces the temporary RF+1 state before any old voter is removed;
+- a pre-promotion failure returns to ABC without changing voters;
+- a post-promotion failure safely removes D while A is still leader;
+- A is removed only after leadership transfers to B;
+- rollback consumes the finite fault budget; and
+- the successful path converges to BCD and is idempotent when replayed.
+
+Primary invariant: `composition_safety`.
+
+The finite transition graph is acyclic when stuttering/hold actions are excluded,
+after the one modeled failure is consumed. This is bounded non-blocking evidence
+under an explicit fair-progress assumption, not an unbounded temporal liveness
+proof. `fm-composition.toml` deliberately marks the production `fiducia-node`
+adapter as planned.
+
 ## Reproduce locally
 
 Quint and the Java runtime used by CI are pinned in `fm.toml`,
-`fm-reconfiguration.toml`, `fm-scheduler.toml`, and the workflows. The membership
+`fm-reconfiguration.toml`, `fm-scheduler.toml`, `fm-composition.toml`, and the workflows. The membership
 manifest is the default discovered by `fmctl`; pass an explicit manifest for the
 other models.
 
@@ -160,13 +189,34 @@ $QUINT run formal/brain_scheduler.qnt \
 $QUINT verify formal/brain_scheduler.qnt \
   --backend=tlc \
   --invariant=scheduler_safety
+
+
+$QUINT typecheck formal/brain_composition.qnt
+$QUINT run formal/brain_composition.qnt \
+  --max-samples=20000 \
+  --max-steps=30 \
+  --invariant=composition_safety \
+  --witnesses \
+    move_started_reached \
+    active_reconcile_hold_reached \
+    pre_promotion_rollback_reached \
+    post_promotion_rollback_reached \
+    retry_reached \
+    promotion_reached \
+    leader_transfer_reached \
+    convergence_reached \
+    idempotent_stable_replay_reached
+$QUINT verify formal/brain_composition.qnt \
+  --backend=tlc \
+  --invariant=composition_safety
 ```
 
 CI exports model-based testing traces in Informal Trace Format. The membership and
 scheduler models both fail closed when their expected corpus is absent and replay
 every generated transition against production Rust. The reconfiguration model
-remains a design-level contract for the staged data-plane learner sequence until a
-`fiducia-node` implementation adapter owns those actual membership operations.
+and composition model remain design-level contracts for the staged data-plane
+learner sequence until a `fiducia-node` implementation adapter owns those actual
+membership operations.
 
 ## Deliberate limits and next refinements
 
@@ -177,7 +227,8 @@ These models do not yet cover:
 3. real learner log indexes and snapshot installation;
 4. joint-consensus details inside `fiducia-node`;
 5. partitions between the brain target and data-plane observations;
-6. temporal liveness under explicit fairness assumptions.
+6. unbounded temporal liveness, repeated partitions/failures, or fairness beyond
+   the composition model's single-failure bounded progress assumption.
 
 The next highest-value refinements and models are:
 
