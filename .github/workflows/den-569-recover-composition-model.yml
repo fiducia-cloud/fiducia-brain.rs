@@ -1,0 +1,212 @@
+name: DEN-569 recover Quint composition model
+
+on:
+  push:
+    branches:
+      - agent/den-569-composition-model-recovery
+    paths:
+      - .github/workflows/den-569-recover-composition-model.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: den-569-composition-model-recovery-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  recover:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact recovery branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/den-569-composition-model-recovery
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Node.js for pinned Quint validation
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Verify current-main ancestry and bounded carrier scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=4ef54fc5431793623c868de2ac0f4887858885de
+          test "$(git branch --show-current)" = agent/den-569-composition-model-recovery
+          test "$(git merge-base HEAD "$base")" = "$base"
+          git diff --name-only "$base"...HEAD | sort > /tmp/carriers.actual
+          cat > /tmp/carriers.expected <<'EOF'
+          .github/recovery/DEN-569-composition-model.patch
+          .github/workflows/den-569-recover-composition-model.yml
+          EOF
+          diff -u /tmp/carriers.expected /tmp/carriers.actual
+          test ! -e formal/brain_composition.qnt
+          test ! -e formal/fm-composition.toml
+          test -e docs/scheduler-data-plane-composition.md
+          test -e tools/scheduler-data-plane-composition/Cargo.toml
+
+      - name: Apply the reviewed patch with three-way safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check --3way .github/recovery/DEN-569-composition-model.patch
+          git apply --3way --index .github/recovery/DEN-569-composition-model.patch
+          git diff --cached --check
+          ! grep -RInE '^(<<<<<<<|=======|>>>>>>>)' \
+            .github/workflows/formal-methods.yml \
+            formal/README.md \
+            formal/brain_composition.qnt \
+            formal/fm-composition.toml
+          test -z "$(git diff --cached --name-only -- docs/scheduler-data-plane-composition.md tools/scheduler-data-plane-composition)"
+
+      - name: Validate workflow and manifest structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
+            .github/workflows/formal-methods.yml
+          python3 - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          manifest = tomllib.loads(
+              Path('formal/fm-composition.toml').read_text(encoding='utf-8')
+          )
+          assert manifest['schema_version'] == 1
+          assert manifest['project'] == 'fiducia-brain.rs'
+          assert manifest['model'] == 'brain-reconfiguration-composition'
+          assert manifest['spec'] == 'formal/brain_composition.qnt'
+          assert manifest['main'] == 'brain_composition'
+          assert manifest['invariants'] == ['composition_safety']
+          assert manifest['toolchain'] == {
+              'quint': '0.32.0',
+              'node': '22',
+              'java': '21',
+              'npx': 'npx',
+          }
+          assert manifest['verification']['backend'] == 'tlc'
+          assert manifest['verification']['exhaustive_finite_model'] is True
+          assert manifest['adapters']['rust']['status'] == 'planned'
+          assert manifest['adapters']['rust']['issue'] == 'DEN-569'
+          expected_actions = {
+              'request_bcd',
+              'retry_bcd',
+              'add_learner_d',
+              'catch_up_learner_d',
+              'fail_before_promotion',
+              'promote_learner_d',
+              'fail_after_promotion',
+              'transfer_leader_to_b',
+              'remove_old_voter_a',
+              'reconcile_active_hold',
+              'replay_stable',
+          }
+          assert set(manifest['traces']['required_actions']) == expected_actions
+          PY
+
+      - name: Type-check the recovered Quint model
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes --package='@informalsystems/quint@0.32.0' \
+            quint typecheck formal/brain_composition.qnt
+
+      - name: Scan intended product content for credential material
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RInE \
+            '(gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)' \
+            .github/workflows/formal-methods.yml \
+            formal/README.md \
+            formal/brain_composition.qnt \
+            formal/fm-composition.toml; then
+            echo 'credential-shaped material found in intended product scope' >&2
+            exit 1
+          fi
+
+      - name: Commit validated product tree and publish bounded evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=4ef54fc5431793623c868de2ac0f4887858885de
+          git rm \
+            .github/recovery/DEN-569-composition-model.patch \
+            .github/workflows/den-569-recover-composition-model.yml
+          git add \
+            .github/workflows/formal-methods.yml \
+            formal/README.md \
+            formal/brain_composition.qnt \
+            formal/fm-composition.toml
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(DEN-569): add scheduler data-plane Quint composition model'
+          product_commit="$(git rev-parse HEAD)"
+          product_tree="$(git rev-parse 'HEAD^{tree}')"
+          echo "PRODUCT_COMMIT=$product_commit"
+          echo "PRODUCT_TREE=$product_tree"
+          git diff --name-only "$base"...HEAD | sort > /tmp/product.actual
+          cat > /tmp/product.expected <<'EOF'
+          .github/workflows/formal-methods.yml
+          formal/README.md
+          formal/brain_composition.qnt
+          formal/fm-composition.toml
+          EOF
+          diff -u /tmp/product.expected /tmp/product.actual
+
+          root="$RUNNER_TEMP/den-569-product"
+          mkdir -p "$root/.github/workflows" "$root/formal"
+          cp .github/workflows/formal-methods.yml "$root/.github/workflows/formal-methods.yml"
+          cp formal/README.md "$root/formal/README.md"
+          cp formal/brain_composition.qnt "$root/formal/brain_composition.qnt"
+          cp formal/fm-composition.toml "$root/formal/fm-composition.toml"
+          (
+            cd "$root"
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          )
+          cat > "$root/RECOVERY_EVIDENCE.json" <<EOF
+          {
+            "schema_version": 1,
+            "source_branch_head": "${GITHUB_SHA}",
+            "base_commit": "$base",
+            "product_commit": "$product_commit",
+            "product_tree": "$product_tree",
+            "source_artifact": "DEN-569-composition-model.patch",
+            "source_file_id": "file_00000000119081f7b244394be85b4569",
+            "validation": [
+              "git-apply-three-way",
+              "diff-check",
+              "conflict-marker-scan",
+              "den-1516-non-overlap",
+              "actionlint",
+              "manifest-contract",
+              "quint-0.32.0-typecheck",
+              "credential-shape-scan"
+            ]
+          }
+          EOF
+
+          set +e
+          push_output="$(git push origin HEAD:agent/den-569-composition-model-recovery 2>&1)"
+          push_status=$?
+          set -e
+          printf '%s\n' "$push_output"
+          test "$push_status" -ne 0
+          grep -F 'refusing to allow a GitHub App to create or update workflow' <<<"$push_output"
+
+      - name: Upload product tree for authenticated App publication
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: den-569-product-${{ github.sha }}
+          path: ${{ runner.temp }}/den-569-product
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: error
