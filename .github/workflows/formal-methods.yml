@@ -272,3 +272,101 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
+
+  composition:
+    name: Quint scheduler/data-plane composition model
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      QUINT_PACKAGE: '@informalsystems/quint@0.32.0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Install Java for TLC
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Typecheck scheduler/data-plane composition model
+        shell: bash
+        run: |
+          mkdir -p .formal-artifacts/composition
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint typecheck \
+            formal/brain_composition.qnt 2>&1 \
+            | tee .formal-artifacts/composition/typecheck.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Simulate safety and bounded progress witnesses
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_composition.qnt \
+            --max-samples=20000 \
+            --max-steps=30 \
+            --invariant=composition_safety \
+            --witnesses \
+              move_started_reached \
+              active_reconcile_hold_reached \
+              pre_promotion_rollback_reached \
+              post_promotion_rollback_reached \
+              retry_reached \
+              promotion_reached \
+              leader_transfer_reached \
+              convergence_reached \
+              idempotent_stable_replay_reached 2>&1 \
+            | tee .formal-artifacts/composition/simulation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Exhaustively check finite composition state graph
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint verify \
+            formal/brain_composition.qnt \
+            --backend=tlc \
+            --invariant=composition_safety 2>&1 \
+            | tee .formal-artifacts/composition/tlc.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Generate composition model-based traces
+        shell: bash
+        run: |
+          set +e
+          npx --yes --package="$QUINT_PACKAGE" quint run \
+            formal/brain_composition.qnt \
+            --max-samples=10000 \
+            --max-steps=24 \
+            --n-traces=8 \
+            --mbt \
+            --out-itf='.formal-artifacts/composition/trace-{seq}.itf.json' 2>&1 \
+            | tee .formal-artifacts/composition/trace-generation.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Upload composition diagnostics and traces
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fiducia-brain-composition-formal
+          path: .formal-artifacts/composition/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

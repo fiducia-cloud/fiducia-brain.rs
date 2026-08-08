@@ -1,0 +1,72 @@
+# Schema-v1 composition model for DEN-569. This connects the desired-placement
+# scheduler contract to the staged data-plane reconfiguration protocol without
+# claiming a production fiducia-node refinement adapter yet.
+schema_version = 1
+project = "fiducia-brain.rs"
+model = "brain-reconfiguration-composition"
+language = "quint"
+spec = "formal/brain_composition.qnt"
+main = "brain_composition"
+init = "init"
+step = "step"
+invariants = ["composition_safety"]
+witnesses = [
+  "move_started_reached",
+  "active_reconcile_hold_reached",
+  "pre_promotion_rollback_reached",
+  "post_promotion_rollback_reached",
+  "retry_reached",
+  "promotion_reached",
+  "leader_transfer_reached",
+  "convergence_reached",
+  "idempotent_stable_replay_reached",
+]
+
+[toolchain]
+quint = "0.32.0"
+node = "22"
+java = "21"
+npx = "npx"
+
+[execution]
+timeout_seconds = 1200
+max_output_bytes = 8388608
+artifacts_dir = ".formal-artifacts/composition"
+
+[simulation]
+backend = "typescript"
+max_samples = 20000
+max_steps = 30
+
+[verification]
+backend = "tlc"
+exhaustive_finite_model = true
+
+[traces]
+format = "itf"
+model_based_testing_metadata = true
+backend = "typescript"
+seed = "0x8e4f26c1d79ab350"
+count = 128
+max_steps = 24
+max_samples = 10000
+required_actions = [
+  "request_bcd",
+  "retry_bcd",
+  "add_learner_d",
+  "catch_up_learner_d",
+  "fail_before_promotion",
+  "promote_learner_d",
+  "fail_after_promotion",
+  "transfer_leader_to_b",
+  "remove_old_voter_a",
+  "reconcile_active_hold",
+  "replay_stable",
+]
+
+[adapters.rust]
+strategy = "design-model-awaiting-data-plane-refinement"
+target = "fiducia-node learner/catch-up/promote/remove implementation"
+implementation = "fiducia-node staged shard reconfiguration"
+status = "planned"
+issue = "DEN-569"
