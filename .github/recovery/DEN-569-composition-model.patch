@@ -1,0 +1,618 @@
+diff --git a/.github/workflows/formal-methods.yml b/.github/workflows/formal-methods.yml
+index 8360be0..1a282d2 100644
+--- a/.github/workflows/formal-methods.yml
++++ b/.github/workflows/formal-methods.yml
+@@ -272,3 +272,101 @@ jobs:
+           include-hidden-files: true
+           if-no-files-found: error
+           retention-days: 14
++
++  composition:
++    name: Quint scheduler/data-plane composition model
++    runs-on: ubuntu-latest
++    timeout-minutes: 25
++    env:
++      QUINT_PACKAGE: '@informalsystems/quint@0.32.0'
++    steps:
++      - name: Checkout
++        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
++        with:
++          persist-credentials: false
++
++      - name: Install Node.js
++        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
++        with:
++          node-version: '22'
++
++      - name: Install Java for TLC
++        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
++        with:
++          distribution: temurin
++          java-version: '21'
++
++      - name: Typecheck scheduler/data-plane composition model
++        shell: bash
++        run: |
++          mkdir -p .formal-artifacts/composition
++          set +e
++          npx --yes --package="$QUINT_PACKAGE" quint typecheck \
++            formal/brain_composition.qnt 2>&1 \
++            | tee .formal-artifacts/composition/typecheck.log
++          status=${PIPESTATUS[0]}
++          set -e
++          exit "$status"
++
++      - name: Simulate safety and bounded progress witnesses
++        shell: bash
++        run: |
++          set +e
++          npx --yes --package="$QUINT_PACKAGE" quint run \
++            formal/brain_composition.qnt \
++            --max-samples=20000 \
++            --max-steps=30 \
++            --invariant=composition_safety \
++            --witnesses \
++              move_started_reached \
++              active_reconcile_hold_reached \
++              pre_promotion_rollback_reached \
++              post_promotion_rollback_reached \
++              retry_reached \
++              promotion_reached \
++              leader_transfer_reached \
++              convergence_reached \
++              idempotent_stable_replay_reached 2>&1 \
++            | tee .formal-artifacts/composition/simulation.log
++          status=${PIPESTATUS[0]}
++          set -e
++          exit "$status"
++
++      - name: Exhaustively check finite composition state graph
++        shell: bash
++        run: |
++          set +e
++          npx --yes --package="$QUINT_PACKAGE" quint verify \
++            formal/brain_composition.qnt \
++            --backend=tlc \
++            --invariant=composition_safety 2>&1 \
++            | tee .formal-artifacts/composition/tlc.log
++          status=${PIPESTATUS[0]}
++          set -e
++          exit "$status"
++
++      - name: Generate composition model-based traces
++        shell: bash
++        run: |
++          set +e
++          npx --yes --package="$QUINT_PACKAGE" quint run \
++            formal/brain_composition.qnt \
++            --max-samples=10000 \
++            --max-steps=24 \
++            --n-traces=8 \
++            --mbt \
++            --out-itf='.formal-artifacts/composition/trace-{seq}.itf.json' 2>&1 \
++            | tee .formal-artifacts/composition/trace-generation.log
++          status=${PIPESTATUS[0]}
++          set -e
++          exit "$status"
++
++      - name: Upload composition diagnostics and traces
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: fiducia-brain-composition-formal
++          path: .formal-artifacts/composition/
++          include-hidden-files: true
++          if-no-files-found: error
++          retention-days: 14
+diff --git a/formal/README.md b/formal/README.md
+index 2b769be..64c0f4b 100644
+--- a/formal/README.md
++++ b/formal/README.md
+@@ -1,6 +1,6 @@
+ # fiducia-brain formal verification
+ 
+-This directory contains executable, finite Quint models for the three control-plane
++This directory contains executable, finite Quint models for the four control-plane
+ state machines most likely to turn a transient failure into lost quorum or unsafe
+ placement.
+ 
+@@ -101,10 +101,39 @@ the complete observable production projection after every model action: role,
+ known/healthy/draining membership, reported hosting, observed leader, authoritative
+ replicas, preferred leader, placement generation, and finalized removals.
+ 
++## 4. Scheduler-to-data-plane composition
++
++[`brain_composition.qnt`](brain_composition.qnt) composes one desired BCD
++placement generation with the staged learner/catch-up/promote/leader-transfer/
++remove protocol. It allows one target failure before or immediately after
++promotion, then permits a single retry.
++
++It verifies:
++
++- only one reconfiguration generation is active;
++- reconciliation during an active generation holds rather than overlapping a
++  second replacement;
++- the voter set never drops below RF=3;
++- learner and voter identities remain disjoint;
++- promotion produces the temporary RF+1 state before any old voter is removed;
++- a pre-promotion failure returns to ABC without changing voters;
++- a post-promotion failure safely removes D while A is still leader;
++- A is removed only after leadership transfers to B;
++- rollback consumes the finite fault budget; and
++- the successful path converges to BCD and is idempotent when replayed.
++
++Primary invariant: `composition_safety`.
++
++The finite transition graph is acyclic when stuttering/hold actions are excluded,
++after the one modeled failure is consumed. This is bounded non-blocking evidence
++under an explicit fair-progress assumption, not an unbounded temporal liveness
++proof. `fm-composition.toml` deliberately marks the production `fiducia-node`
++adapter as planned.
++
+ ## Reproduce locally
+ 
+ Quint and the Java runtime used by CI are pinned in `fm.toml`,
+-`fm-reconfiguration.toml`, `fm-scheduler.toml`, and the workflows. The membership
++`fm-reconfiguration.toml`, `fm-scheduler.toml`, `fm-composition.toml`, and the workflows. The membership
+ manifest is the default discovered by `fmctl`; pass an explicit manifest for the
+ other models.
+ 
+@@ -160,13 +189,34 @@ $QUINT run formal/brain_scheduler.qnt \
+ $QUINT verify formal/brain_scheduler.qnt \
+   --backend=tlc \
+   --invariant=scheduler_safety
++
++
++$QUINT typecheck formal/brain_composition.qnt
++$QUINT run formal/brain_composition.qnt \
++  --max-samples=20000 \
++  --max-steps=30 \
++  --invariant=composition_safety \
++  --witnesses \
++    move_started_reached \
++    active_reconcile_hold_reached \
++    pre_promotion_rollback_reached \
++    post_promotion_rollback_reached \
++    retry_reached \
++    promotion_reached \
++    leader_transfer_reached \
++    convergence_reached \
++    idempotent_stable_replay_reached
++$QUINT verify formal/brain_composition.qnt \
++  --backend=tlc \
++  --invariant=composition_safety
+ ```
+ 
+ CI exports model-based testing traces in Informal Trace Format. The membership and
+ scheduler models both fail closed when their expected corpus is absent and replay
+ every generated transition against production Rust. The reconfiguration model
+-remains a design-level contract for the staged data-plane learner sequence until a
+-`fiducia-node` implementation adapter owns those actual membership operations.
++and composition model remain design-level contracts for the staged data-plane
++learner sequence until a `fiducia-node` implementation adapter owns those actual
++membership operations.
+ 
+ ## Deliberate limits and next refinements
+ 
+@@ -177,7 +227,8 @@ These models do not yet cover:
+ 3. real learner log indexes and snapshot installation;
+ 4. joint-consensus details inside `fiducia-node`;
+ 5. partitions between the brain target and data-plane observations;
+-6. temporal liveness under explicit fairness assumptions.
++6. unbounded temporal liveness, repeated partitions/failures, or fairness beyond
++   the composition model's single-failure bounded progress assumption.
+ 
+ The next highest-value refinements and models are:
+ 
+diff --git a/formal/brain_composition.qnt b/formal/brain_composition.qnt
+new file mode 100644
+index 0000000..02377c0
+--- /dev/null
++++ b/formal/brain_composition.qnt
+@@ -0,0 +1,328 @@
++// Finite composition model for the desired-placement scheduler and staged
++// learner/catch-up/promote/leader-transfer/remove data-plane protocol.
++//
++// The model allows one target failure, before or immediately after promotion.
++// Once that finite fault budget is consumed, a fair scheduler that eventually
++// takes enabled progress actions has an acyclic path to the requested BCD
++// placement. Stuttering remains available and is not claimed as temporal
++// liveness without the stated fairness assumption.
++module brain_composition {
++  type Phase =
++    | StableABC
++    | PlanIssued
++    | LearnerAdded
++    | LearnerCaughtUp
++    | LearnerPromoted
++    | LeaderTransferred
++    | StableBCD
++
++  pure val NODES = Set(1, 2, 3, 4)
++  pure val ABC = Set(1, 2, 3)
++  pure val BCD = Set(2, 3, 4)
++  pure val ABCD = Set(1, 2, 3, 4)
++  pure val RF = 3
++  pure val NO_GENERATION = 0
++
++  type State = {
++    phase: Phase,
++    desired_bcd: bool,
++    voters: Set[int],
++    learners: Set[int],
++    leader: int,
++    generation: int,
++    active_generation: int,
++    failure_available: bool,
++    saw_move_started: bool,
++    saw_active_reconcile_hold: bool,
++    saw_pre_promotion_rollback: bool,
++    saw_post_promotion_rollback: bool,
++    saw_retry: bool,
++    saw_promotion: bool,
++    saw_leader_transfer: bool,
++    saw_convergence: bool,
++    saw_idempotent_stable_replay: bool,
++  }
++
++  var s: State
++
++  action init = {
++    s' = {
++      phase: StableABC,
++      desired_bcd: false,
++      voters: ABC,
++      learners: Set(),
++      leader: 1,
++      generation: 1,
++      active_generation: NO_GENERATION,
++      failure_available: true,
++      saw_move_started: false,
++      saw_active_reconcile_hold: false,
++      saw_pre_promotion_rollback: false,
++      saw_post_promotion_rollback: false,
++      saw_retry: false,
++      saw_promotion: false,
++      saw_leader_transfer: false,
++      saw_convergence: false,
++      saw_idempotent_stable_replay: false,
++    }
++  }
++
++  action request_bcd = all {
++    s.phase == StableABC,
++    not(s.desired_bcd),
++    s' = {
++      ...s,
++      phase: PlanIssued,
++      desired_bcd: true,
++      generation: s.generation + 1,
++      active_generation: s.generation + 1,
++      saw_move_started: true,
++    },
++  }
++
++  action retry_bcd = all {
++    s.phase == StableABC,
++    s.desired_bcd,
++    s.active_generation == NO_GENERATION,
++    s' = {
++      ...s,
++      phase: PlanIssued,
++      generation: s.generation + 1,
++      active_generation: s.generation + 1,
++      saw_retry: true,
++    },
++  }
++
++  action add_learner_d = all {
++    s.phase == PlanIssued,
++    s' = {
++      ...s,
++      phase: LearnerAdded,
++      learners: Set(4),
++    },
++  }
++
++  action catch_up_learner_d = all {
++    s.phase == LearnerAdded,
++    s.learners == Set(4),
++    s' = { ...s, phase: LearnerCaughtUp },
++  }
++
++  action fail_before_promotion = all {
++    s.failure_available,
++    or {
++      s.phase == LearnerAdded,
++      s.phase == LearnerCaughtUp,
++    },
++    s' = {
++      ...s,
++      phase: StableABC,
++      learners: Set(),
++      active_generation: NO_GENERATION,
++      failure_available: false,
++      saw_pre_promotion_rollback: true,
++    },
++  }
++
++  action promote_learner_d = all {
++    s.phase == LearnerCaughtUp,
++    s.learners == Set(4),
++    s' = {
++      ...s,
++      phase: LearnerPromoted,
++      voters: ABCD,
++      learners: Set(),
++      saw_promotion: true,
++    },
++  }
++
++  // The target may fail after promotion while A is still leader. Removing D
++  // restores ABC and retains RF=3; the scheduler may then issue one new
++  // generation because the finite fault budget is consumed.
++  action fail_after_promotion = all {
++    s.phase == LearnerPromoted,
++    s.failure_available,
++    s.leader == 1,
++    s' = {
++      ...s,
++      phase: StableABC,
++      voters: ABC,
++      active_generation: NO_GENERATION,
++      failure_available: false,
++      saw_post_promotion_rollback: true,
++    },
++  }
++
++  action transfer_leader_to_b = all {
++    s.phase == LearnerPromoted,
++    s.voters == ABCD,
++    s.leader == 1,
++    s' = {
++      ...s,
++      phase: LeaderTransferred,
++      leader: 2,
++      saw_leader_transfer: true,
++    },
++  }
++
++  action remove_old_voter_a = all {
++    s.phase == LeaderTransferred,
++    s.voters == ABCD,
++    s.leader == 2,
++    s' = {
++      ...s,
++      phase: StableBCD,
++      voters: BCD,
++      active_generation: NO_GENERATION,
++      saw_convergence: true,
++    },
++  }
++
++  // Brain reconciliation while a data-plane generation is active must hold the
++  // same generation rather than overlap a second replacement.
++  action reconcile_active_hold = all {
++    s.active_generation != NO_GENERATION,
++    s' = { ...s, saw_active_reconcile_hold: true },
++  }
++
++  action replay_stable = all {
++    s.phase == StableBCD,
++    s' = { ...s, saw_idempotent_stable_replay: true },
++  }
++
++  action idle = s' = s
++
++  action step = any {
++    request_bcd,
++    retry_bcd,
++    add_learner_d,
++    catch_up_learner_d,
++    fail_before_promotion,
++    promote_learner_d,
++    fail_after_promotion,
++    transfer_leader_to_b,
++    remove_old_voter_a,
++    reconcile_active_hold,
++    replay_stable,
++    idle,
++  }
++
++  val identities_are_bounded = and {
++    s.voters.subseteq(NODES),
++    s.learners.subseteq(NODES),
++    s.learners.forall(node => not(s.voters.contains(node))),
++    s.learners.size() <= 1,
++  }
++
++  val quorum_floor_is_preserved = s.voters.size() >= RF
++  val leader_is_always_a_voter = s.voters.contains(s.leader)
++
++  val phase_shape_is_consistent = or {
++    and {
++      s.phase == StableABC,
++      s.voters == ABC,
++      s.learners.size() == 0,
++      s.leader == 1,
++      s.active_generation == NO_GENERATION,
++    },
++    and {
++      s.phase == PlanIssued,
++      s.voters == ABC,
++      s.learners.size() == 0,
++      s.leader == 1,
++      s.active_generation == s.generation,
++      s.desired_bcd,
++    },
++    and {
++      or { s.phase == LearnerAdded, s.phase == LearnerCaughtUp },
++      s.voters == ABC,
++      s.learners == Set(4),
++      s.leader == 1,
++      s.active_generation == s.generation,
++      s.desired_bcd,
++    },
++    and {
++      s.phase == LearnerPromoted,
++      s.voters == ABCD,
++      s.learners.size() == 0,
++      s.leader == 1,
++      s.active_generation == s.generation,
++      s.desired_bcd,
++    },
++    and {
++      s.phase == LeaderTransferred,
++      s.voters == ABCD,
++      s.learners.size() == 0,
++      s.leader == 2,
++      s.active_generation == s.generation,
++      s.desired_bcd,
++    },
++    and {
++      s.phase == StableBCD,
++      s.voters == BCD,
++      s.learners.size() == 0,
++      s.leader == 2,
++      s.active_generation == NO_GENERATION,
++      s.desired_bcd,
++    },
++  }
++
++  val one_generation_is_active = or {
++    s.active_generation == NO_GENERATION,
++    s.active_generation == s.generation,
++  }
++
++  // One initial plan plus at most one retry after the single modeled target
++  // failure bounds generation growth and rules out overlapping retry storms.
++  val generation_is_bounded = and {
++    s.generation >= 1,
++    s.generation <= 3,
++  }
++
++  val request_is_monotonic = or {
++    s.desired_bcd,
++    and {
++      s.phase == StableABC,
++      s.generation == 1,
++      s.failure_available,
++    },
++  }
++
++  val rollback_consumes_fault_budget = or {
++    not(or {
++      s.saw_pre_promotion_rollback,
++      s.saw_post_promotion_rollback,
++    }),
++    not(s.failure_available),
++  }
++
++  val old_voter_is_removed_only_after_transfer = or {
++    s.voters.contains(1),
++    and {
++      s.phase == StableBCD,
++      s.leader == 2,
++    },
++  }
++
++  val composition_safety = and {
++    identities_are_bounded,
++    quorum_floor_is_preserved,
++    leader_is_always_a_voter,
++    phase_shape_is_consistent,
++    one_generation_is_active,
++    generation_is_bounded,
++    request_is_monotonic,
++    rollback_consumes_fault_budget,
++    old_voter_is_removed_only_after_transfer,
++  }
++
++  val move_started_reached = s.saw_move_started
++  val active_reconcile_hold_reached = s.saw_active_reconcile_hold
++  val pre_promotion_rollback_reached = s.saw_pre_promotion_rollback
++  val post_promotion_rollback_reached = s.saw_post_promotion_rollback
++  val retry_reached = s.saw_retry
++  val promotion_reached = s.saw_promotion
++  val leader_transfer_reached = s.saw_leader_transfer
++  val convergence_reached = s.saw_convergence
++  val idempotent_stable_replay_reached = s.saw_idempotent_stable_replay
++}
+diff --git a/formal/fm-composition.toml b/formal/fm-composition.toml
+new file mode 100644
+index 0000000..7137b51
+--- /dev/null
++++ b/formal/fm-composition.toml
+@@ -0,0 +1,72 @@
++# Schema-v1 composition model for DEN-569. This connects the desired-placement
++# scheduler contract to the staged data-plane reconfiguration protocol without
++# claiming a production fiducia-node refinement adapter yet.
++schema_version = 1
++project = "fiducia-brain.rs"
++model = "brain-reconfiguration-composition"
++language = "quint"
++spec = "formal/brain_composition.qnt"
++main = "brain_composition"
++init = "init"
++step = "step"
++invariants = ["composition_safety"]
++witnesses = [
++  "move_started_reached",
++  "active_reconcile_hold_reached",
++  "pre_promotion_rollback_reached",
++  "post_promotion_rollback_reached",
++  "retry_reached",
++  "promotion_reached",
++  "leader_transfer_reached",
++  "convergence_reached",
++  "idempotent_stable_replay_reached",
++]
++
++[toolchain]
++quint = "0.32.0"
++node = "22"
++java = "21"
++npx = "npx"
++
++[execution]
++timeout_seconds = 1200
++max_output_bytes = 8388608
++artifacts_dir = ".formal-artifacts/composition"
++
++[simulation]
++backend = "typescript"
++max_samples = 20000
++max_steps = 30
++
++[verification]
++backend = "tlc"
++exhaustive_finite_model = true
++
++[traces]
++format = "itf"
++model_based_testing_metadata = true
++backend = "typescript"
++seed = "0x8e4f26c1d79ab350"
++count = 128
++max_steps = 24
++max_samples = 10000
++required_actions = [
++  "request_bcd",
++  "retry_bcd",
++  "add_learner_d",
++  "catch_up_learner_d",
++  "fail_before_promotion",
++  "promote_learner_d",
++  "fail_after_promotion",
++  "transfer_leader_to_b",
++  "remove_old_voter_a",
++  "reconcile_active_hold",
++  "replay_stable",
++]
++
++[adapters.rust]
++strategy = "design-model-awaiting-data-plane-refinement"
++target = "fiducia-node learner/catch-up/promote/remove implementation"
++implementation = "fiducia-node staged shard reconfiguration"
++status = "planned"
++issue = "DEN-569"
