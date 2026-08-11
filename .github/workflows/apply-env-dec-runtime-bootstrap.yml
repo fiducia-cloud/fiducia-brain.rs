@@ -10,4 +10,4 @@ permissions:
 
 jobs:
   apply:
-    uses: fiducia-cloud/.github/.github/workflows/apply-fiducia-env-dec-runtime-bootstrap.yml@d0005619e14ed4e8f65860a6817019a74d2f3d2c
+    uses: fiducia-cloud/.github/.github/workflows/apply-fiducia-env-dec-runtime-bootstrap.yml@94f0578a7da3cbf9540a63bf5c4889db045f6bf8
