@@ -23,7 +23,7 @@ COPY . fiducia-brain.rs
 WORKDIR /build/fiducia-brain.rs
 RUN cargo build --locked --release && strip target/release/fiducia-brain
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:adcd20c7b4c988b73cbfbddb26d2eee574571e6d7c9ffea29b3821e0690efb77
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
 COPY --from=build --chown=65532:65532 /build/fiducia-brain.rs/target/release/fiducia-brain /usr/local/bin/fiducia-brain
 EXPOSE 8095 9095
 USER 65532:65532
