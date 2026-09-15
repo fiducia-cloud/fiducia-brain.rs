@@ -25,4 +25,4 @@ fiducia-routing = { path = "../fiducia-routing.rs" }
 # ores-locks-and-leases without enabling its Fiducia client adapter, allowing
 # Cloudflare Durable Objects to fence placement application/migrations while a
 # Fiducia control plane itself is recovering.
-fiducia-lib-core = { git = "https://github.com/fiducia-cloud/fiducia-lib-core.git", rev = "b63725cc13f0d5d8b020f8e291239c161e53daf5", default-features = false }
+fiducia-lib-core = { git = "https://github.com/fiducia-cloud/fiducia-lib-core.git", rev = "47d637ba92db3fc35b04bafe9bf66ff5b0223216", default-features = false }
