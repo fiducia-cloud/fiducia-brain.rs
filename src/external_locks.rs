@@ -5,7 +5,7 @@
 //! those decisions and may be backed by Cloudflare Durable Objects while the
 //! Fiducia control plane itself is unhealthy or bootstrapping.
 
-use ores_locks_and_leases::LockKey;
+use fiducia_lib_core::locks::LockKey;
 
 pub fn plan_apply(plan_id: &str) -> LockKey {
     fiducia_lib_core::locks::brain_plan_apply(plan_id)
