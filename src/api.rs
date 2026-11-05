@@ -50,6 +50,17 @@ pub struct BrainState {
     pub http: reqwest::Client,
 }
 
+/// Internal hop transport for forwarding a follower's request to its leader.
+/// A redirect's Location is untrusted and may point outside the brain cluster;
+/// it must never carry the shared hop secret or an already-applied mutation.
+pub fn leader_forward_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build no-redirect leader-forwarding HTTP client")
+}
+
 /// Marks a request as already forwarded once by a member. A handler must never
 /// re-forward a request carrying it: two members with transiently stale leader
 /// views (each believing the other leads) would otherwise ping-pong the request
@@ -885,5 +896,80 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(s.membership.snapshot()[0].health, NodeHealth::Draining);
+    }
+}
+
+
+#[cfg(test)]
+mod redirect_boundary_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A follower's forwarded write is a privileged internal hop. A deposed
+    /// leader can return an arbitrary Location, which must never be followed.
+    #[tokio::test]
+    async fn forwarded_control_plane_write_refuses_cross_origin_redirect() {
+        let attacker_hits = Arc::new(AtomicUsize::new(0));
+        let attacker = Router::new()
+            .route(
+                "/collect",
+                post({
+                    let hits = attacker_hits.clone();
+                    move || {
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({"ok": true, "counterfeit_leader": true}))
+                        }
+                    }
+                }),
+            );
+        let attacker_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind second brain test origin");
+        let destination = format!(
+            "http://{}/collect",
+            attacker_listener.local_addr().expect("attacker socket")
+        );
+        let attacker_server = tokio::spawn(async move {
+            axum::serve(attacker_listener, attacker)
+                .await
+                .expect("second brain server");
+        });
+
+        let leader = Router::new().route(
+            "/forward/v1/scale",
+            post(move || {
+                let destination = destination.clone();
+                async move { (StatusCode::TEMPORARY_REDIRECT, [("location", destination)]) }
+            }),
+        );
+        let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind leader fixture");
+        let origin = format!(
+            "http://{}/forward/v1/scale",
+            leader_listener.local_addr().expect("leader socket")
+        );
+        let leader_server = tokio::spawn(async move {
+            axum::serve(leader_listener, leader)
+                .await
+                .expect("leader fixture server");
+        });
+
+        let response = forwarded(
+            leader_forward_client()
+                .post(origin)
+                .json(&json!({"target_nodes": 3, "replication_factor": 3})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            attacker_hits.load(Ordering::SeqCst),
+            0,
+            "leader-controlled Location is never a trusted forwarding destination"
+        );
+        leader_server.abort();
+        attacker_server.abort();
     }
 }
