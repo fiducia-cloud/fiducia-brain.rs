@@ -899,7 +899,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod redirect_boundary_tests {
     use super::*;
@@ -910,20 +909,19 @@ mod redirect_boundary_tests {
     #[tokio::test]
     async fn forwarded_control_plane_write_refuses_cross_origin_redirect() {
         let attacker_hits = Arc::new(AtomicUsize::new(0));
-        let attacker = Router::new()
-            .route(
-                "/collect",
-                post({
-                    let hits = attacker_hits.clone();
-                    move || {
-                        let hits = hits.clone();
-                        async move {
-                            hits.fetch_add(1, Ordering::SeqCst);
-                            Json(json!({"ok": true, "counterfeit_leader": true}))
-                        }
+        let attacker = Router::new().route(
+            "/collect",
+            post({
+                let hits = attacker_hits.clone();
+                move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"ok": true, "counterfeit_leader": true}))
                     }
-                }),
-            );
+                }
+            }),
+        );
         let attacker_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind second brain test origin");
