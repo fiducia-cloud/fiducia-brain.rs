@@ -203,10 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Short-timeout client for forwarding follower writes/heartbeats to the
         // leader. Fail fast at startup rather than fall back to an untimed
         // default client that would let a hung leader stall forwarded requests.
-        http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .build()
-            .expect("failed to build the leader-forwarding HTTP client"),
+        http: api::leader_forward_client(),
     };
 
     // Reusable hardening stack (outermost last): catch handler panics → 500,
